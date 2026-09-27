@@ -1,0 +1,12 @@
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+/snap/
+/build/
+/dist/
+/docs/
+.env
+.vscode/
