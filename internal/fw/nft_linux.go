@@ -10,11 +10,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"netmonitor/internal/policy"
 )
 
-func prepareNft(p Policy) error {
+// prepareNft creates bound cgroups and returns their inode ids: nft resolves a
+// cgroupv2 path once, at load, so a restarted service gets a new, unmatched id.
+func prepareNft(p Policy) (map[string]uint64, error) {
+	ids := map[string]uint64{}
 	var rs []policy.Rule
 	rs = append(rs, p.Rules...)
 	rs = append(rs, p.Groups...)
@@ -35,11 +39,32 @@ func prepareNft(p Policy) error {
 			seen[cg] = true
 			dir := filepath.Join("/sys/fs/cgroup", filepath.FromSlash(cg))
 			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("cgroup %s: %w", cg, err)
+				return nil, fmt.Errorf("cgroup %s: %w", cg, err)
 			}
+			ids[dir] = cgroupID(dir)
 		}
 	}
-	return nil
+	return ids, nil
+}
+
+func cgroupID(dir string) uint64 {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
+}
+
+func cgroupsMoved(ids map[string]uint64) bool {
+	for dir, id := range ids {
+		if cgroupID(dir) != id {
+			return true
+		}
+	}
+	return false
 }
 
 func listLearnHits() []LearnHit {

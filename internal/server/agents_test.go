@@ -83,6 +83,84 @@ func TestDeleteAgentRemovesRow(t *testing.T) {
 	}
 }
 
+func TestRemoveAgentQueuesUntilAck(t *testing.T) {
+	s, cert := batchFixture(t)
+	if err := s.changeAgent("a", "remove", "", ""); !errors.Is(err, errAgentSilent) {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=?`, store.NowMS()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='pending'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.changeAgent("a", "remove", "", ""); !errors.Is(err, errAgentState) {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='trusted', policy_rev=2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.changeAgent("a", "remove", "", "10.0.0.8"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.changeAgent("a", "remove", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	var id, kind string
+	if err := s.st.DB.QueryRow(`SELECT COUNT(*), MIN(command_id), MIN(kind) FROM commands`).Scan(&n, &id, &kind); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || kind != "uninstall" || id == "" {
+		t.Fatal(n, id, kind)
+	}
+	if _, err := s.st.DB.Exec(`UPDATE commands SET delivered_at_ms=1, delivered_rev=2 WHERE command_id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	rev := int64(2)
+	// Старая сборка подтверждает uninstall в Ack, не умея его выполнить.
+	st := &protocol.ApplyStatus{Backend: "nftables", DesiredRev: 2, AppliedRev: &rev, CommandIDs: []string{id}}
+	if code := postPoll(t, s, cert, protocol.PollReq{Rev: 2, Ack: []string{id}, Status: st}); code != 200 {
+		t.Fatal(code)
+	}
+	s.st.DB.QueryRow(`SELECT COUNT(*) FROM agents`).Scan(&n)
+	if n != 1 {
+		t.Fatal("old agent ack removed the row")
+	}
+	if ui := s.uiState("", "settings"); len(ui.Agents) != 1 || ui.Agents[0].Removing != "old" {
+		t.Fatal(ui.Agents)
+	}
+	if err := s.changeAgent("a", "remove", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.st.DB.QueryRow(`SELECT command_id FROM commands WHERE acked_at_ms IS NULL`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if ui := s.uiState("", "settings"); ui.Agents[0].Removing != "wait" {
+		t.Fatal(ui.Agents[0].Removing)
+	}
+	if code := postPoll(t, s, cert, protocol.PollReq{Rev: 2, Uninstalled: id, Status: st}); code == 200 {
+		t.Fatal("undelivered uninstall accepted")
+	}
+	if _, err := s.st.DB.Exec(`UPDATE commands SET delivered_at_ms=1, delivered_rev=2 WHERE command_id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	// The previous pre-removal promise must neither forget the agent nor
+	// let that build proceed to its unsafe cleanup.
+	broken := &protocol.ApplyStatus{Backend: "nftables", DesiredRev: 2, Error: "nft: fail", CommandIDs: []string{id}}
+	if code := postPoll(t, s, cert, protocol.PollReq{Rev: 2, Uninstalled: id, Status: broken}); code != 409 {
+		t.Fatal(code)
+	}
+	s.st.DB.QueryRow(`SELECT COUNT(*) FROM agents`).Scan(&n)
+	if n != 1 {
+		t.Fatal("pre-removal promise deleted agent", n)
+	}
+	if ui := s.uiState("", "settings"); ui.Agents[0].Removing != "old" {
+		t.Fatal(ui.Agents)
+	}
+
+}
+
 func TestResumeHistoryOnTrust(t *testing.T) {
 	s, _ := batchFixture(t)
 	now := store.NowMS()

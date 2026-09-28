@@ -50,8 +50,13 @@ type Controller struct {
 	backend    string
 	signature  string
 	lastPolicy Policy
+	cgroups    map[string]uint64
 	execute    func(string, string, ...string) ([]byte, error)
 }
+
+// CgroupsMoved: a service bound by a rule restarted since the last apply, and
+// nft still matches its old cgroup. The same policy has to be loaded again.
+func (c *Controller) CgroupsMoved() bool { return cgroupsMoved(c.cgroups) }
 
 func NewController() *Controller      { return &Controller{backend: Backend(), execute: command} }
 func (c *Controller) Backend() string { return c.backend }
@@ -79,7 +84,7 @@ func command(input, name string, args ...string) ([]byte, error) {
 	return out, nil
 }
 func (c *Controller) Apply(p Policy) error {
-	if c.signature != "" && reflect.DeepEqual(c.lastPolicy, p) && c.Alive() {
+	if c.signature != "" && reflect.DeepEqual(c.lastPolicy, p) && c.Alive() && !c.CgroupsMoved() {
 		return nil
 	}
 
@@ -102,7 +107,8 @@ func (c *Controller) Apply(p Policy) error {
 	if c.backend != "nftables" {
 		return fmt.Errorf("backend %s: reliable policy application is unavailable; existing firewall unchanged", c.backend)
 	}
-	if err := prepareNft(p); err != nil {
+	cgroups, err := prepareNft(p)
+	if err != nil {
 		return err
 	}
 	script, err := nftScript(p, time.Now())
@@ -120,6 +126,7 @@ func (c *Controller) Apply(p Policy) error {
 	}
 	c.signature = signature
 	c.lastPolicy = clonePolicy(p)
+	c.cgroups = cgroups
 	return nil
 }
 func (c *Controller) Alive() bool {

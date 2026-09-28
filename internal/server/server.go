@@ -25,7 +25,8 @@ import (
 	"netmonitor/internal/tlsutil"
 )
 
-const Version = "1.0"
+// Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
+var Version = "1.0.1"
 
 type Config struct {
 	ArtifactDir string
@@ -234,6 +235,9 @@ func Listen(cfg Config) (*Server, error) {
 	if err := s.ensureMonitorServiceRules(); err != nil {
 		log.Printf("monitor service rules: %v", err)
 	}
+	if err := s.ensureUpdateRule(); err != nil {
+		log.Printf("update service rule: %v", err)
+	}
 	if err := s.reconcileAlertsWithBans(); err != nil {
 		log.Printf("сверка тревог с банами: %v", err)
 	}
@@ -248,6 +252,8 @@ func Listen(cfg Config) (*Server, error) {
 	mux.HandleFunc("POST /v1/batch", s.handleBatch)
 	mux.HandleFunc("GET /v1/poll", s.handlePoll)
 	mux.HandleFunc("POST /v1/poll", s.handlePoll)
+	mux.HandleFunc("POST /v1/uninstall-result", s.handleUninstallResult)
+	mux.HandleFunc("POST /v1/update-result", s.handleUpdateResult)
 	mux.HandleFunc("POST /v1/local-unblock", s.handleLocalUnblock)
 	s.mountUI(mux)
 	mux.HandleFunc("GET /install/{asset}", s.installAsset)

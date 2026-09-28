@@ -334,7 +334,14 @@ func (a *Agent) reconcileOnce() error {
 		s.Rev = a.policyRev
 	}
 	if a.firewall.Alive() && a.actualRev != nil && reflect.DeepEqual(p, a.policyLocked()) {
-		return nil
+		// Служба из правила перезапустилась: та же политика, заново к новой cgroup.
+		// Это не порча firewall, поэтому без тревоги «восстановлена».
+		if m, ok := a.firewall.(interface{ CgroupsMoved() bool }); ok && m.CgroupsMoved() {
+			if err = a.firewall.Apply(p); err != nil {
+				a.fwError = err.Error()
+			}
+		}
+		return err
 	}
 	a.actualRev = nil
 	a.setPolicyLocked(p)

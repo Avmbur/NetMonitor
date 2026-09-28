@@ -124,8 +124,9 @@ func Validate(r Rule) error {
 			return fmt.Errorf("invalid port")
 		}
 	}
-	if (m.LocalPort > 0 || m.RemotePort > 0 || m.AnyPort > 0) && m.Protocol != "tcp" && m.Protocol != "udp" {
-		return fmt.Errorf("a port requires tcp or udp")
+	// Порт при любом протоколе — это tcp и udp сразу: у icmp портов нет.
+	if (m.LocalPort > 0 || m.RemotePort > 0 || m.AnyPort > 0) && (m.Protocol == "icmp" || m.Protocol == "icmpv6") {
+		return fmt.Errorf("a port requires tcp, udp or any protocol")
 	}
 	for _, n := range m.Networks {
 		p, e := netip.ParsePrefix(n)

@@ -110,7 +110,8 @@ func TestRuleClosesQuestion(t *testing.T) {
 	if len(ui.Questions) != 0 {
 		t.Fatalf("open questions %d", len(ui.Questions))
 	}
-	if len(ui.Rules) != 6 {
+	// Пять стартовых, решение по вопросу и служебное «обновления».
+	if len(ui.Rules) != 7 {
 		t.Fatalf("rules %d", len(ui.Rules))
 	}
 }

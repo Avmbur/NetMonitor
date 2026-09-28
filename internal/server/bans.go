@@ -131,6 +131,10 @@ func validateBan(b banSpec, confirmLocalPort bool) error {
 	if b.Hosts != nil && len(b.Hosts) == 0 {
 		return fmt.Errorf("выбери серверы")
 	}
+	// Бан с портом по-прежнему требует протокол; «любой» с портом — только у правил.
+	if (b.Port > 0 || b.LocalPort > 0) && b.Protocol != "tcp" && b.Protocol != "udp" {
+		return fmt.Errorf("a port requires tcp or udp")
+	}
 	return policy.Executable(b.rule())
 }
 

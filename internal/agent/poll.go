@@ -33,6 +33,9 @@ func (a *Agent) pollLoop() {
 }
 
 func (a *Agent) pollOnce() error {
+	if err := a.reportPendingUpdate(); err != nil {
+		log.Printf("update report: %v", err)
+	}
 	if err := a.reportPauses(); err != nil {
 		log.Printf("pause report: %v", err)
 	}
@@ -289,15 +292,45 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 		status.Error = err.Error()
 	}
 	var ack []string
+	uninstall := ""
+	updateID, updatePayload := "", ""
 	for _, c := range pr.Commands {
 		status.CommandIDs = append(status.CommandIDs, c.ID)
-		if err == nil {
-			ack = append(ack, c.ID)
+		// Снятие и обновление не зависят от политики.
+		switch c.Kind {
+		case "uninstall":
+			uninstall = c.ID
+		case "update":
+			updateID, updatePayload = c.ID, c.Payload
+		default:
+			if err == nil {
+				ack = append(ack, c.ID)
+			}
 		}
 	}
 	rev := a.rev
 	unlock()
 	_, reportErr := a.exchangePoll(protocol.PollReq{Rev: rev, Ack: ack, Status: &status})
+	if uninstall != "" {
+		// Scheduling never claims success; the durable worker confirms after cleanup.
+		start := a.startRemoval
+		if start == nil {
+			start = a.scheduleUninstall
+		}
+		if removeErr := start(uninstall); removeErr != nil {
+			_ = sendUninstallResult(a.client, a.monitorURL(), protocol.UninstallResult{CommandID: uninstall, Phase: "failed", Error: removeErr.Error()})
+			return fmt.Errorf("schedule removal: %w", removeErr)
+		}
+	}
+	if updateID != "" {
+		start := a.startUpdate
+		if start == nil {
+			start = a.scheduleUpdate
+		}
+		if upErr := start(updateID, updatePayload); upErr != nil {
+			return fmt.Errorf("schedule update: %w", upErr)
+		}
+	}
 	if err != nil {
 		if reportErr != nil {
 			return fmt.Errorf("apply: %w; reporting: %v", err, reportErr)

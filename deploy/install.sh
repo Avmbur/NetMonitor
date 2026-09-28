@@ -263,6 +263,39 @@ nm_do_agent() {
 
 # Агент на монитор по кнопке в морде: nmserver пишет файл запроса, nmagent-self.path
 # запускает этот же скрипт с --mode self-request.
+# Обновление монитора по кнопке в морде: nmserver пишет update.request,
+# nm-update.path запускает этот же скрипт с --mode update-request.
+nm_update_request() {
+    nm_req=${NM_UPDATE_REQUEST:-/var/lib/nmserver/update.request}
+    [ -f "$nm_req" ] || return 0
+    nm_ver= nm_arch_req= nm_url= nm_sum=
+    while IFS= read -r nm_line || [ -n "$nm_line" ]; do
+        case "$nm_line" in
+            VERSION=*) nm_ver=${nm_line#VERSION=} ;;
+            ARCH=*) nm_arch_req=${nm_line#ARCH=} ;;
+            URL=*) nm_url=${nm_line#URL=} ;;
+            SHA256=*) nm_sum=${nm_line#SHA256=} ;;
+        esac
+    done < "$nm_req"
+    nm_work=$nm_req.running
+    mv -f "$nm_req" "$nm_work"
+    case "$nm_ver" in ''|*[!0-9.]*) die "Неверная версия" 2 ;; esac
+    case "$nm_arch_req" in amd64|arm64) ;; *) die "Неверная архитектура" 2 ;; esac
+    case "$nm_url" in
+        "https://github.com/Avmbur/NetMonitor/releases/download/v${nm_ver}/netmonitor-linux-${nm_arch_req}.tar.gz") ;;
+        *) die "Чужой адрес комплекта" 2 ;;
+    esac
+    if [ -n "$nm_sum" ] && [ "${#nm_sum}" -ne 64 ]; then die "Неверная сумма" 2; fi
+    curl -fsSL --proto '=https' --max-time 180 -o "$nm_tmp/pkg.tar.gz" "$nm_url" || die "Не скачался комплект"
+    if [ -n "$nm_sum" ]; then
+        printf '%s  %s\n' "$nm_sum" "$nm_tmp/pkg.tar.gz" | sha256sum -c - || die "Сумма не сошлась"
+    fi
+    tar -xzf "$nm_tmp/pkg.tar.gz" -C "$nm_tmp" || die "Битый архив"
+    nm_kit=$nm_tmp/netmonitor-linux-$nm_arch_req
+    [ -f "$nm_kit/install.sh" ] || die "В комплекте нет install.sh"
+    sh "$nm_kit/install.sh" --mode monitor --self-agent no
+}
+
 nm_self_request() {
     nm_req=${NM_SELF_REQUEST:-/var/lib/nmserver/self-agent.request}
     [ -f "$nm_req" ] || return 0
@@ -330,8 +363,30 @@ Unit=nmagent-self.service
 [Install]
 WantedBy=multi-user.target
 NM_SELF_PATH
+    cat > /etc/systemd/system/nm-update.service <<'NM_UPDATE'
+[Unit]
+Description=Install a NetMonitor monitor update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/netmonitor/install.sh --mode update-request
+NM_UPDATE
+    cat > /etc/systemd/system/nm-update.path <<'NM_UPDATE_PATH'
+[Unit]
+Description=Watch for a NetMonitor monitor update request
+
+[Path]
+PathChanged=/var/lib/nmserver/update.request
+Unit=nm-update.service
+
+[Install]
+WantedBy=multi-user.target
+NM_UPDATE_PATH
     chmod 644 /etc/systemd/system/nmserver.service /etc/systemd/system/nmagent-self.service \
-        /etc/systemd/system/nmagent-self.path
+        /etc/systemd/system/nmagent-self.path /etc/systemd/system/nm-update.service \
+        /etc/systemd/system/nm-update.path
 }
 
 nm_self_agent() {
@@ -448,9 +503,10 @@ nm_do_monitor() {
     fi
     chown -R nmserver:nmserver /var/lib/nmserver
     systemctl daemon-reload
-    systemctl enable nmserver.service nmagent-self.path
+    systemctl enable nmserver.service nmagent-self.path nm-update.path
     systemctl restart nmserver.service
     systemctl restart nmagent-self.path
+    systemctl restart nm-update.path
     systemctl is-active --quiet nmserver.service
     nm_i=0
     nm_code=000
@@ -530,6 +586,10 @@ main() {
     nm_ensure_pkgs
     if [ "$nm_mode" = self-request ]; then
         nm_self_request
+        return 0
+    fi
+    if [ "$nm_mode" = update-request ]; then
+        nm_update_request
         return 0
     fi
     [ "$nm_no_fw" = 1 ] || nm_note_fw

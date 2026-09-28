@@ -11,8 +11,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--go", default="go")
     parser.add_argument("--arch", choices=["amd64", "arm64"], default="amd64")
+    parser.add_argument("--version", help="версия сборки; по умолчанию метка vX на HEAD")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    version = args.version or tag_version(root)
+    flags = []
+    if version:
+        # Версия в программах равна метке релиза: иначе агенты вечно «отстают».
+        flags = ["-ldflags", "-X netmonitor/internal/server.Version=%s -X netmonitor/internal/agent.Version=%s" % (version, version)]
     dest = root / "dist" / ("netmonitor-linux-" + args.arch)
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True)
@@ -20,7 +26,7 @@ def main():
     names = []
     for binary in ["nmserver", "nmagent"]:
         name = binary + "-linux-" + args.arch
-        subprocess.run([args.go, "build", "-trimpath", "-o", str(dest / name), "./cmd/" + binary],
+        subprocess.run([args.go, "build", "-trimpath", *flags, "-o", str(dest / name), "./cmd/" + binary],
                        cwd=root, env=env, check=True)
         names.append(name)
     data = (root / "deploy" / "install.sh").read_bytes()
@@ -39,6 +45,14 @@ def main():
             info.mode = 0o755
             bundle.addfile(info, io.BytesIO(data))
     print(archive)
+
+def tag_version(root):
+    try:
+        out = subprocess.run(["git", "describe", "--tags", "--exact-match", "HEAD"], cwd=root,
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return out[1:] if out.startswith("v") else None
 
 if __name__ == "__main__":
     main()

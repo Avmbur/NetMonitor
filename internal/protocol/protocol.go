@@ -176,6 +176,8 @@ type PollReq struct {
 	Rev          int64        `json:"rev"`
 	Ack          []string     `json:"ack"`
 	ConsumedOnce []string     `json:"consumed_once,omitempty"`
+	// Legacy pre-removal claim. Never evidence of completed cleanup.
+	Uninstalled string `json:"uninstalled,omitempty"`
 }
 
 type PollRes struct {
@@ -236,4 +238,18 @@ type LocalUnblock struct {
 	// rollback — откат своего бана в первую минуту без связи. Пустая причина
 	// бан не отключает: монитор ставит его снова.
 	Reason string `json:"reason,omitempty"`
+}
+
+type UninstallResult struct {
+	CommandID string `json:"command_id"`
+	Phase     string `json:"phase"`
+	Error     string `json:"error,omitempty"`
+}
+
+// UpdateResult is sent by the agent only after the new binary is the one running,
+// or when the download and replacement failed. A plain poll ACK is not this.
+type UpdateResult struct {
+	CommandID string `json:"command_id"`
+	Phase     string `json:"phase"`
+	Error     string `json:"error,omitempty"`
 }

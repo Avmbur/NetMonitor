@@ -12,6 +12,12 @@ import (
 
 func main() {
 	log.SetFlags(0)
+	if len(os.Args) == 2 && os.Args[1] == "uninstall-worker" {
+		if err := agent.RunUninstallWorker(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "restore" {
 		fs := flag.NewFlagSet("restore", flag.ExitOnError)
 		data := fs.String("data", "/var/lib/nmagent", "каталог данных")

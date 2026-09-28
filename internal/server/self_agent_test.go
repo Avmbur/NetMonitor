@@ -236,3 +236,39 @@ func TestParseInstallCmd(t *testing.T) {
 		t.Fatal(ep, pin, tok, err)
 	}
 }
+
+func TestUpdateRuleOpensHTTPSOnlyForNetMonitorServices(t *testing.T) {
+	s, _ := batchFixture(t)
+	if err := s.ensureUpdateRule(); err != nil {
+		t.Fatal(err)
+	}
+	var rev int64
+	s.st.DB.QueryRow(`SELECT policy_rev FROM agents WHERE agent_id='a'`).Scan(&rev)
+	rs, err := hostRules(s.st.DB, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r policy.Rule
+	for _, x := range rs {
+		if x.ID == parkRuleUpdate {
+			r = x
+		}
+	}
+	if r.Action != "allow" || r.Hosts != nil || r.Match.Direction != "out" || r.Match.Protocol != "tcp" || r.Match.RemotePort != 443 || len(r.Match.Bindings) != 3 {
+		t.Fatal(r)
+	}
+	if !strings.Contains(r.Name, "служебные · обновления") || !isServiceRuleID(r.ID) {
+		t.Fatal(r.Name)
+	}
+	if err := policy.Executable(r); err != nil || policy.Inert(r) {
+		t.Fatal("rule does not execute", err)
+	}
+	if err := s.ensureUpdateRule(); err != nil {
+		t.Fatal(err)
+	}
+	var again int64
+	s.st.DB.QueryRow(`SELECT policy_rev FROM agents WHERE agent_id='a'`).Scan(&again)
+	if again != rev {
+		t.Fatal("unchanged rule bumped policy", rev, again)
+	}
+}

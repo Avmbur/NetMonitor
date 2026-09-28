@@ -16,6 +16,7 @@ import (
 
 var errAgentMissing = errors.New("агент не найден")
 var errAgentState = errors.New("действие недоступно в текущем состоянии агента")
+var errAgentSilent = errors.New("агент молчит")
 var errNoResume = errors.New("нет похожего сервера")
 
 func (s *Server) changeAgent(id, action, name, src string) error {
@@ -61,7 +62,9 @@ func (s *Server) applyAgentChange(id, action, name, src string, resume bool) err
 			next = "revoked"
 			label = "отозвал сертификат"
 		case "delete":
-			return deleteAgentRow(tx, id, trust, host, oldName, src)
+			return deleteAgentRow(tx, id, trust, host, oldName, src, "")
+		case "remove":
+			return queueAgentRemoval(tx, id, trust, host, oldName, src)
 		default:
 			return errAgentState
 		}
@@ -124,7 +127,7 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errAgentMissing) {
 			code = 404
 		}
-		if errors.Is(err, errAgentState) || errors.Is(err, errNoResume) {
+		if errors.Is(err, errAgentState) || errors.Is(err, errAgentSilent) || errors.Is(err, errNoResume) {
 			code = 409
 		}
 		if strings.HasPrefix(err.Error(), "имя:") {
@@ -136,7 +139,41 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func deleteAgentRow(tx *sql.Tx, id, trust, host, name, src string) error {
+func queueAgentRemoval(tx *sql.Tx, id, trust, host, name, src string) error {
+	if trust != "trusted" {
+		return errAgentState
+	}
+	var last int64
+	err := tx.QueryRow(`SELECT COALESCE(last_seen_ms,0) FROM hosts WHERE host_id=?`, host).Scan(&last)
+	if err == sql.ErrNoRows {
+		last = 0
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	if last < store.NowMS()-60000 {
+		return errAgentSilent
+	}
+	var n int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='uninstall' AND acked_at_ms IS NULL`, id).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	now := store.NowMS()
+	if _, err = tx.Exec(`INSERT INTO commands(command_id,agent_id,kind,payload,created_at_ms) VALUES(?,?,?,?,?)`, idgen.NewV7(), id, "uninstall", "{}", now); err != nil {
+		return err
+	}
+	_, err = tx.Exec("INSERT INTO audit_log(audit_id,at_ms,actor,action,object,src_ip) VALUES(?,?,?,?,?,?)", idgen.NewV7(), now, "adm", "запросил снятие агента", id+" "+name, src)
+	return err
+}
+
+func deleteAgentRow(tx *sql.Tx, id, trust, host, name, src, action string) error {
+	if action == "" {
+		action = "забыл агента"
+	}
 	now := store.NowMS()
 	if _, err := tx.Exec(`UPDATE alerts SET closed_at_ms=? WHERE rule_id='clone' AND closed_at_ms IS NULL
 		AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.trust_state='quarantined' AND a.agent_id!=?)`, now, id); err != nil {
@@ -165,7 +202,7 @@ func deleteAgentRow(tx *sql.Tx, id, trust, host, name, src string) error {
 		return err
 	}
 	_, err := tx.Exec("INSERT INTO audit_log(audit_id,at_ms,actor,action,object,src_ip) VALUES(?,?,?,?,?,?)",
-		idgen.NewV7(), now, "adm", "удалил агента", id+" "+name, src)
+		idgen.NewV7(), now, "adm", action, id+" "+name, src)
 	return err
 }
 

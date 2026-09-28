@@ -49,6 +49,8 @@ func (s *Server) mountUI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ui/api/policy.txt", s.needSess(s.handlePolicyExport))
 	mux.HandleFunc("GET /ui/api/whois", s.needSess(s.handleWhois))
 	mux.HandleFunc("GET /ui/api/dns", s.needSess(s.handleDNSLookup))
+	mux.HandleFunc("GET /ui/api/update", s.needSess(s.handleUpdate))
+	mux.HandleFunc("POST /ui/api/update", s.needSess(s.handleUpdate))
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -683,6 +685,10 @@ type uiAgent struct {
 	Queue      int64                 `json:"queue"`
 	ResumeHost string                `json:"resume_host,omitempty"`
 	ResumeName string                `json:"resume_name,omitempty"`
+	// Removing — последняя команда снятия: wait — ждём машину, old — агент
+	// старой сборки снимать себя не умеет.
+	Removing     string `json:"removing,omitempty"`
+	RemovalError string `json:"removalError,omitempty"`
 }
 
 type uiAlert struct {
@@ -826,6 +832,19 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 		c, err := readControl(s.st.DB, st.Agents[i].HostID)
 		db.record(err)
 		st.Agents[i].Control = c
+		var open int
+		var result string
+		err = s.st.DB.QueryRow(`SELECT acked_at_ms IS NULL, COALESCE(result,''),COALESCE(error,'') FROM commands WHERE agent_id=? AND kind='uninstall' ORDER BY created_at_ms DESC LIMIT 1`, st.Agents[i].AgentID).Scan(&open, &result, &st.Agents[i].RemovalError)
+		if err != sql.ErrNoRows {
+			db.record(err)
+		}
+		if err == nil && result == "remove_error" {
+			st.Agents[i].Removing = "error"
+		} else if err == nil && open == 1 {
+			st.Agents[i].Removing = "wait"
+		} else if err == nil && result == "unsupported" {
+			st.Agents[i].Removing = "old"
+		}
 		if mon.HostID != "" && st.Agents[i].HostID == mon.HostID {
 			st.Agents[i].Monitor = true
 			st.Agents[i].Name = monitorAgentName

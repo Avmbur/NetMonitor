@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -27,8 +28,35 @@ const (
 	monitorRuleICMP  = "monitor-svc-icmp"
 	monitorRuleSSH   = "monitor-svc-ssh"
 	monitorRuleWhois = "monitor-svc-whois"
+	parkRuleUpdate   = "park-svc-update"
 	defaultLAN       = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
 )
+
+// updateRule открывает HTTPS только службам NetMonitor, и на всём парке: агент
+// сам качает релиз с GitHub, монитор проверяет релиз (nmserver) и ставит его
+// (nm-update). Остальные программы машины по 443 так и не выходят.
+func updateRule() policy.Rule {
+	return policy.Rule{
+		ID: parkRuleUpdate, Name: "служебные · обновления (руками не трогать)", Order: 994,
+		Enabled: true, Action: "allow",
+		Match: policy.Match{Direction: "out", Protocol: "tcp", RemotePort: 443, Bindings: []policy.Binding{
+			{Name: "nmagent", Cgroup: "system.slice/nmagent.service"},
+			{Name: "nmserver", Cgroup: "system.slice/nmserver.service"},
+			{Name: "nm-update", Cgroup: "system.slice/nm-update.service"},
+		}},
+	}
+}
+
+func (s *Server) ensureUpdateRule() error {
+	return s.st.Update(func(tx *sql.Tx) error {
+		changed, err := upsertMonitorRule(tx, updateRule(), store.NowMS())
+		if err != nil || !changed {
+			return err
+		}
+		_, err = tx.Exec(`UPDATE agents SET policy_rev=policy_rev+1 WHERE trust_state='trusted'`)
+		return err
+	})
+}
 
 var selfInstallHook func(s *Server, endpoint, pin, token string) error
 var selfInstallWait = 45 * time.Second
@@ -375,7 +403,10 @@ func monitorRuleSame(a, b policy.Rule) bool {
 	if a.Match.Direction != b.Match.Direction || a.Match.Protocol != b.Match.Protocol || a.Match.AnyPort != b.Match.AnyPort || a.Match.LocalPort != b.Match.LocalPort || a.Match.RemotePort != b.Match.RemotePort {
 		return false
 	}
-	if len(a.Hosts) != len(b.Hosts) || len(a.Match.Networks) != len(b.Match.Networks) {
+	if len(a.Hosts) != len(b.Hosts) || len(a.Match.Networks) != len(b.Match.Networks) || !reflect.DeepEqual(a.Match.Bindings, b.Match.Bindings) {
+		return false
+	}
+	if (a.Hosts == nil) != (b.Hosts == nil) {
 		return false
 	}
 	for i := range a.Hosts {

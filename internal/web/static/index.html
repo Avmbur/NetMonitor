@@ -2532,7 +2532,8 @@ function settingsForm() {
         ${keepFieldHtml("сводки", "как долго хранить часовые сводки", "hoursN", "hoursU", d)}
         <div class="rfield"><span title="префиксы LAN в морде. свои агенты — не LAN, а «свои»">LAN</span>
           <input data-cfg="lan" value="${esc(d.lan)}">
-          <div class="ferr" data-ferr="lan" hidden>CIDR через запятую</div>
+          <div class="ferr" data-ferr="lan" hidden>CIDR через запятую, как в примере</div>
+          <div class="hint">пример: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7</div>
         </div>
       </div>
     </div>
@@ -2708,6 +2709,7 @@ function renderSettings() {
         ${settingsForm()}
         <div class="tile-foot cfg-foot">
           <span class="hint">заводской порт 8443. правки применяются по «Сохранить».<br>команда установки агента берёт уже сохранённый порт.</span>
+          <button type="button" class="pill" data-check-update="1">Проверить обновление</button>
           <button type="button" class="pill" data-save-cfg="1">Сохранить</button>
         </div>
         </div>
@@ -3406,7 +3408,8 @@ function ruleKindText(r) {
   return t ? k + " · " + t : k;
 }
 function serviceRule(r) {
-  return !!(r && (String(r.id || "").indexOf("monitor-svc-") === 0 || /руками не трогать/.test(r.name || "")));
+  const id = String((r && r.id) || "");
+  return !!(r && (id.indexOf("monitor-svc-") === 0 || id.indexOf("park-svc-") === 0 || /руками не трогать/.test(r.name || "")));
 }
 function openPortsModal(vm) {
   const list = (vm && vm.listeners) || [];
@@ -4286,7 +4289,8 @@ function openMenu(x, y, ctx) {
       ${item("pause", a.pauseUntil>Date.now() ? "снять паузу авто-банов…" : "пауза авто-банов…", online)}
       ${item("qtn", a.quarantine ? "снять карантин…" : "карантин сервера…", online)}
       <div class="sep"></div>
-      ${item("del", "удалить…", true)}
+      ${item("del", "забыть…", true)}
+      ${item("remove", "удалить с сервера…", true)}
       <button type="button" data-a="whois">whois</button>`;
   } else if (ctx.type === "alert") {
     const a = ctx.alert;
@@ -4814,6 +4818,78 @@ function periodLabel(m) {
   return p ? p.title : (key || "");
 }
 
+function renderUpdateModal() {
+  const m = state.modal;
+  const info = m && m.info || {};
+  let inner = "";
+  if (info.error) {
+    inner = `<div class="hint" style="padding:0">${esc(info.error)}</div>`;
+  } else if (m.manual) {
+    inner = `<div class="hint" style="padding:0">запрос записан. монитор перезапустится, страница оборвётся, база останется. если через минуту эта страница ещё открыта, служба обновления с этой сборки ещё не стоит — выполни команду:</div>
+      <div class="cmdbox">${esc(m.manual)}</div>`;
+  } else {
+    const newer = !!info.newer;
+    const agents = (info.agents || []).filter(a => a.behind);
+    inner = `<div class="hint" style="padding:0">сейчас ${esc(info.current || "—")}, на GitHub ${esc(info.latest || "—")}${newer ? "" : ". это последняя версия"}.</div>`;
+    if (info.notes) inner += `<div class="hint" style="padding:0">${esc(info.notes)}</div>`;
+    inner += `<div class="hint" style="padding:0">монитор и агенты ставятся отдельно. агент старой сборки команду увидит и не выполнит: его один раз переставляют командой установки из «Настройки и агенты», дальше кнопка обновляет сама.</div>`;
+    if (agents.length) {
+      inner += `<div class="hint" style="padding:0">отстают: ${esc(agents.map(a => a.name + " " + (a.version || "—") + (a.pending ? " (уже в очереди)" : "")).join(", "))}</div>`;
+    }
+  }
+  let foot = `<button type="button" data-a="cancel">Закрыть</button>`;
+  // Монитор и агенты отстают независимо: обновлённый монитор не прячет кнопку агентов.
+  if (!info.error && !m.manual && info.newer) {
+    foot += `<button type="button" data-a="updmon">Установить монитор</button>`;
+  }
+  if (!info.error && !m.manual && (info.agents || []).some(a => a.behind && !a.pending)) {
+    foot += `<button type="button" data-a="updagents">Установить агентам</button>`;
+  }
+  if (m.manual) foot = `<button type="button" data-a="copyupdate">Копировать</button>` + foot;
+  showModal(modalShell("Обновление", "GitHub Avmbur/NetMonitor", `<div class="rform one">${inner}</div>`, foot), "wide");
+}
+async function openUpdateModal() {
+  try {
+    const r = await fetch("/ui/api/update");
+    if (r.status === 401) { showLogin(); return; }
+    const text = await r.text();
+    if (!r.ok) throw new Error(text || "не удалось проверить обновление");
+    state.modal = { kind: "update", info: JSON.parse(text) };
+    renderUpdateModal();
+  } catch (e) {
+    toastMsg(e.message || "не удалось проверить обновление");
+  }
+}
+async function runUpdate(target) {
+  const m = state.modal;
+  if (!m || m.saving) return;
+  m.saving = true;
+  try {
+    const r = await fetch("/ui/api/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target: target }) });
+    const text = await r.text();
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) throw new Error(text || "не удалось");
+    const j = JSON.parse(text);
+    if (target === "monitor") {
+      m.manual = j.manual || "";
+      renderUpdateModal();
+      return;
+    }
+    toastMsg(j.queued ? "в очередь: " + j.queued : "обновлять некого");
+    closeModal();
+  } catch (e) {
+    m.saving = false;
+    toastMsg(e.message || "не удалось");
+  }
+}
+function agentRemoveCmd() {
+  return "sudo sh -c 'systemctl disable --now nmagent.service nmagent-restore.service; nft delete table inet netmon; rm -f /etc/systemd/system/nmagent.service /etc/systemd/system/nmagent-restore.service /usr/local/bin/nmagent /usr/local/bin/nmagent.stage /usr/local/bin/nmagent.next; rm -rf /var/lib/nmagent; systemctl daemon-reload'";
+}
+// Команду снятия можно доставить только подтверждённому агенту на связи,
+// который умеет снимать себя.
+function agentRemoveLive(a) {
+  return a.kind === "trusted" && a.status === "online" && a.removing !== "old";
+}
 function blankGroup() {
   return { name: "", policy: "allow", members: "", hosts: "all", mute: true, except: [] };
 }
@@ -4918,9 +4994,26 @@ function renderAgentModal() {
     meta = esc(a.name);
     inner = `<div class="hint" style="padding:0">ключ больше не принимаем. агент останется в списке как «отозван».</div>`;
   } else if (m.act === "del") {
-    title = "Удалить агента";
+    title = "Забыть агента";
     meta = esc(a.name);
-    inner = `<div class="hint" style="padding:0">строка пропадёт из списка. ключ больше не принимаем. история контактов остаётся.</div>`;
+    inner = `<div class="hint" style="padding:0">строка пропадёт из списка, этот ключ больше не принимаем. программа на сервере остаётся. история и правила сохраняются: при новой установке можно нажать «Продолжить историю».</div>`;
+  } else if (m.act === "remove") {
+    title = "Удалить с сервера";
+    meta = esc(a.name);
+    inner = `<div class="hint" style="padding:0">остановить агента, убрать программу, /var/lib/nmagent и таблицу inet netmon. nmserver и его база не трогаются.</div>`;
+    if (a.removing === "error") {
+      inner += `<div class="hint" style="padding:0">удаление не завершено: ${esc(a.removalError || "ошибка на сервере")}. Запись сохранена. Повторная доставка команды и запущенная служба удаления повторяют попытки.</div>`;
+    }
+    if (agentRemoveLive(a)) {
+      inner += `<div class="hint" style="padding:0">${a.removing === "wait" ? "удаление выполняется; ждём подтверждение результата. При обрыве связи отправка повторится." : "строка исчезнет только после подтверждённого удаления программы и её фильтрации."}</div>`;
+    } else {
+      const why = a.removing === "wait" || a.removing === "error" ? "подтверждения удаления пока нет. Для ручной очистки"
+        : a.removing === "old" ? "агент старой сборки снимать себя не умеет: обнови агента или"
+        : a.kind !== "trusted" ? "команду этому агенту не доставить:"
+        : "агент сейчас молчит, команду ему не доставить:";
+      inner += `<div class="hint" style="padding:0">${why} выполни на сервере, затем нажми «Забыть» — строка сама не пропадёт.</div>
+        <div class="cmdbox">${esc(agentRemoveCmd())}</div>`;
+    }
   } else if (m.act === "pause" && a.pauseUntil > Date.now()) {
     title = "Снять паузу авто-банов";
     meta = esc(a.name);
@@ -4938,6 +5031,17 @@ function renderAgentModal() {
   let html = modalShell(title, meta, body);
   if (m.act === "pause" && a.pauseUntil > Date.now()) {
     html = html.replace('<button type="button" data-a="save">Сохранить</button>', '<button type="button" data-a="save">Снять</button>');
+  }
+  if (m.act === "del") {
+    html = html.replace('<button type="button" data-a="save">Сохранить</button>', '<button type="button" data-a="save">Забыть</button>');
+  }
+  if (m.act === "remove") {
+    html = html.replace(
+      '<button type="button" data-a="save">Сохранить</button>',
+      agentRemoveLive(a)
+        ? '<button type="button" data-a="save">Удалить с сервера</button>'
+        : '<button type="button" data-a="copyremove">Копировать</button>'
+    );
   }
   if (m.act === "ok" && a.resumeHost) {
     html = html.replace(
@@ -5198,6 +5302,17 @@ function ruleHostsHtml(d, opts) {
     ${opts.allInFooter ? "" : hostsAllButtonHtml(d)}
     <div class="vm-grid">${btns}</div>
   </div>`;
+}
+function rememberSavedGroup(d, id) {
+  if (!id) return;
+  const row = {
+    id: id, order: Number(d.order) || 0, name: String(d.name || "").trim(),
+    policy: d.policy || "allow", members: d.members || "", hosts: d.hosts || "all",
+    mute: !!d.mute, except: d.except || []
+  };
+  const i = GROUPS.findIndex(g => g.id === id);
+  if (i >= 0) GROUPS[i] = Object.assign({}, GROUPS[i], row);
+  else GROUPS.push(row);
 }
 function groupSelectHtml(d, grouping) {
   const sel = GROUPS.some(g => g.id === d.group) ? d.group : "";
@@ -6101,7 +6216,7 @@ function openBrandModal() {
       <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
     </div>`;
-  showModal(modalShell("AVMBUR", "NetMonitor · 1.0 · 27.09.2026", body, ""), "brand");
+  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.1 · 28.09.2026", body, ""), "brand");
 }
 
 document.getElementById("profile").addEventListener("click", openProfileModal);
@@ -6216,7 +6331,8 @@ function saveModal() {
     const el = document.querySelector("#modal [data-k=name]");
     if (el) m.name = el.value;
     const a = m.agent;
-    const action = {ok:"trust",no:"reject",revoke:"revoke",del:"delete"}[m.act];
+    const action = {ok:"trust",no:"reject",revoke:"revoke",del:"delete",remove:"remove"}[m.act];
+    if (action === "remove" && !agentRemoveLive(a)) return;
     if (action) {
       if (m.saving) return;
       m.saving = true;
@@ -6224,7 +6340,7 @@ function saveModal() {
         method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name:m.name, resume: !!m.resume})
       }).then(async r => {
         if (!r.ok) throw new Error(await r.text());
-        closeModal(); await window.nmRefresh(); toastMsg("сохранено");
+        closeModal(); await window.nmRefresh(); toastMsg(action === "remove" ? "ждём ответ машины" : action === "delete" ? "агент забыт" : "сохранено");
       }).catch(e => {m.saving=false;toastMsg(e.message || "не удалось сохранить");});
     } else if (m.act === "asnew") { toastMsg("подтверждение клона ещё не реализовано"); }
     else if (m.act === "pause") {
@@ -6375,6 +6491,18 @@ document.getElementById("modal").addEventListener("click", ev => {
   }
   if (a === "copycmd" && m.kind === "install") {
     copyText(installCmd(m));
+    return;
+  }
+  if (a === "copyremove") {
+    copyText(agentRemoveCmd());
+    return;
+  }
+  if (a === "copyupdate" && state.modal && state.modal.manual) {
+    copyText(state.modal.manual);
+    return;
+  }
+  if (a === "updmon" || a === "updagents") {
+    runUpdate(a === "updmon" ? "monitor" : "agents");
     return;
   }
   if (m.kind === "snap") {
@@ -6730,7 +6858,9 @@ requestAnimationFrame(() => {
       polError: !!(a.fw && a.fw.error),
       polTip: a.fw ? (a.fw.error ? "Ошибка применения политики. " : "") + "Применена ревизия: " + (a.fw.applied_rev == null ? "нет" : a.fw.applied_rev) + "; ожидается: " + a.policy_rev + "; " + a.fw_backend + (a.fw.error ? "\n" + a.fw.error : "") : "Агент ещё не подтвердил применение",
       resumeHost: a.resume_host || "",
-      resumeName: a.resume_name || ""
+      resumeName: a.resume_name || "",
+      removing: a.removing || "",
+      removalError: a.removalError || ""
     }));
     AGENTS.splice(0, AGENTS.length, ...ag);
     const bansLive = liveArr(d, "bans");
@@ -7033,9 +7163,16 @@ requestAnimationFrame(() => {
  try{
   const r=await fetch("/ui/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});
   if(!r.ok)throw new Error(await r.text());const result=await r.json();
-  if(m)closeModal();await pull();
-  if(m && m.back){m.back.draft.group=result.id;state.modal=m.back;renderRuleModal();}
-  else if(m && m.next && QUESTIONS.length)openAskModal(QUESTIONS[0]);
+  if(m)closeModal();
+  if(m && m.back){
+    rememberSavedGroup(d, result.id);
+    try { await loadPolicy(); } catch (err) {}
+    if(!GROUPS.some(g => g.id === result.id)) rememberSavedGroup(d, result.id);
+    m.back.draft.group=result.id;state.modal=m.back;renderRuleModal();
+  } else {
+    await pull();
+    if(m && m.next && QUESTIONS.length)openAskModal(QUESTIONS[0]);
+  }
   toastMsg("группа сохранена");
  }catch(e){if(m)m.saving=false;else await pull();toastMsg(e.message||"не удалось сохранить группу");}
 };
@@ -7215,6 +7352,12 @@ window.nmSaveRule = async function(d,m,op) {
   document.addEventListener("click", ev => {
     if (ev.target.closest("[data-a=logout]")) {
       fetch("/ui/logout", { method: "POST" });
+    }
+    if (ev.target.closest("[data-check-update]")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openUpdateModal();
+      return;
     }
     if (ev.target.closest("[data-save-cfg]")) {
       ev.preventDefault();

@@ -34,7 +34,8 @@ import (
 	"netmonitor/internal/tlsutil"
 )
 
-const Version = "1.0"
+// Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
+var Version = "1.0.1"
 
 type Config struct {
 	Pin         string
@@ -51,6 +52,9 @@ type firewall interface {
 }
 
 type Agent struct {
+	startRemoval  func(string) error         // Optional test seam; production uses the durable worker.
+	startUpdate   func(string, string) error // Optional test seam; production replaces the binary.
+	updating      string                     // Команда обновления, уже запущенная этим процессом.
 	managed       bool
 	rules, groups []pol.Rule
 	process       collect.ProcessIndex

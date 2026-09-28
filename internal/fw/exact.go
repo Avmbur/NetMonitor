@@ -112,6 +112,10 @@ func emitPolicyRules(rs []policy.Rule, add func(string, string)) error {
 					}
 					if proto != "" && proto != "any" {
 						terms = append(terms, "meta l4proto "+proto)
+					} else if m.LocalPort > 0 || m.RemotePort > 0 || m.AnyPort > 0 {
+						// Порт при любом протоколе: tcp и udp, порт из общего заголовка.
+						terms = append(terms, "meta l4proto { tcp, udp }")
+						proto = "th"
 					}
 					if m.LocalPort > 0 {
 						terms = append(terms, fmt.Sprintf("%s %s %d", proto, lp, m.LocalPort))

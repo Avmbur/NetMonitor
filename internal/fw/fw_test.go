@@ -249,3 +249,22 @@ func TestStormAnyModeBeforeRules(t *testing.T) {
 		t.Fatal(b, st)
 	}
 }
+
+func TestPortWithAnyProtocolCoversTCPAndUDP(t *testing.T) {
+	r := policy.Rule{ID: "r", Enabled: true, Action: "deny", Hosts: []string{"h"}, Match: policy.Match{Direction: "out", Protocol: "any", RemotePort: 5432}}
+	if err := policy.Validate(r); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	if err := emitPolicyRules([]policy.Rule{r}, func(ch, line string) { lines = append(lines, ch+": "+line) }); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "output: ct direction original meta l4proto { tcp, udp } th dport 5432") || strings.Contains(joined, "any") {
+		t.Fatal(joined)
+	}
+	r.Match.Protocol = "icmp"
+	if policy.Validate(r) == nil {
+		t.Fatal("icmp with a port accepted")
+	}
+}

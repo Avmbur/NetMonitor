@@ -639,7 +639,7 @@ func ipToPrefix(s string) (string, bool) {
 }
 
 func isServiceRuleID(id string) bool {
-	return strings.HasPrefix(id, "monitor-svc-")
+	return strings.HasPrefix(id, "monitor-svc-") || strings.HasPrefix(id, "park-svc-")
 }
 
 func findDuplicateRule(tx *sql.Tx, rule policy.Rule) (string, error) {
