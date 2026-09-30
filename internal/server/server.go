@@ -26,7 +26,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.1"
+var Version = "1.0.2"
 
 type Config struct {
 	ArtifactDir string
