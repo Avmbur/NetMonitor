@@ -1607,6 +1607,16 @@ function esc(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[ch]));
 }
+function insideDir(d) {
+  return d === "bridge" || d === "tohost" || d === "fromhost";
+}
+function questionMatchesRow(r, q) {
+  return r.peer === q.peer && r.dir === q.dir && r.proto === q.proto &&
+    Number(r.port || 0) === Number(q.port || 0) &&
+    (r.containerIP || "") === (q.containerIP || "") &&
+    (!!q.containerIP || (r.container || "") === (q.container || ""));
+}
+
 function R(o) {
   return Object.assign({
     proc: "—", path: "", dir: "out", proto: "tcp", addr: "", peer: "",
@@ -2828,8 +2838,8 @@ function renderLog() {
   const histView = histSrc.slice(histPage.sliceFrom, histPage.sliceTo);
   const audit = auditView.map(r => [whenText(r.at), r.who, r.action, r.object]);
   const hist = histView.map(r => [
-    whenText(r.at), hostName(r.vm), r.proc,
-    r.dir === "in" ? `<span class="dir-in">вход</span>` : `<span class="dir-out">исход</span>`,
+    whenText(r.at), hostName(r.vm), r.container ? "▣ " + r.container : r.proc,
+    r.dir === "in" ? `<span class="dir-in">вход</span>` : insideDir(r.dir) ? `<span class="dir-out">внутри</span>` : `<span class="dir-out">исход</span>`,
     r.proto, `<span class="addr">${esc(r.addr)}</span>`, r.rx, r.tx, r.rule
   ]);
   const emptyH = histSrc.length ? "" : `<div class="hint">ничего не нашлось · конец списка</div>`;
@@ -3456,7 +3466,7 @@ function policyBlocks() {
   const qhtml = qs.length
     ? qs.map(q => `
       <div class="qitem" data-id="${q.id}">
-        <div class="who">сервер: ${esc((vmById[q.vm] && vmById[q.vm].name) || q.vm)} · процесс: ${esc(q.proc)}</div>
+        <div class="who">сервер: ${esc((vmById[q.vm] && vmById[q.vm].name) || q.vm)} · ${q.container ? "контейнер: ▣ " + esc(q.container) : "процесс: " + esc(q.proc)}</div>
         <div class="dest">${q.dir === "in" ? "входящий" : "исходящий"} ${esc(q.proto)} на ${addrMark(q.dest, q.peer)}</div>
         <div class="rep">${esc(q.at || "")} · повторов ${q.repeats} · ${esc(q.names)}</div>
       </div>`).join("")
@@ -4005,8 +4015,8 @@ function buildTable(vm) {
     if (r.ask) tr.classList.add("ask");
     const ac = addrCellHtml(r);
     const all = {
-      proc: { text: r.proc, title: rowTip(r), cls: "" },
-      dir: { text: r.dir === "in" ? "вход" : "исход", cls: r.dir === "in" ? "dir-in" : "dir-out" },
+      proc: { text: r.container ? "▣ " + r.container : r.proc, title: r.container ? "контейнер Docker" : rowTip(r), cls: "" },
+      dir: { text: r.dir === "in" ? "вход" : insideDir(r.dir) ? "внутри" : "исход", cls: r.dir === "in" ? "dir-in" : "dir-out" },
       proto: { text: r.proto, cls: "proto" },
       addr: { html: ac.html, title: ac.title, cls: "addr" },
       rule: { text: r.rule, title: rowTip(r), cls: "" },
@@ -6784,9 +6794,11 @@ requestAnimationFrame(() => {
       });
       const next = servers.map(s => {
         const rows = (byHost[s.host_id] || []).map(f => R({
-          proc: f.proc || "—",
+          proc: f.container ? "—" : (f.proc || "—"),
+          container: f.container || "",
+          containerIP: f.container_ip || "", port: f.port || 0,
           path: f.path || "",
-          dir: f.direction === "in" ? "in" : f.direction === "out" ? "out" : "out",
+          dir: f.direction === "in" ? "in" : insideDir(f.direction) ? f.direction : "out",
           proto: f.protocol || "",
           addr: f.addr || f.remote || "",
           peer: f.peer || "",
@@ -6890,7 +6902,8 @@ requestAnimationFrame(() => {
     }
     if (qLive) {
     const qs = qLive.map(q => ({
-      id: q.id, vm: q.vm || q.host_id, proc: q.proc || "—", path: q.path || "",
+      id: q.id, vm: q.vm || q.host_id, proc: q.container ? "—" : (q.proc || "—"), container: q.container || "", path: q.container ? "" : (q.path || ""),
+      containerIP: q.container_ip || "", port: q.port || 0,
       dir: q.dir || "out", proto: q.proto || "", dest: q.dest || "", peer: q.peer || "",
       names: q.names || "", repeats: q.repeats || 1, at: q.at || "", inbound: !!q.inbound
     }));
@@ -6900,19 +6913,23 @@ requestAnimationFrame(() => {
       QUESTIONS.filter(q => q.vm === vm.id).forEach(q => {
         const dir = q.dir === "in" || q.inbound ? "in" : "out";
         const proto = q.proto || "";
-        const hit = vm.rows.find(r => r.peer === q.peer && r.dir === dir && r.proto === proto);
+        // Вопрос контейнера — только к строке того же контейнера, вопрос хоста — к строке хоста.
+        const hit = vm.rows.find(r => questionMatchesRow(r, q));
         if (hit) {
           hit.ask = true;
           if (!hit.rule || hit.rule === "—") hit.rule = "обучение";
           hit.state = "block";
           hit.qid = q.id;
-          if ((!hit.proc || hit.proc === "—") && q.proc && q.proc !== "—") hit.proc = q.proc;
+          if (q.container) hit.container = q.container;
+          if (!q.container && (!hit.proc || hit.proc === "—") && q.proc && q.proc !== "—") hit.proc = q.proc;
           if (q.names && !hit.dns) hit.dns = q.names;
           hit.showName = !!addrShowName[vm.id + "|" + (hit.peer || "")];
         } else {
           vm.rows.unshift(R({
-            proc: q.proc || "—",
-            path: q.path || "",
+            proc: q.container ? "—" : (q.proc || "—"),
+            container: q.container || "",
+            containerIP: q.containerIP || "", port: q.port || 0,
+            path: q.container ? "" : (q.path || ""),
             dir: dir,
             proto: proto,
             addr: q.dest || q.peer || "",
@@ -6979,8 +6996,8 @@ requestAnimationFrame(() => {
     const histLive = liveArr(d, "history");
     if (histLive) {
     const hist = histLive.map(f => ({
-      at: f.at || f.when || "", vm: f.host_id || f.vm || f.server, proc: f.proc || "—",
-      dir: (f.direction || f.dir) === "in" ? "in" : "out",
+      at: f.at || f.when || "", vm: f.host_id || f.vm || f.server, proc: f.container ? "—" : (f.proc || "—"), container: f.container || "",
+      dir: (f.direction || f.dir) === "in" ? "in" : insideDir(f.direction || f.dir) ? (f.direction || f.dir) : "out",
       proto: f.protocol || f.proto || "",
       addr: f.addr || f.remote || "", peer: f.peer || "",
       rx: typeof f.rx === "number" ? bytes(f.rx) : (f.rx || "0 B"),

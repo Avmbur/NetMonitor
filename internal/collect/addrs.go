@@ -3,6 +3,7 @@ package collect
 import (
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 )
 
@@ -12,14 +13,17 @@ func LocalAddrs() []netip.Addr {
 }
 
 type NetView struct {
-	AddrIface  map[string]string
-	Local      []netip.Addr
-	Overlay    []netip.Prefix
-	DockerNets []netip.Prefix
+	AddrIface    map[string]string
+	Local        []netip.Addr
+	Overlay      []netip.Prefix
+	DockerNets   []netip.Prefix
+	BridgeIfaces []string
+	BridgeNets   []netip.Prefix
 }
 
 func LocalView(skip map[string]bool) NetView {
 	v := NetView{AddrIface: map[string]string{}}
+	seenBridge := map[string]bool{}
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return v
@@ -59,6 +63,13 @@ func LocalView(skip map[string]bool) NetView {
 			if docker && !a.IsLoopback() {
 				v.DockerNets = append(v.DockerNets, px)
 			}
+			if IsDockerBridge(name) && !a.IsLoopback() {
+				if !seenBridge[name] {
+					seenBridge[name] = true
+					v.BridgeIfaces = append(v.BridgeIfaces, name)
+				}
+				v.BridgeNets = append(v.BridgeNets, px.Masked())
+			}
 			if a.IsLoopback() {
 				continue
 			}
@@ -66,7 +77,26 @@ func LocalView(skip map[string]bool) NetView {
 			v.AddrIface[a.String()] = name
 		}
 	}
+	sort.Strings(v.BridgeIfaces)
 	return v
+}
+
+// IsDockerBridge reports a bridge Docker itself creates: docker0, or br- and
+// exactly twelve hex digits. A host bridge named br-lan is not one of them.
+func IsDockerBridge(name string) bool {
+	n := strings.ToLower(name)
+	if n == "docker0" {
+		return true
+	}
+	if len(n) != 15 || !strings.HasPrefix(n, "br-") {
+		return false
+	}
+	for _, c := range n[3:] {
+		if c < '0' || (c > '9' && c < 'a') || c > 'f' {
+			return false
+		}
+	}
+	return true
 }
 
 func overlayIface(name string) bool {

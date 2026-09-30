@@ -157,7 +157,7 @@ func strictPrefixes(ss []string) ([]netip.Prefix, error) {
 // policyLocked and setPolicyLocked require fwMu.
 func (a *Agent) policyLocked() fw.Policy {
 	_, port := a.monitorAddr()
-	return fw.Policy{Managed: a.managed, Rules: a.rules, Groups: a.groups, Blocks: a.applied, BlockNets: a.nets, AllowNets: a.allows, Never: a.never, Monitor: a.monitorIP(), MonitorPort: port, Mode: a.mode}
+	return fw.Policy{Managed: a.managed, Rules: a.rules, Groups: a.groups, Blocks: a.applied, BlockNets: a.nets, AllowNets: a.allows, Never: a.never, Monitor: a.monitorIP(), MonitorPort: port, Mode: a.mode, DockerIfaces: a.dockerIfaces, DockerNets: a.dockerNets}
 }
 func (a *Agent) setPolicyLocked(p fw.Policy) {
 	a.managed = p.Managed
@@ -168,6 +168,13 @@ func (a *Agent) setPolicyLocked(p fw.Policy) {
 	a.allows = p.AllowNets
 	a.never = p.Never
 	a.mode = p.Mode
+	a.dockerIfaces = append([]string(nil), p.DockerIfaces...)
+	a.dockerNets = append([]netip.Prefix(nil), p.DockerNets...)
+}
+func (a *Agent) fillBridges(p *fw.Policy) {
+	view := collect.LocalView(a.skipIfaces)
+	p.DockerIfaces = append([]string(nil), view.BridgeIfaces...)
+	p.DockerNets = append([]netip.Prefix(nil), view.BridgeNets...)
 }
 
 func (a *Agent) adoptViewLocked(pr protocol.PollRes) {
@@ -238,6 +245,10 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 		}
 		control.OnceUsed = keep
 		p = markOnceUsed(p, control.OnceUsed)
+	}
+	if err == nil {
+		a.fillBridges(&p)
+		a.setContainerNets(p.DockerNets)
 	}
 	if err == nil && (a.actualRev == nil || *a.actualRev != pr.PolicyRev || a.fwError != "" || !reflect.DeepEqual(p, a.policyLocked())) {
 		err = a.firewall.Apply(p)

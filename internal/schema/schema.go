@@ -14,7 +14,7 @@ var MonitorSQL string
 //go:embed agent.sql
 var AgentSQL string
 
-const version = 9
+const version = 10
 const agentVersion = 6
 const monitorID = 0x4e4d4f4e // NMON
 const agentID = 0x4e4d4147   // NMAG
@@ -143,6 +143,16 @@ func apply(db *sql.DB, script string, appID int, required, forbidden string) err
 		} {
 			if _, err := tx.Exec(stmt); err != nil {
 				return fmt.Errorf("v9: %w", err)
+			}
+		}
+	}
+	if ver != 0 && ver < 10 && appID == monitorID {
+		for _, stmt := range []string{
+			`ALTER TABLE flows ADD COLUMN container TEXT`,
+			`ALTER TABLE learn_questions ADD COLUMN container TEXT`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("v10: %w", err)
 			}
 		}
 	}

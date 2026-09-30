@@ -598,19 +598,22 @@ type uiState struct {
 }
 
 type uiQuestion struct {
-	ID      string `json:"id"`
-	HostID  string `json:"host_id"`
-	VM      string `json:"vm"`
-	Proc    string `json:"proc"`
-	Path    string `json:"path"`
-	Dir     string `json:"dir"`
-	Proto   string `json:"proto"`
-	Dest    string `json:"dest"`
-	Peer    string `json:"peer"`
-	Names   string `json:"names"`
-	Repeats int    `json:"repeats"`
-	At      string `json:"at"`
-	Inbound bool   `json:"inbound"`
+	ID          string `json:"id"`
+	HostID      string `json:"host_id"`
+	VM          string `json:"vm"`
+	Proc        string `json:"proc"`
+	Container   string `json:"container,omitempty"`
+	ContainerIP string `json:"container_ip,omitempty"`
+	Port        int    `json:"port"`
+	Path        string `json:"path"`
+	Dir         string `json:"dir"`
+	Proto       string `json:"proto"`
+	Dest        string `json:"dest"`
+	Peer        string `json:"peer"`
+	Names       string `json:"names"`
+	Repeats     int    `json:"repeats"`
+	At          string `json:"at"`
+	Inbound     bool   `json:"inbound"`
 }
 
 type uiBan struct {
@@ -712,28 +715,31 @@ type uiAlert struct {
 }
 
 type uiFlow struct {
-	FlowUID    string `json:"flow_uid"`
-	Ended      *int64 `json:"ended_at_ms"`
-	Incomplete bool   `json:"incomplete"`
-	When       string `json:"when"`
-	HostID     string `json:"host_id"`
-	Server     string `json:"server"`
-	Direction  string `json:"direction"`
-	Protocol   string `json:"protocol"`
-	Local      string `json:"local"`
-	Remote     string `json:"remote"`
-	Proc       string `json:"proc"`
-	Path       string `json:"path"`
-	Addr       string `json:"addr"`
-	Peer       string `json:"peer"`
-	DNS        string `json:"dns"`
-	Rx         int64  `json:"rx"`
-	Tx         int64  `json:"tx"`
-	Rate       int64  `json:"rate"`
-	RateKnown  bool   `json:"rate_known"`
-	Rule       string `json:"rule"`
-	State      string `json:"state"`
-	Tip        string `json:"tip"`
+	FlowUID     string `json:"flow_uid"`
+	Ended       *int64 `json:"ended_at_ms"`
+	Incomplete  bool   `json:"incomplete"`
+	When        string `json:"when"`
+	HostID      string `json:"host_id"`
+	Server      string `json:"server"`
+	Direction   string `json:"direction"`
+	Protocol    string `json:"protocol"`
+	Local       string `json:"local"`
+	Remote      string `json:"remote"`
+	Proc        string `json:"proc"`
+	Container   string `json:"container,omitempty"`
+	ContainerIP string `json:"container_ip,omitempty"`
+	Port        int    `json:"port"`
+	Path        string `json:"path"`
+	Addr        string `json:"addr"`
+	Peer        string `json:"peer"`
+	DNS         string `json:"dns"`
+	Rx          int64  `json:"rx"`
+	Tx          int64  `json:"tx"`
+	Rate        int64  `json:"rate"`
+	RateKnown   bool   `json:"rate_known"`
+	Rule        string `json:"rule"`
+	State       string `json:"state"`
+	Tip         string `json:"tip"`
 }
 
 func sectionIn(section string, names ...string) bool {
@@ -980,9 +986,9 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 }
 
 func (s *Server) listQuestions(db *checkedRead, serverFilter string, hostFilter bool) []uiQuestion {
-	q := `SELECT q.question_id, q.host_id, COALESCE(h.hostname,''), COALESCE(q.proc_comm,''), COALESCE(q.proc_path,''),
+	q := `SELECT q.question_id, q.host_id, COALESCE(h.hostname,''), COALESCE(q.proc_comm,''), COALESCE(q.proc_path,''), COALESCE(q.container,''),
 		COALESCE(q.direction,''), COALESCE(q.protocol,''), COALESCE(q.remote_ip,''), CASE WHEN q.direction='in' THEN COALESCE(q.local_port,0) ELSE COALESCE(q.remote_port,0) END,
-		COALESCE(q.dns_name,''), q.repeats, q.opened_at_ms
+		COALESCE(q.dns_name,''), q.repeats, q.opened_at_ms, q.dedup_key
 		FROM learn_questions q LEFT JOIN hosts h ON h.host_id=q.host_id
 		WHERE q.status='open' AND q.host_id IN (SELECT host_id FROM agents WHERE trust_state='trusted')`
 	args := []any{}
@@ -1000,12 +1006,22 @@ func (s *Server) listQuestions(db *checkedRead, serverFilter string, hostFilter 
 	for rows.Next() {
 		var u uiQuestion
 		var rport, opened int64
-		if err := rows.Scan(&u.ID, &u.HostID, &u.VM, &u.Proc, &u.Path, &u.Dir, &u.Proto, &u.Peer, &rport, &u.Names, &u.Repeats, &opened); err != nil {
+		var dedupKey string
+		if err := rows.Scan(&u.ID, &u.HostID, &u.VM, &u.Proc, &u.Path, &u.Container, &u.Dir, &u.Proto, &u.Peer, &rport, &u.Names, &u.Repeats, &opened, &dedupKey); err != nil {
 			continue
 		}
 		u.VM = u.HostID
+		u.Port = int(rport)
+		if _, ip, ok := strings.Cut(dedupKey, "|\u25a3"); ok {
+			if addr, err := netip.ParseAddr(ip); err == nil {
+				u.ContainerIP = addr.Unmap().String()
+			}
+		}
+		if u.ContainerIP != "" || u.Container != "" {
+			u.Proc, u.Path = "", ""
+		}
 		u.Proc = displayProc(u.Proc, u.Path)
-		if u.Proc == "" {
+		if u.Proc == "" && u.ContainerIP == "" && u.Container == "" {
 			u.Proc = flowProcForQuestion(db, u)
 		}
 		if u.Proc == "" {
@@ -1192,8 +1208,8 @@ func asInt(v any) int {
 
 func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlow {
 	q := `SELECT f.flow_uid,datetime(f.last_seen_at_ms/1000,'unixepoch','localtime'),f.host_id,COALESCE(h.hostname,''),f.direction,f.protocol,
- f.local_ip,f.local_port,f.remote_ip,f.remote_port,COALESCE(f.proc_comm,''),COALESCE(f.proc_path,''),f.proc_uid,COALESCE(f.proc_cgroup,''),COALESCE(f.dns_name,''),
- COALESCE(f.orig_bytes,0),COALESCE(f.reply_bytes,0),COALESCE(f.state,''),f.ended_at_ms,f.incomplete,f.reply_seen,COALESCE(h.last_seen_ms,0)
+ f.local_ip,f.local_port,f.remote_ip,f.remote_port,COALESCE(f.proc_comm,''),COALESCE(f.proc_path,''),f.proc_uid,COALESCE(f.proc_cgroup,''),COALESCE(f.container,''),COALESCE(f.dns_name,''),
+ COALESCE(f.orig_bytes,0),COALESCE(f.reply_bytes,0),COALESCE(f.state,''),f.ended_at_ms,f.incomplete,f.reply_seen,COALESCE(h.last_seen_ms,0),COALESCE(f.origin,''),COALESCE(f.reply_src_ip,'')
  FROM flows f LEFT JOIN hosts h ON h.host_id=f.host_id WHERE f.agent_id IN (SELECT agent_id FROM agents WHERE trust_state='trusted')`
 	var args []any
 	if !history {
@@ -1209,6 +1225,7 @@ func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlo
 	}
 	type flowRow struct {
 		f                            uiFlow
+		origin, replySrc             string
 		lip, rip, state, cg, flowDNS string
 		lp, rp, end, puid            sql.NullInt64
 		ob, rb, last                 int64
@@ -1224,7 +1241,7 @@ func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlo
 	var raw []flowRow
 	for rows.Next() {
 		var r flowRow
-		if err = rows.Scan(&r.f.FlowUID, &r.f.When, &r.f.HostID, &r.f.Server, &r.f.Direction, &r.f.Protocol, &r.lip, &r.lp, &r.rip, &r.rp, &r.f.Proc, &r.f.Path, &r.puid, &r.cg, &r.flowDNS, &r.ob, &r.rb, &r.state, &r.end, &r.f.Incomplete, &r.reply, &r.last); err != nil {
+		if err = rows.Scan(&r.f.FlowUID, &r.f.When, &r.f.HostID, &r.f.Server, &r.f.Direction, &r.f.Protocol, &r.lip, &r.lp, &r.rip, &r.rp, &r.f.Proc, &r.f.Path, &r.puid, &r.cg, &r.f.Container, &r.flowDNS, &r.ob, &r.rb, &r.state, &r.end, &r.f.Incomplete, &r.reply, &r.last, &r.origin, &r.replySrc); err != nil {
 			rows.Close()
 			db.record(err)
 			return nil
@@ -1243,6 +1260,17 @@ func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlo
 		lip, rip, state, cg, flowDNS := r.lip, r.rip, r.state, r.cg, r.flowDNS
 		lp, rp, end, puid := r.lp, r.rp, r.end, r.puid
 		ob, rb, last, reply := r.ob, r.rb, r.last, r.reply
+		f.Port = int(rp.Int64)
+		if f.Direction == "in" {
+			f.Port = int(lp.Int64)
+		}
+		if (r.origin == "docker" || f.Container != "") && f.Direction != "bridge" {
+			f.ContainerIP = lip
+			if f.Direction == "in" && r.replySrc != "" {
+				f.ContainerIP = r.replySrc
+			}
+			f.Proc, f.Path, cg, puid = "", "", "", sql.NullInt64{}
+		}
 		var uid *int
 		if puid.Valid {
 			n := int(puid.Int64)

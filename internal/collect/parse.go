@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -30,6 +31,12 @@ type Entry struct {
 	ReplyBytes                 int64
 	Unreplied                  bool
 	Assured                    bool
+	// TCPFlags is the TCP flag byte. TCPFlagsKnown is false for conntrack dumps.
+	TCPFlags      int
+	TCPFlagsKnown bool
+	// NFLOG carries the packet direction from conntrack, for every protocol.
+	CTDirectionKnown bool
+	CTReply          bool
 }
 
 func (e Entry) TupleKey() string {
@@ -136,6 +143,10 @@ func ParseLine(line string) (Entry, bool) {
 }
 
 func Classify(e Entry, local []netip.Addr) (dir, localIP, remoteIP string, localPort, remotePort *int) {
+	return ClassifyNets(e, local, nil)
+}
+
+func ClassifyNets(e Entry, local []netip.Addr, docker []netip.Prefix) (dir, localIP, remoteIP string, localPort, remotePort *int) {
 	loc := make(map[netip.Addr]struct{}, len(local))
 	for _, a := range local {
 		loc[a.Unmap()] = struct{}{}
@@ -143,14 +154,39 @@ func Classify(e Entry, local []netip.Addr) (dir, localIP, remoteIP string, local
 	os, od := e.OrigSrc.Unmap(), e.OrigDst.Unmap()
 	_, srcLocal := loc[os]
 	_, dstLocal := loc[od]
+	srcDocker := prefixContains(os, docker)
+	dstDocker := prefixContains(od, docker)
 	switch {
+	case srcDocker && dstLocal && !srcLocal:
+		return "tohost", netipx.Canonical(os), netipx.Canonical(od), e.OrigSport, e.OrigDport
+	case srcLocal && dstDocker && !dstLocal:
+		return "fromhost", netipx.Canonical(os), netipx.Canonical(od), e.OrigSport, e.OrigDport
+	case srcDocker && dstDocker:
+		return "bridge", netipx.Canonical(os), netipx.Canonical(od), e.OrigSport, e.OrigDport
 	case srcLocal && !dstLocal:
 		return "out", netipx.Canonical(os), netipx.Canonical(od), e.OrigSport, e.OrigDport
 	case dstLocal && !srcLocal:
 		return "in", netipx.Canonical(od), netipx.Canonical(os), e.OrigDport, e.OrigSport
+	case srcDocker && !dstLocal && !dstDocker:
+		return "out", netipx.Canonical(os), netipx.Canonical(od), e.OrigSport, e.OrigDport
+	case dstDocker && !srcLocal && !srcDocker:
+		return "in", netipx.Canonical(od), netipx.Canonical(os), e.OrigDport, e.OrigSport
 	default:
 		return "unknown", netipx.Canonical(os), netipx.Canonical(od), e.OrigSport, e.OrigDport
 	}
+}
+
+func prefixContains(ip netip.Addr, nets []netip.Prefix) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func Skip(e Entry, monitor netip.Addr, monitorPort int) bool {
@@ -201,13 +237,53 @@ func portStr(p *int) string {
 	return strconv.Itoa(*p)
 }
 
+// TCPReply is a TCP packet that does not open a session. A bare SYN does.
+// SYN+ACK and later flags are the reply half of a session we already opened.
+func (e Entry) TCPReply() bool {
+	if e.Protocol != "tcp" || !e.TCPFlagsKnown {
+		return false
+	}
+	const syn, ack = 0x02, 0x10
+	return e.TCPFlags&syn == 0 || e.TCPFlags&ack != 0
+}
+
 // ClassifySession is Classify with the listening socket deciding the side of a
 // conversation: a reply of a local service leaves through the output path, yet
 // it belongs to the session somebody opened towards us.
+// HostSide is traffic the firewall lets through between a container and the
+// host or another container. It is not an external contact.
+func HostSide(dir string) bool {
+	return dir == "bridge" || dir == "tohost" || dir == "fromhost"
+}
+
 func ClassifySession(e Entry, local []netip.Addr) (dir, localIP, remoteIP string, localPort, remotePort *int) {
-	dir, lip, rip, lp, rp := Classify(e, local)
+	return ClassifySessionNets(e, local, nil)
+}
+
+func ClassifySessionNets(e Entry, local []netip.Addr, docker []netip.Prefix) (dir, localIP, remoteIP string, localPort, remotePort *int) {
+	dir, lip, rip, lp, rp := ClassifyNets(e, local, docker)
+	// Порт контейнера не сравниваем со слушающими портами хоста.
+	if ip, err := netip.ParseAddr(lip); err == nil && prefixContains(ip, docker) {
+		return dir, lip, rip, lp, rp
+	}
 	if dir == "out" && lp != nil && Listening(e.Protocol, *lp) && (rp == nil || !Listening(e.Protocol, *rp)) {
 		dir = "in"
 	}
 	return dir, lip, rip, lp, rp
+}
+
+// setNFLogCTInfo reads NFULA_CT_INFO (enum ip_conntrack_info, network byte order).
+// Values 0..2 describe original packets; 3..4 describe replies. Missing or
+// unknown values must not be mistaken for an original packet.
+func (e *Entry) setNFLogCTInfo(v []byte) {
+	e.CTDirectionKnown, e.CTReply = false, false
+	if len(v) != 4 {
+		return
+	}
+	info := binary.BigEndian.Uint32(v)
+	if info > 4 {
+		return
+	}
+	e.CTDirectionKnown = true
+	e.CTReply = info >= 3
 }

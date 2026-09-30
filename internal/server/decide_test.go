@@ -36,6 +36,28 @@ func TestFlowVerdictObservePassesAndAlertCuts(t *testing.T) {
 	if d.needsQuestion(policy.Contact{Direction: "in", Protocol: "tcp", RemoteIP: "1.1.1.1", LocalPort: 22, Host: "h"}, now) {
 		t.Fatal("matching allow still asks")
 	}
+	name, st, _ = d.explain(policy.Contact{Direction: "bridge", RemoteIP: "172.17.0.3", Host: "h"}, now)
+	if name != "docker" || st != "open" {
+		t.Fatal("bridge", name, st)
+	}
+	name, st, _ = d.explain(policy.Contact{Direction: "tohost", Protocol: "tcp", RemoteIP: "172.17.0.1", RemotePort: 22, Host: "h"}, now)
+	if name != "docker" || st != "open" {
+		t.Fatal("tohost learn", name, st)
+	}
+	d.mode = "quarantine"
+	name, st, _ = d.explain(policy.Contact{Direction: "tohost", Protocol: "tcp", RemoteIP: "172.17.0.1", RemotePort: 22, Host: "h"}, now)
+	if name != "карантин" || st != "block" {
+		t.Fatal("quarantine tohost", name, st)
+	}
+	name, st, _ = d.explain(policy.Contact{Direction: "tohost", Protocol: "udp", RemoteIP: "172.17.0.1", RemotePort: 53, Host: "h"}, now)
+	if name != "docker" || st != "open" {
+		t.Fatal("quarantine dns", name, st)
+	}
+	name, st, _ = d.explain(policy.Contact{Direction: "fromhost", Protocol: "tcp", RemoteIP: "172.17.0.2", RemotePort: 80, Host: "h"}, now)
+	if name != "docker" || st != "open" {
+		t.Fatal("fromhost", name, st)
+	}
+	d.mode = "learn"
 	name, st, _ = d.explain(policy.Contact{RemoteIP: "9.9.9.9", Host: "h"}, now)
 	if name != "обучение" || st != "block" {
 		t.Fatal(name, st)

@@ -60,6 +60,15 @@ func (d hostDecision) explain(c policy.Contact, now int64) (name, state, detail 
 }
 
 func (d hostDecision) resolve(c policy.Contact, now int64) (name, action, state string) {
+	switch c.Direction {
+	case "bridge", "fromhost":
+		return "docker", "allow", "open"
+	case "tohost":
+		if d.mode == "quarantine" && !containerDNS(c) {
+			return "карантин", "deny", "block"
+		}
+		return "docker", "allow", "open"
+	}
 	ip, err := netip.ParseAddr(c.RemoteIP)
 	if err == nil {
 		ip = ip.Unmap()
@@ -99,6 +108,13 @@ func (d hostDecision) resolve(c policy.Contact, now int64) (name, action, state 
 	default:
 		return "—", "allow", "open"
 	}
+}
+
+func containerDNS(c policy.Contact) bool {
+	if c.RemotePort != 53 {
+		return false
+	}
+	return c.Protocol == "" || c.Protocol == "tcp" || c.Protocol == "udp"
 }
 
 func (d hostDecision) stormNamed(ip netip.Addr) bool {

@@ -78,6 +78,14 @@ type Agent struct {
 	allows        []netip.Prefix
 	never         []netip.Prefix
 	lan, own      []netip.Prefix
+	dockerIfaces  []string
+	dockerNets    []netip.Prefix
+	// Имена контейнеров под своим мьютексом: читаются и из транзакции сборщика,
+	// где ждать fwMu нельзя (применение политики держит fwMu и ждёт БД).
+	contMu        sync.Mutex
+	containers    map[string]string
+	containersAt  time.Time
+	containerNets []netip.Prefix
 	observeDocker bool
 	skipIfaces    map[string]bool
 	mode          string
@@ -537,6 +545,7 @@ func (a *Agent) Run() error {
 	go a.watchNFLog(stop)
 	go a.pollLoop()
 	go a.watchdog()
+	go a.watchLinks(stop)
 	// Three independent requests: slow backlog cannot block heartbeat or a new decision.
 	for _, lane := range []string{"urgent", "heartbeat", "history"} {
 		go a.deliver(stop, lane)
@@ -602,7 +611,7 @@ func (a *Agent) dumpOpts() collect.DumpOpts {
 		LAN:           lan,
 		Overlay:       view.Overlay,
 		Own:           own,
-		DockerNets:    view.DockerNets,
+		DockerNets:    view.BridgeNets,
 		SkipIfaces:    skip,
 		AddrIface:     view.AddrIface,
 		ObserveDocker: observe,
@@ -612,7 +621,50 @@ func (a *Agent) dumpOpts() collect.DumpOpts {
 		MonoMS:        collect.MonotonicMS(),
 		Namespace:     collect.Namespace(),
 		Process:       a.process.Lookup,
+		Container:     a.containerName,
 	}
+}
+
+// containerName ищет имя по адресу контейнера. Новый контейнер ещё не в карте:
+// перечитываем её сразу, но не чаще раза в секунду, иначе первый вопрос
+// по свежему контейнеру придёт без имени и не склеится со следующим.
+func (a *Agent) containerName(ip string) string {
+	a.contMu.Lock()
+	defer a.contMu.Unlock()
+	if name, ok := a.containers[ip]; ok || ip == "" {
+		return name
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || time.Since(a.containersAt) < time.Second || !inPrefixes(addr.Unmap(), a.containerNets) {
+		return ""
+	}
+	a.containers = collect.ContainerNames("")
+	a.containersAt = time.Now()
+	return a.containers[ip]
+}
+
+func (a *Agent) refreshContainers(nets []netip.Prefix) {
+	names := collect.ContainerNames("")
+	a.contMu.Lock()
+	a.containers, a.containersAt = names, time.Now()
+	a.containerNets = append([]netip.Prefix(nil), nets...)
+	a.contMu.Unlock()
+}
+
+// setContainerNets только сообщает, где искать контейнеры; файлы читает промах.
+func (a *Agent) setContainerNets(nets []netip.Prefix) {
+	a.contMu.Lock()
+	a.containerNets = append([]netip.Prefix(nil), nets...)
+	a.contMu.Unlock()
+}
+
+func inPrefixes(ip netip.Addr, nets []netip.Prefix) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) dumpOnce() {
@@ -652,11 +704,18 @@ func (a *Agent) noteLearnSets() {
 }
 
 func (a *Agent) noteOnce(e collect.Entry) {
-	dir, _, remoteIP, lport, rport := collect.Classify(e, collect.LocalAddrs())
-	if dir == "" || dir == "unknown" || remoteIP == "" {
+	a.fwMu.RLock()
+	nets := a.dockerNets
+	a.fwMu.RUnlock()
+	dir, lip, remoteIP, lport, rport := collect.ClassifySessionNets(e, collect.LocalAddrs(), nets)
+	if dir == "" || dir == "unknown" || collect.HostSide(dir) || remoteIP == "" {
 		return
 	}
-	proc := a.process.Lookup(e)
+	var proc collect.Process
+	addr, _ := netip.ParseAddr(lip)
+	if !inPrefixes(addr.Unmap(), nets) && !inPrefixes(e.ReplySrc.Unmap(), nets) {
+		proc = a.process.Lookup(e)
+	}
 	lp, rp := 0, 0
 	if lport != nil {
 		lp = *lport
@@ -696,6 +755,11 @@ func (a *Agent) noteOnce(e collect.Entry) {
 }
 
 func (a *Agent) noteLearn(e collect.Entry, dropped ...bool) {
+	// A reply belongs to an existing contact, even if an alert group logged it
+	// before the policy tail. Keep its firewall event, but do not ask again.
+	if e.CTDirectionKnown && e.CTReply {
+		return
+	}
 	a.fwMu.RLock()
 	managed := a.managed
 	a.fwMu.RUnlock()
@@ -708,11 +772,30 @@ func (a *Agent) noteLearn(e collect.Entry, dropped ...bool) {
 	if mode != "learn" && !managed {
 		return
 	}
-	dir, _, remoteIP, lport, rport := collect.ClassifySession(e, collect.LocalAddrs())
-	if dir == "" || dir == "unknown" || remoteIP == "" {
+	a.fwMu.RLock()
+	nets := a.dockerNets
+	a.fwMu.RUnlock()
+	dir, lip, remoteIP, lport, rport := collect.ClassifySessionNets(e, collect.LocalAddrs(), nets)
+	if dir == "" || dir == "unknown" || collect.HostSide(dir) || remoteIP == "" {
 		return
 	}
-	proc := a.process.Lookup(e)
+	// Ответ на наш исходящий приходит на input и похож на вход на случайный порт.
+	if !e.CTDirectionKnown && dir == "in" && e.TCPReply() && lport != nil && !collect.Listening(e.Protocol, *lport) {
+		return
+	}
+	// Адрес контейнера: при исходе — локальный, при входе через DNAT — ответчик.
+	cip := ""
+	if ip, err := netip.ParseAddr(lip); err == nil && inPrefixes(ip.Unmap(), nets) {
+		cip = ip.Unmap().String()
+	} else if e.ReplySrc.IsValid() && inPrefixes(e.ReplySrc.Unmap(), nets) {
+		cip = e.ReplySrc.Unmap().String()
+	}
+	// У контейнера нет процесса хоста: на опубликованном порту поиск нашёл бы
+	// docker-proxy, а правила по процессу в forward не действуют.
+	var proc collect.Process
+	if cip == "" {
+		proc = a.process.Lookup(e)
+	}
 	if a.flowAllowed(e, dir, remoteIP, lport, rport, proc) {
 		return
 	}
@@ -723,13 +806,16 @@ func (a *Agent) noteLearn(e collect.Entry, dropped ...bool) {
 	if lport != nil {
 		lp = *lport
 	}
-	a.enqueueLearnProcess(dir, e.Protocol, remoteIP, lp, rp, proc)
+	a.enqueueLearnProcess(dir, e.Protocol, remoteIP, lp, rp, proc, cip)
 }
 
 func (a *Agent) enqueueLearn(dir, proto, remoteIP string, lp, rp int) {
-	a.enqueueLearnProcess(dir, proto, remoteIP, lp, rp, collect.Process{})
+	a.enqueueLearnProcess(dir, proto, remoteIP, lp, rp, collect.Process{}, "")
 }
-func (a *Agent) enqueueLearnProcess(dir, proto, remoteIP string, lp, rp int, proc collect.Process) {
+
+// containerIP — адрес контейнера, если соединение его. Ключ склейки строится по
+// адресу: имя из config.v2.json у свежего контейнера появляется не сразу.
+func (a *Agent) enqueueLearnProcess(dir, proto, remoteIP string, lp, rp int, proc collect.Process, containerIP string) {
 	a.fwMu.RLock()
 	defer a.fwMu.RUnlock()
 	a.askedMu.Lock()
@@ -766,9 +852,14 @@ func (a *Agent) enqueueLearnProcess(dir, proto, remoteIP string, lp, rp int, pro
 		qport = lp
 	}
 	key := dir + "|" + proto + "|" + rip.String() + "|" + strconv.Itoa(qport) + "|" + proc.Path + "|" + proc.Cgroup
+	container := ""
+	if containerIP != "" {
+		key += "|▣" + containerIP
+		container = a.containerName(containerIP)
+	}
 	log.Printf("question %s", key)
 	err = a.Enqueue("question", 7, protocol.QuestionPayload{
-		Direction: dir, Protocol: proto, RemoteIP: rip.String(), RemotePort: rp, LocalPort: lp, DedupKey: key, ProcComm: proc.Comm, ProcPath: pol.FormatIdentity(proc.Path, proc.UID, proc.Cgroup), Repeats: 1,
+		Direction: dir, Protocol: proto, RemoteIP: rip.String(), RemotePort: rp, LocalPort: lp, DedupKey: key, ProcComm: proc.Comm, ProcPath: pol.FormatIdentity(proc.Path, proc.UID, proc.Cgroup), Container: container, Repeats: 1,
 	})
 	if err != nil {
 		log.Printf("queue question: %v", err)

@@ -76,6 +76,7 @@ type FlowPayload struct {
 	ProcUID      *int   `json:"proc_uid"`
 	ProcCgroup   string `json:"proc_cgroup,omitempty"`
 	ProcComm     string `json:"proc_comm,omitempty"`
+	Container    string `json:"container,omitempty"`
 	DNSName      string `json:"dns_name,omitempty"`
 	Incomplete   int    `json:"incomplete"`
 	NS           string `json:"ns,omitempty"`
@@ -210,6 +211,7 @@ type QuestionPayload struct {
 	DNSName    string `json:"dns_name"`
 	ProcComm   string `json:"proc_comm"`
 	ProcPath   string `json:"proc_path"`
+	Container  string `json:"container,omitempty"`
 	DedupKey   string `json:"dedup_key"`
 	Repeats    int    `json:"repeats,omitempty"`
 }

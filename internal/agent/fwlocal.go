@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
+	"netmonitor/internal/collect"
 	"netmonitor/internal/filelock"
 	"netmonitor/internal/fw"
 	"netmonitor/internal/idgen"
@@ -333,12 +334,24 @@ func (a *Agent) reconcileOnce() error {
 		p = filterPaused(a.policyLocked(), c)
 		s.Rev = a.policyRev
 	}
-	if a.firewall.Alive() && a.actualRev != nil && reflect.DeepEqual(p, a.policyLocked()) {
-		// Служба из правила перезапустилась: та же политика, заново к новой cgroup.
-		// Это не порча firewall, поэтому без тревоги «восстановлена».
-		if m, ok := a.firewall.(interface{ CgroupsMoved() bool }); ok && m.CgroupsMoved() {
+	a.fillBridges(&p)
+	a.refreshContainers(p.DockerNets)
+	stored := a.policyLocked()
+	bridgesMoved := !reflect.DeepEqual(p.DockerIfaces, stored.DockerIfaces) || !reflect.DeepEqual(p.DockerNets, stored.DockerNets)
+	if a.firewall.Alive() && a.actualRev != nil && reflect.DeepEqual(stripDocker(p), stripDocker(stored)) {
+		// Служба из правила перезапустилась или у Docker появилась сеть.
+		// Та же политика, без тревоги «восстановлена».
+		cgroupsMoved := false
+		if m, ok := a.firewall.(interface{ CgroupsMoved() bool }); ok {
+			cgroupsMoved = m.CgroupsMoved()
+		}
+		if cgroupsMoved || bridgesMoved {
 			if err = a.firewall.Apply(p); err != nil {
 				a.fwError = err.Error()
+			} else if bridgesMoved {
+				a.dockerIfaces = append([]string(nil), p.DockerIfaces...)
+				a.dockerNets = append([]netip.Prefix(nil), p.DockerNets...)
+				err = a.savePolicyLocked(*a.actualRev, p)
 			}
 		}
 		return err
@@ -363,6 +376,44 @@ func (a *Agent) reconcileOnce() error {
 	}
 	return nil
 }
+func stripDocker(p fw.Policy) fw.Policy {
+	p.DockerIfaces = nil
+	p.DockerNets = nil
+	return p
+}
+
+func (a *Agent) watchLinks(stop <-chan struct{}) {
+	retryLinkWatch(stop, time.Second, func() error {
+		return collect.WatchLinks(stop, func() {
+			if err := a.reconcileOnce(); err != nil {
+				log.Printf("docker link: %v", err)
+			}
+		})
+	})
+}
+
+func retryLinkWatch(stop <-chan struct{}, delay time.Duration, watch func() error) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if err := watch(); err != nil {
+			log.Printf("docker link watch: %v", err)
+		} else {
+			return
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 func (a *Agent) watchdog() {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()

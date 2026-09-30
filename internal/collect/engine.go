@@ -28,6 +28,7 @@ type DumpOpts struct {
 	// Snapshot began before its netlink request. Newer events cannot be closed by it.
 	SnapshotMono int64
 	Process      func(Entry) Process
+	Container    func(string) string
 }
 type checkpoint struct {
 	Flow           protocol.FlowPayload
@@ -219,7 +220,11 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 			fp.StartedAtMS = &ms
 		}
 	}
-	if (fp.ProcComm == "" || fp.ProcPath == "") && opt.Process != nil {
+	if opt.containerSide(fp, e) {
+		// Clear process data saved before Docker attribution was available.
+		fp.ProcComm, fp.ProcPath, fp.ProcCgroup, fp.ProcUID = "", "", "", nil
+	}
+	if (fp.ProcComm == "" || fp.ProcPath == "") && opt.Process != nil && !opt.containerSide(fp, e) {
 		p := opt.Process(e)
 		fp.ProcComm = p.Comm
 		fp.ProcPath = p.Path
@@ -236,7 +241,10 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 		pri = 5
 	}
 	procNew := exists && ((prev.Flow.ProcComm == "" && fp.ProcComm != "") || (prev.Flow.ProcPath == "" && fp.ProcPath != ""))
-	sendFlow := !exists || kind != "dump" || pri == 5 || procNew
+	metadataChanged := exists && (fp.Container != prev.Flow.Container || fp.Origin != prev.Flow.Origin ||
+		fp.Direction != prev.Flow.Direction || fp.LocalIP != prev.Flow.LocalIP || fp.RemoteIP != prev.Flow.RemoteIP ||
+		fp.ProcComm != prev.Flow.ProcComm || fp.ProcPath != prev.Flow.ProcPath || fp.ProcCgroup != prev.Flow.ProcCgroup)
+	sendFlow := !exists || kind != "dump" || pri == 5 || procNew || metadataChanged
 	if sendFlow {
 		if err = enqueue(tx, "flow", pri, fp, opt.NowMS); err != nil {
 			return err
@@ -313,7 +321,7 @@ func closeCheckpoint(tx *sql.Tx, key string, c checkpoint, opt DumpOpts, reason 
 	return saveCheckpoint(tx, key, c)
 }
 func makeFlow(e Entry, opt DumpOpts) protocol.FlowPayload {
-	dir, lip, rip, lp, rp := Classify(e, opt.Local)
+	dir, lip, rip, lp, rp := ClassifyNets(e, opt.Local, opt.DockerNets)
 	remote, _ := netipx.Parse(rip)
 	p := protocol.FlowPayload{BootID: opt.BootID, CtID: e.CTID, FirstSeenMS: opt.NowMS, LastSeenMS: opt.NowMS,
 		IPVersion: e.IPVersion, Protocol: e.Protocol, OrigSrcIP: ipStr(e.OrigSrc), OrigDstIP: ipStr(e.OrigDst),
@@ -321,6 +329,15 @@ func makeFlow(e Entry, opt DumpOpts) protocol.FlowPayload {
 		Direction: dir, LocalIP: lip, RemoteIP: rip, LocalPort: lp, RemotePort: rp,
 		RemoteScope: netipx.Scope(remote, orLAN(opt.LAN), opt.Overlay, opt.Own),
 		Origin:      opt.origin(lip, e), State: e.State, ICMPType: e.ICMPType, ICMPCode: e.ICMPCode, Zone: strconv.Itoa(e.Zone), NS: opt.Namespace}
+	if opt.containerSide(p, e) {
+		p.Origin = "docker"
+	}
+	if opt.Container != nil {
+		p.Container = opt.Container(lip)
+		if p.Container == "" {
+			p.Container = opt.Container(ipStr(e.ReplySrc))
+		}
+	}
 	if !e.Unreplied && (e.Assured || e.ReplyBytes > 0 || e.ReplyPackets > 0 || e.State == "ESTABLISHED") {
 		p.ReplySeen = 1
 	}
@@ -340,7 +357,21 @@ func orLAN(lan []netip.Prefix) []netip.Prefix {
 	return lan
 }
 
+// containerSide: соединение контейнера с внешним миром. Процесса хоста у него нет;
+// на опубликованном порту поиск по порту нашёл бы docker-proxy, а правила по
+// процессу в forward не действуют.
+func (opt DumpOpts) containerSide(fp protocol.FlowPayload, e Entry) bool {
+	if fp.Direction == "bridge" {
+		return false
+	}
+	ip, err := netip.ParseAddr(fp.LocalIP)
+	return err == nil && prefixContains(ip, opt.DockerNets) || prefixContains(e.ReplySrc, opt.DockerNets)
+}
+
 func (opt DumpOpts) origin(localIP string, e Entry) string {
+	if ip, err := netip.ParseAddr(localIP); err == nil && prefixContains(ip, opt.DockerNets) {
+		return "docker"
+	}
 	iface := opt.AddrIface[localIP]
 	if dockerIface(iface) {
 		return "docker"

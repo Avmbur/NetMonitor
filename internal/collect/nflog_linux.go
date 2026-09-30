@@ -75,7 +75,9 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 	mode := []byte{0, 0, 1, 0, 2, 0}
 	attrs := logAttr(2, mode)
 	attrs = append(attrs, logAttr(5, []byte{0, 0, 0, 1})...)
-	attrs = append(attrs, logAttr(6, []byte{0, 1})...)
+	// NFULNL_CFG_F_SEQ | NFULNL_CFG_F_CONNTRACK: keep loss detection and
+	// request NFULA_CT_INFO even when a group drops before the policy tail.
+	attrs = append(attrs, logAttr(6, []byte{0, 5})...)
 	if e = logConfig(fd, 2, attrs); e != nil {
 		return fmt.Errorf("NFLOG config: %w", e)
 	}
@@ -107,7 +109,7 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 			if m.Header.Type != 4<<8 || len(m.Data) < 4 {
 				continue
 			}
-			var packet []byte
+			var packet, ctInfo, ctRaw []byte
 			prefix := ""
 			hook := byte(255)
 			var input int
@@ -123,6 +125,10 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 					}
 				case 9:
 					packet = append([]byte(nil), v...)
+				case 18: // NFULA_CT
+					ctRaw = append([]byte(nil), v...)
+				case 19: // NFULA_CT_INFO
+					ctInfo = v
 				case 10:
 					prefix = strings.TrimRight(string(v), "\x00")
 				case 12:
@@ -141,6 +147,7 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 				gap(fmt.Errorf("NFLOG unsupported/truncated packet header"))
 				continue
 			}
+			entry.setNFLogCTInfo(ctInfo)
 			verdict := ""
 			switch {
 			case strings.HasPrefix(prefix, "nm:drop:"):
@@ -150,15 +157,27 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 			default:
 				continue
 			}
-			dir, lip, rip, lp, rp := Classify(entry, LocalAddrs())
-			if hook == 3 {
+			if hook == 2 {
+				postDst := entry.OrigDst
+				if ct, ok := ctFromNFULA(ctRaw); ok {
+					entry.OrigSrc, entry.OrigDst = ct.OrigSrc, ct.OrigDst
+					entry.OrigSport, entry.OrigDport = ct.OrigSport, ct.OrigDport
+					if ct.ReplySrc.IsValid() {
+						entry.ReplySrc = ct.ReplySrc
+					} else if postDst.IsValid() && postDst != entry.OrigDst {
+						entry.ReplySrc = postDst
+					}
+				}
+			}
+			dir, lip, rip, lp, rp := ClassifyNets(entry, LocalAddrs(), LocalView(nil).BridgeNets)
+			if hook == 3 && !HostSide(dir) {
 				dir = "out"
 				lip = entry.OrigSrc.String()
 				rip = entry.OrigDst.String()
 				lp = entry.OrigSport
 				rp = entry.OrigDport
 			}
-			if hook == 1 {
+			if hook == 1 && !HostSide(dir) {
 				dir = "in"
 				lip = entry.OrigDst.String()
 				rip = entry.OrigSrc.String()
@@ -169,7 +188,7 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 				continue
 			}
 			// A dropped reply of a local service is not an outgoing contact.
-			if dir == "out" && lp != nil && Listening(entry.Protocol, *lp) && (rp == nil || !Listening(entry.Protocol, *rp)) {
+			if dir == "out" && hook != 2 && lp != nil && Listening(entry.Protocol, *lp) && (rp == nil || !Listening(entry.Protocol, *rp)) {
 				dir = "in"
 			}
 			iface := ""
@@ -182,6 +201,21 @@ func ListenNFLog(stop <-chan struct{}, fn func(protocol.FirewallPayload, Entry),
 		}
 	}
 }
+
+// ctFromNFULA reads NFULA_CT. The kernel sends either a conntrack message
+// (nfgenmsg plus attributes) or the bare attribute list.
+func ctFromNFULA(b []byte) (Entry, bool) {
+	if e, ok := parseCT(b); ok {
+		return e, true
+	}
+	pad := make([]byte, 4+len(b))
+	copy(pad[4:], b)
+	if e, ok := parseCT(pad); ok {
+		return e, true
+	}
+	return Entry{}, false
+}
+
 func PacketEntry(b []byte) (Entry, bool) {
 	var e Entry
 	if len(b) < 20 {
@@ -246,6 +280,10 @@ func PacketEntry(b []byte) (Entry, bool) {
 		sp, dp := int(binary.BigEndian.Uint16(b[offset:])), int(binary.BigEndian.Uint16(b[offset+2:]))
 		e.OrigSport = &sp
 		e.OrigDport = &dp
+	}
+	if proto == 6 && len(b) >= offset+14 {
+		e.TCPFlags = int(b[offset+13])
+		e.TCPFlagsKnown = true
 	}
 	if proto == 1 || proto == 58 {
 		typ, code := int(b[offset]), int(b[offset+1])

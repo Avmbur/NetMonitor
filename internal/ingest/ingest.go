@@ -278,6 +278,9 @@ func upsertFlow(tx *sql.Tx, ag Agent, p protocol.FlowPayload, receivedMS, seq in
 	if origin == "" {
 		origin = "host"
 	}
+	if origin == "docker" && p.Direction != "bridge" {
+		p.ProcComm, p.ProcPath, p.ProcCgroup, p.ProcUID = "", "", "", nil
+	}
 	boot := p.BootID
 	if boot == "" {
 		boot = "unknown"
@@ -295,8 +298,8 @@ INSERT INTO flows(
   local_ip, local_ip_bin, local_port, remote_ip, remote_ip_bin, remote_port,
   remote_scope, origin, state, reply_seen, close_reason,
   orig_bytes, reply_bytes, orig_packets, reply_packets,
-  proc_path, proc_uid, proc_cgroup, proc_comm, dns_name, incomplete, received_at_ms, state_seq, icmp_type, icmp_code, zone, ns)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  proc_path, proc_uid, proc_cgroup, proc_comm, container, dns_name, incomplete, received_at_ms, state_seq, icmp_type, icmp_code, zone, ns)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(flow_uid) DO UPDATE SET
   last_seen_at_ms=MAX(flows.last_seen_at_ms,excluded.last_seen_at_ms),
   ended_at_ms=COALESCE(excluded.ended_at_ms, flows.ended_at_ms),
@@ -308,12 +311,18 @@ ON CONFLICT(flow_uid) DO UPDATE SET
   reply_packets=excluded.reply_packets,
   close_reason=COALESCE(excluded.close_reason, flows.close_reason),
   received_at_ms=excluded.received_at_ms,
+  direction=excluded.direction, origin=excluded.origin, remote_scope=excluded.remote_scope,
+  local_ip=excluded.local_ip, local_ip_bin=excluded.local_ip_bin, local_port=excluded.local_port,
+  remote_ip=excluded.remote_ip, remote_ip_bin=excluded.remote_ip_bin, remote_port=excluded.remote_port,
+  reply_src_ip=COALESCE(excluded.reply_src_ip,flows.reply_src_ip),
+  reply_dst_ip=COALESCE(excluded.reply_dst_ip,flows.reply_dst_ip),
  state_seq=excluded.state_seq,
  started_at_ms=COALESCE(flows.started_at_ms,excluded.started_at_ms),
- proc_comm=COALESCE(excluded.proc_comm,flows.proc_comm),
- proc_path=COALESCE(excluded.proc_path,flows.proc_path),
- proc_uid=COALESCE(excluded.proc_uid,flows.proc_uid),
- proc_cgroup=COALESCE(excluded.proc_cgroup,flows.proc_cgroup),
+ proc_comm=CASE WHEN excluded.origin='docker' AND excluded.direction!='bridge' THEN NULL ELSE COALESCE(excluded.proc_comm,flows.proc_comm) END,
+ container=COALESCE(NULLIF(excluded.container,''), flows.container),
+ proc_path=CASE WHEN excluded.origin='docker' AND excluded.direction!='bridge' THEN NULL ELSE COALESCE(excluded.proc_path,flows.proc_path) END,
+ proc_uid=CASE WHEN excluded.origin='docker' AND excluded.direction!='bridge' THEN NULL ELSE COALESCE(excluded.proc_uid,flows.proc_uid) END,
+ proc_cgroup=CASE WHEN excluded.origin='docker' AND excluded.direction!='bridge' THEN NULL ELSE COALESCE(excluded.proc_cgroup,flows.proc_cgroup) END,
  dns_name=COALESCE(NULLIF(excluded.dns_name,''), flows.dns_name),
  incomplete=MAX(flows.incomplete,excluded.incomplete)
  WHERE excluded.state_seq>flows.state_seq`,
@@ -326,7 +335,7 @@ ON CONFLICT(flow_uid) DO UPDATE SET
 		netipx.Canonical(remote), netipx.Bin16(remote), p.RemotePort,
 		scope, origin, nullStr(p.State), p.ReplySeen, nullStr(p.CloseReason),
 		p.OrigBytes, p.ReplyBytes, p.OrigPackets, p.ReplyPackets,
-		nullStr(p.ProcPath), p.ProcUID, nullStr(p.ProcCgroup), nullStr(p.ProcComm), nullStr(p.DNSName),
+		nullStr(p.ProcPath), p.ProcUID, nullStr(p.ProcCgroup), nullStr(p.ProcComm), nullStr(p.Container), nullStr(p.DNSName),
 		p.Incomplete, receivedMS, seq, p.ICMPType, p.ICMPCode, nullStr(p.Zone), nullStr(p.NS),
 	)
 	if err != nil {
@@ -594,8 +603,9 @@ func upsertQuestion(tx *sql.Tx, ag Agent, p protocol.QuestionPayload, now int64)
 		}
 		_, err = tx.Exec(`UPDATE learn_questions SET repeats=repeats+?, last_seen_ms=MAX(last_seen_ms,?),
 			proc_comm=CASE WHEN COALESCE(proc_comm,'')='' THEN ? ELSE proc_comm END,
-			proc_path=CASE WHEN COALESCE(proc_path,'')='' THEN ? ELSE proc_path END
-			WHERE question_id=?`, add, now, nullStr(p.ProcComm), nullStr(p.ProcPath), id)
+			proc_path=CASE WHEN COALESCE(proc_path,'')='' THEN ? ELSE proc_path END,
+			container=CASE WHEN COALESCE(container,'')='' THEN ? ELSE container END
+			WHERE question_id=?`, add, now, nullStr(p.ProcComm), nullStr(p.ProcPath), nullStr(p.Container), id)
 		return err
 	}
 	if err != sql.ErrNoRows {
@@ -607,9 +617,9 @@ func upsertQuestion(tx *sql.Tx, ag Agent, p protocol.QuestionPayload, now int64)
 		n = 1
 	}
 	_, err = tx.Exec(
-		`INSERT INTO learn_questions(question_id, host_id, dedup_key, opened_at_ms, repeats, last_seen_ms, direction, protocol, local_port, remote_ip, remote_port, dns_name, proc_path, proc_comm, status)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')`,
-		qid, ag.HostID, key, now, n, now, p.Direction, p.Protocol, p.LocalPort, p.RemoteIP, p.RemotePort, nullStr(p.DNSName), nullStr(p.ProcPath), nullStr(p.ProcComm),
+		`INSERT INTO learn_questions(question_id, host_id, dedup_key, opened_at_ms, repeats, last_seen_ms, direction, protocol, local_port, remote_ip, remote_port, dns_name, proc_path, proc_comm, container, status)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')`,
+		qid, ag.HostID, key, now, n, now, p.Direction, p.Protocol, p.LocalPort, p.RemoteIP, p.RemotePort, nullStr(p.DNSName), nullStr(p.ProcPath), nullStr(p.ProcComm), nullStr(p.Container),
 	)
 	return err
 }

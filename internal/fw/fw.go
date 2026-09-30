@@ -32,16 +32,18 @@ type LearnHit struct {
 func LearnHits() []LearnHit { return listLearnHits() }
 
 type Policy struct {
-	Managed   bool
-	Rules     []policy.Rule
-	Groups    []policy.Rule
-	Blocks    []Desired
-	BlockNets []netip.Prefix
-	AllowNets []netip.Prefix
-	Never       []netip.Prefix
-	Monitor     netip.Addr
-	MonitorPort int
-	Mode        string
+	Managed      bool
+	Rules        []policy.Rule
+	Groups       []policy.Rule
+	Blocks       []Desired
+	BlockNets    []netip.Prefix
+	AllowNets    []netip.Prefix
+	Never        []netip.Prefix
+	Monitor      netip.Addr
+	MonitorPort  int
+	Mode         string
+	DockerIfaces []string
+	DockerNets   []netip.Prefix
 }
 
 // The backend is selected once. A failing/disappearing nft must not silently

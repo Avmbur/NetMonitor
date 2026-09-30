@@ -69,6 +69,7 @@ CREATE TABLE flows(
   orig_bytes INTEGER, reply_bytes INTEGER,
   orig_packets INTEGER, reply_packets INTEGER,
   proc_path TEXT, proc_uid INTEGER, proc_cgroup TEXT, proc_comm TEXT,
+  container TEXT,
   dns_name TEXT,
   incomplete INTEGER NOT NULL DEFAULT 0,
   received_at_ms INTEGER NOT NULL);
@@ -252,7 +253,7 @@ CREATE TABLE learn_questions(
   last_seen_ms INTEGER NOT NULL,
   direction TEXT, protocol TEXT,
   local_port INTEGER, remote_ip TEXT, remote_port INTEGER,
-  dns_name TEXT, proc_path TEXT, proc_comm TEXT,
+  dns_name TEXT, proc_path TEXT, proc_comm TEXT, container TEXT,
   status TEXT NOT NULL,
   answer TEXT);
 CREATE UNIQUE INDEX learn_open_dedup ON learn_questions(host_id, dedup_key) WHERE status = 'open';

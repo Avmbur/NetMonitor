@@ -85,6 +85,9 @@ func mergeQuestion(tx *sql.Tx, raw []byte) (bool, error) {
 		if in.ProcComm != "" {
 			old.ProcComm = in.ProcComm
 		}
+		if in.Container != "" {
+			old.Container = in.Container
+		}
 		body, err := json.Marshal(old)
 		if err != nil {
 			return false, err

@@ -2,7 +2,9 @@ package collect
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/netip"
+	"netmonitor/internal/protocol"
 	"testing"
 
 	"strings"
@@ -66,6 +68,57 @@ func TestDumpDeltaOnce(t *testing.T) {
 	}
 }
 
+func TestMakeFlowNamesContainer(t *testing.T) {
+	netw := netip.MustParsePrefix("172.17.0.0/16")
+	box := netip.MustParseAddr("192.168.10.186")
+	c1 := netip.MustParseAddr("172.17.0.2")
+	out := netip.MustParseAddr("1.1.1.1")
+	sp, dp := 40000, 443
+	e := Entry{Protocol: "tcp", OrigSrc: c1, OrigDst: out, OrigSport: &sp, OrigDport: &dp}
+	fp := makeFlow(e, DumpOpts{Local: []netip.Addr{box}, DockerNets: []netip.Prefix{netw}, NowMS: 1,
+		Container: func(ip string) string {
+			if ip == c1.String() {
+				return "web"
+			}
+			return ""
+		}})
+	if fp.Direction != "out" || fp.Origin != "docker" || fp.Container != "web" || fp.RemoteIP != out.String() {
+		t.Fatalf("%s %s %s %s", fp.Direction, fp.Origin, fp.Container, fp.RemoteIP)
+	}
+}
+
+// Вход на опубликованный порт: по порту 8080 на хосте слушает docker-proxy,
+// но соединение принадлежит контейнеру — процесс хоста к нему не приписываем.
+func TestPublishedPortFlowHasNoHostProcess(t *testing.T) {
+	st, err := store.OpenAgent(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	box := netip.MustParseAddr("192.168.10.186")
+	c1 := netip.MustParseAddr("172.17.0.3")
+	client := netip.MustParseAddr("192.168.20.50")
+	sp, pub := 50000, 8080
+	id := int64(7)
+	e := Entry{Protocol: "tcp", OrigSrc: client, OrigDst: box, OrigSport: &sp, OrigDport: &pub,
+		ReplySrc: c1, ReplyDst: client, CTID: &id, StartNS: 1}
+	opt := DumpOpts{HostID: "h", BootID: "b", Local: []netip.Addr{box}, DockerNets: []netip.Prefix{netip.MustParsePrefix("172.17.0.0/16")}, NowMS: 1,
+		Process: func(Entry) Process {
+			return Process{Comm: "docker-proxy", Path: "/usr/bin/docker-proxy", Cgroup: "/system.slice/docker.service"}
+		},
+		Container: func(ip string) string { return map[string]string{c1.String(): "pub"}[ip] }}
+	if err = st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, e, "new", opt) }); err != nil {
+		t.Fatal(err)
+	}
+	var payload string
+	if err = st.DB.QueryRow(`SELECT payload FROM outbox WHERE kind='flow'`).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(payload, "docker-proxy") || !strings.Contains(payload, `"container":"pub"`) || !strings.Contains(payload, `"local_port":8080`) {
+		t.Fatal(payload)
+	}
+}
+
 func TestScopeOriginAndSkipIfaces(t *testing.T) {
 	st, err := store.OpenAgent(t.TempDir())
 	if err != nil {
@@ -124,5 +177,79 @@ func TestScopeOriginAndSkipIfaces(t *testing.T) {
 	st.DB.QueryRow(`SELECT payload FROM outbox WHERE kind='flow'`).Scan(&payload)
 	if !strings.Contains(payload, `"origin":"host"`) || !strings.Contains(payload, `"remote_scope":"own"`) {
 		t.Fatal(payload)
+	}
+}
+
+func TestDockerAttributionUpdatesExistingFlow(t *testing.T) {
+	for _, inbound := range []bool{false, true} {
+		name := "outgoing"
+		if inbound {
+			name = "published"
+		}
+		t.Run(name, func(t *testing.T) {
+			st, err := store.OpenAgent(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			box := netip.MustParseAddr("192.168.10.186")
+			container := netip.MustParseAddr("172.17.0.2")
+			peer := netip.MustParseAddr("203.0.113.50")
+			sp, dp := 40000, 8080
+			id := int64(7)
+			e := Entry{IPVersion: 4, Protocol: "tcp", OrigSrc: container, OrigDst: peer, ReplySrc: peer,
+				OrigSport: &sp, OrigDport: &dp, CTID: &id, StartNS: 1}
+			wantDir := "out"
+			if inbound {
+				e.OrigSrc, e.OrigDst, e.ReplySrc = peer, box, container
+				wantDir = "in"
+			}
+			opt := DumpOpts{HostID: "h", BootID: "b", Local: []netip.Addr{box}, NowMS: 1, MonoMS: 1,
+				Process: func(Entry) Process {
+					return Process{Comm: "docker-proxy", Path: "/usr/bin/docker-proxy", Cgroup: "/system.slice/docker.service"}
+				}}
+			apply := func(kind string) {
+				t.Helper()
+				if err := st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, e, kind, opt) }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			apply("new")
+			opt.DockerNets = []netip.Prefix{netip.MustParsePrefix("172.17.0.0/16")}
+			opt.NowMS, opt.MonoMS = 2, 2
+			apply("dump")
+			var raw string
+			var count int
+			if err := st.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='flow'").Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 2 {
+				t.Fatalf("Docker reclassification did not send flow: %d", count)
+			}
+			if err := st.DB.QueryRow("SELECT payload FROM outbox WHERE kind='flow' ORDER BY seq DESC LIMIT 1").Scan(&raw); err != nil {
+				t.Fatal(err)
+			}
+			var flow protocol.FlowPayload
+			if err := json.Unmarshal([]byte(raw), &flow); err != nil {
+				t.Fatal(err)
+			}
+			if flow.Direction != wantDir || flow.Origin != "docker" || flow.ProcComm != "" || flow.ProcPath != "" || flow.ProcCgroup != "" || flow.ProcUID != nil {
+				t.Fatalf("stale process/direction: %+v", flow)
+			}
+			opt.Container = func(ip string) string {
+				if ip == container.String() {
+					return "pub"
+				}
+				return ""
+			}
+			opt.NowMS, opt.MonoMS = 3, 3
+			apply("dump")
+			if err := st.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='flow'").Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 3 {
+				t.Fatalf("late name did not send flow: %d", count)
+			}
+		})
 	}
 }
