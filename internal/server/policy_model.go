@@ -283,20 +283,9 @@ func hostRules(db policyReader, host string) ([]policy.Rule, error) {
 			}
 			r.Match.Networks = policy.IntersectNetworks(r.Match.Networks, nets)
 		}
-		if len(r.Match.Names) > 0 {
-			var extra []string
-			for _, n := range r.Match.Names {
-				ips, err := resolvePattern(db, n)
-				if err != nil {
-					return nil, err
-				}
-				for _, ip := range ips {
-					if p, ok := ipToPrefix(ip); ok {
-						extra = append(extra, p)
-					}
-				}
-			}
-			r.Match.Networks = append(r.Match.Networks, extra...)
+		r, err = expandRuleNames(db, r)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, r)
 	}
@@ -389,6 +378,10 @@ func (s *Server) handlePolicyRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	var seed []seededAddr
+	if in.Op != "delete" {
+		seed = resolveRuleNames(rule.Match.Names)
+	}
 	err = s.st.Update(func(tx *sql.Tx) error {
 		if in.Op == "delete" {
 			if isServiceRuleID(in.ID) {
@@ -461,6 +454,9 @@ func (s *Server) handlePolicyRule(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return err
 			}
+			if err = rememberResolved(tx, rule.Hosts, seed, now); err != nil {
+				return err
+			}
 			if err = answerPolicyQuestions(tx, rule, qid, in.Together, now); err != nil {
 				return err
 			}
@@ -514,6 +510,10 @@ func answerPolicyQuestions(tx *sql.Tx, rule policy.Rule, qid string, together *b
 		if err != nil {
 			return err
 		}
+	}
+	rule, err = expandRuleNames(tx, rule)
+	if err != nil {
+		return err
 	}
 	for _, q := range qs {
 		if together != nil && !*together && q.id != qid {

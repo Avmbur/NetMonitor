@@ -35,7 +35,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.2"
+var Version = "1.0.3"
 
 type Config struct {
 	Pin         string
@@ -86,6 +86,8 @@ type Agent struct {
 	containers    map[string]string
 	containersAt  time.Time
 	containerNets []netip.Prefix
+	nameMu        sync.Mutex
+	resolved      map[string]resolvedName
 	observeDocker bool
 	skipIfaces    map[string]bool
 	mode          string

@@ -101,6 +101,9 @@ func nftScript(p Policy, now time.Time) (string, error) {
 			line("add set inet netmon learn%s%s { type %s . inet_proto . inet_service; flags timeout; timeout 120s; }", family, dir, typ)
 		}
 	}
+	// Адреса «по запросу» переживают обновление политики: их вписала служба
+	// на время своего соединения.
+	s.WriteString(onDemandSets)
 	for _, r := range p.Rules {
 		if !r.Enabled || !r.Once || policy.Inert(r) {
 			continue
@@ -322,6 +325,52 @@ func nftScript(p Policy, now time.Time) (string, error) {
 		return "", err
 	}
 	return s.String(), nil
+}
+
+const onDemandSets = "add set inet netmon svc4 { type ipv4_addr; flags timeout; }\n" +
+	"add set inet netmon svc6 { type ipv6_addr; flags timeout; }\n"
+
+// admitScript вписывает адреса «по запросу» одной транзакцией. Повтор продлевает
+// срок: add ничего не делает с уже вписанным адресом, поэтому delete и add заново.
+func admitScript(ips []netip.Addr, ttl time.Duration) (string, error) {
+	if len(ips) == 0 {
+		return "", fmt.Errorf("нет адресов")
+	}
+	if ttl < time.Second {
+		return "", fmt.Errorf("срок %s", ttl)
+	}
+	var s strings.Builder
+	s.WriteString("add table inet netmon\n")
+	s.WriteString(onDemandSets)
+	for _, ip := range ips {
+		if !ip.IsValid() || ip.Zone() != "" {
+			return "", fmt.Errorf("адрес %s", ip)
+		}
+		ip = ip.Unmap()
+		set := strings.TrimPrefix(onDemand4, "@")
+		if ip.Is6() {
+			set = strings.TrimPrefix(onDemand6, "@")
+		}
+		el := fmt.Sprintf("inet netmon %s { %s", set, ip)
+		fmt.Fprintf(&s, "add element %s timeout %ds }\n", el, int64(ttl/time.Second))
+		fmt.Fprintf(&s, "delete element %s }\n", el)
+		fmt.Fprintf(&s, "add element %s timeout %ds }\n", el, int64(ttl/time.Second))
+	}
+	return s.String(), nil
+}
+
+// Admit вписывает адреса службы в фильтр до её соединения.
+func Admit(ips []netip.Addr, ttl time.Duration) error {
+	if Backend() != "nftables" {
+		// Правила по процессу есть только в nftables: без него фильтра служб нет.
+		return nil
+	}
+	script, err := admitScript(ips, ttl)
+	if err != nil {
+		return err
+	}
+	_, err = command(script, "nft", "-f", "-")
+	return err
 }
 
 func ifaceSet(names []string) string {

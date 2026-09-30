@@ -18,6 +18,12 @@ func Canonical(a netip.Addr) string {
 	return a.Unmap().String()
 }
 
+// UsableNameIP is an address a DNS name may contribute to a rule.
+func UsableNameIP(a netip.Addr) bool {
+	a = a.Unmap()
+	return a.IsValid() && !a.IsUnspecified() && !a.IsLoopback() && !a.IsMulticast() && !a.IsLinkLocalUnicast()
+}
+
 func Bin16(a netip.Addr) []byte {
 	a = a.Unmap()
 	b := make([]byte, 16)

@@ -19,6 +19,10 @@ type Match struct {
 	UID        *int      `json:"uid,omitempty"`
 	Bindings   []Binding `json:"bindings,omitempty"`
 	Names      []string  `json:"names,omitempty"`
+	// OnDemand — имена, адреса которых служба NetMonitor сама вписывает в фильтр
+	// перед соединением, на ограниченный срок. Правило пускает только их (и
+	// Networks, если заданы). Агент, не знающий поля, видит nil — любой адрес.
+	OnDemand []string `json:"on_demand,omitempty"`
 }
 type Rule struct {
 	ID            string   `json:"id"`
@@ -91,7 +95,8 @@ func (m Match) Matches(c Contact) bool {
 		}
 	}
 	if m.Networks == nil {
-		return true
+		// Адреса «по запросу» живут только в фильтре агента: здесь их нет.
+		return len(m.OnDemand) == 0
 	}
 	ip, err := netip.ParseAddr(c.RemoteIP)
 	if err != nil {
@@ -201,6 +206,34 @@ func Evaluate(rs []Rule, host string, c Contact, now int64) (Decision, bool) {
 		}
 	}
 	return Decision{}, false
+}
+
+// MergeNetworks adds addresses. An empty addition keeps nil as "any address";
+// a rule by name must start from an empty list, not nil.
+func MergeNetworks(existing, more []string) []string {
+	if len(more) == 0 {
+		return existing
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(existing)+len(more))
+	for _, n := range existing {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	for _, n := range more {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return existing
+	}
+	return out
 }
 
 // IntersectNetworks preserves nil=any and []=none. Overlapping CIDRs intersect

@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"netmonitor/internal/svcnet"
 )
 
 func updateUnitActive(unit string) (bool, error) {
@@ -109,7 +111,8 @@ func (a *Agent) launchUpdate(state agentUpdateState, spec updatePayload, outcome
 }
 
 func downloadAgentBinary(url, sum, arch string) ([]byte, error) {
-	client := &http.Client{Timeout: 3 * time.Minute}
+	// Адрес GitHub вписывается в фильтр этого агента до соединения.
+	client := svcnet.Client(admitLocal, 3*time.Minute)
 	res, err := client.Get(url)
 	if err != nil {
 		return nil, err

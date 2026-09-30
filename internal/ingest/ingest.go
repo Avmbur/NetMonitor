@@ -36,6 +36,13 @@ func ApplyBatch(tx *sql.Tx, ag Agent, evs []protocol.Event, receivedMS int64) Re
 // ApplyBatchWith applies each new event and its effects in the same savepoint.
 // The caller must commit before publishing Ack, or discard it on any failure.
 func ApplyBatchWith(tx *sql.Tx, ag Agent, evs []protocol.Event, receivedMS int64, effect func(protocol.Event) error) Result {
+	return ApplyBatchWithHooks(tx, ag, evs, receivedMS, nil, effect)
+}
+
+// ApplyBatchWithHooks runs before and effect only for new, validated events,
+// inside their savepoint. A before failure rolls back the event; an effect
+// failure requires rolling back the transaction, as in ApplyBatchWith.
+func ApplyBatchWithHooks(tx *sql.Tx, ag Agent, evs []protocol.Event, receivedMS int64, before, effect func(protocol.Event) error) Result {
 	result := Result{Ack: []string{}}
 	var hostID string
 	var pendingFrom int64
@@ -62,6 +69,9 @@ func ApplyBatchWith(tx *sql.Tx, ag Agent, evs []protocol.Event, receivedMS int64
 		}
 		sha := idgen.SHA256Hex(ev.Payload)
 		ok, err := insertMarker(tx, ev, ag.ID, sha, receivedMS, pendingFrom)
+		if err == nil && ok && before != nil {
+			err = before(ev)
+		}
 		if err == nil && ok {
 			err = applyOne(tx, ag, ev, receivedMS)
 			if err == nil {

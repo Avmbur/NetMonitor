@@ -105,3 +105,29 @@ func TestOnceSpentOnceAndKeepsParallelBlocked(t *testing.T) {
 		t.Fatal("empty once saved")
 	}
 }
+
+func TestMergeNetworksKeepsAnyWhenNothingAdded(t *testing.T) {
+	if MergeNetworks(nil, nil) != nil {
+		t.Fatal("nil widened")
+	}
+	got := MergeNetworks(nil, []string{"203.0.113.10/32", "203.0.113.10/32", "203.0.113.11/32"})
+	if len(got) != 2 || got[0] != "203.0.113.10/32" || got[1] != "203.0.113.11/32" {
+		t.Fatal(got)
+	}
+	again := MergeNetworks([]string{"203.0.113.10/32"}, []string{"203.0.113.11/32"})
+	if len(again) != 2 {
+		t.Fatal(again)
+	}
+}
+
+func TestOnDemandNeverMeansAnyAddress(t *testing.T) {
+	m := Match{Direction: "out", Protocol: "tcp", RemotePort: 443, OnDemand: []string{"github.com"}}
+	c := Contact{Direction: "out", Protocol: "tcp", RemoteIP: "203.0.113.9", RemotePort: 443}
+	if m.Matches(c) {
+		t.Fatal("on-demand rule matched an address nobody admitted")
+	}
+	m.Networks = []string{"203.0.113.9/32"}
+	if !m.Matches(c) {
+		t.Fatal("explicit address lost")
+	}
+}

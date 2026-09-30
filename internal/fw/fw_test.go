@@ -457,3 +457,84 @@ func TestPortWithAnyProtocolCoversTCPAndUDP(t *testing.T) {
 		t.Fatal("icmp with a port accepted")
 	}
 }
+
+// Правило «по запросу» пускает только адреса, вписанные службой, и никогда —
+// любой адрес. Вписанное переживает обновление политики.
+func TestOnDemandRuleMatchesOnlyAdmittedAddresses(t *testing.T) {
+	r := policy.Rule{ID: "park-svc-update", Enabled: true, Action: "allow",
+		Match: policy.Match{Direction: "out", Protocol: "tcp", RemotePort: 443, OnDemand: []string{"github.com"},
+			Bindings: []policy.Binding{{Name: "nmagent", Cgroup: "system.slice/nmagent.service"}}}}
+	s, err := nftScript(Policy{Mode: "learn", Managed: true, Rules: []policy.Rule{r}}, time.UnixMilli(100000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`output ct direction original ip daddr @svc4 meta l4proto tcp tcp dport 443 socket cgroupv2 level 2 "system.slice/nmagent.service" accept`,
+		`output ct direction original ip6 daddr @svc6 meta l4proto tcp tcp dport 443 socket cgroupv2 level 2 "system.slice/nmagent.service" accept`,
+		`input ct direction reply ip saddr @svc4 meta l4proto tcp tcp sport 443 accept`,
+		"add set inet netmon svc4 { type ipv4_addr; flags timeout; }",
+		"add set inet netmon svc6 { type ipv6_addr; flags timeout; }",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("missing %q:\n%s", want, s)
+		}
+	}
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "tcp dport 443") && !strings.Contains(line, "@svc") {
+			t.Fatalf("service HTTPS open to any address: %s", line)
+		}
+	}
+	if strings.Contains(s, "destroy set inet netmon svc") || strings.Contains(s, "flush set inet netmon svc") {
+		t.Fatal("policy refresh erases admitted addresses")
+	}
+	r.Match.Bindings = nil
+	var fwd []string
+	if err := emitForwardRules([]policy.Rule{r}, "fwd_out", false, func(_, line string) { fwd = append(fwd, line) }); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range fwd {
+		if !strings.Contains(line, "@svc") {
+			t.Fatalf("forward opened any address: %s", line)
+		}
+	}
+}
+
+func TestAdmitScriptRefreshesTTL(t *testing.T) {
+	s, err := admitScript([]netip.Addr{netip.MustParseAddr("::ffff:140.82.121.3"), netip.MustParseAddr("2606:50c0:8000::154")}, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "add table inet netmon\n" + onDemandSets +
+		"add element inet netmon svc4 { 140.82.121.3 timeout 600s }\n" +
+		"delete element inet netmon svc4 { 140.82.121.3 }\n" +
+		"add element inet netmon svc4 { 140.82.121.3 timeout 600s }\n" +
+		"add element inet netmon svc6 { 2606:50c0:8000::154 timeout 600s }\n" +
+		"delete element inet netmon svc6 { 2606:50c0:8000::154 }\n" +
+		"add element inet netmon svc6 { 2606:50c0:8000::154 timeout 600s }\n"
+	if s != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", s, want)
+	}
+	if _, err := admitScript(nil, time.Minute); err == nil {
+		t.Fatal("empty admission accepted")
+	}
+	if _, err := admitScript([]netip.Addr{netip.MustParseAddr("fe80::1%eth0")}, time.Minute); err == nil {
+		t.Fatal("zoned address accepted")
+	}
+}
+
+func TestIntegrityIgnoresAdmittedAddresses(t *testing.T) {
+	list := func(elem string) []byte {
+		return []byte(`{"nftables":[{"metainfo":{}},{"set":{"family":"inet","name":"svc4","table":"netmon","type":"ipv4_addr","handle":3,"flags":["timeout"]` + elem + `}}]}`)
+	}
+	out := list("")
+	c := &Controller{backend: "nftables", execute: func(string, string, ...string) ([]byte, error) { return out, nil }}
+	before, _, err := c.nftState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = list(`,"elem":[{"elem":{"val":"140.82.121.3","timeout":600,"expires":599}}]`)
+	after, _, err := c.nftState()
+	if err != nil || before != after {
+		t.Fatal("an admitted address looks like firewall damage", err)
+	}
+}

@@ -154,6 +154,7 @@ func formatPolicyDump(when time.Time, servers []string, groups []uiGroup, rules 
 		}
 		nets := append([]string{}, r.Match.Networks...)
 		nets = append(nets, r.Match.Names...)
+		nets = append(nets, r.Match.OnDemand...)
 		if len(nets) > 0 {
 			b.WriteString("адреса:\n")
 			for _, n := range nets {

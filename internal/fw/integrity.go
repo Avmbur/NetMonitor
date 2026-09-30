@@ -45,7 +45,7 @@ func (c *Controller) nftState() (string, map[string]bool, error) {
 					}
 				}
 			}
-			if strings.HasPrefix(name, "learn") || name == "ban4" || name == "ban6" {
+			if strings.HasPrefix(name, "learn") || name == "ban4" || name == "ban6" || name == "svc4" || name == "svc6" {
 				delete(set, "elem")
 			}
 			// Elements of static sets are unordered; rule order remains significant.

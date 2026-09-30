@@ -266,3 +266,55 @@ func TestFlowOwnershipAndSequence(t *testing.T) {
 		}
 	}
 }
+
+func TestBeforeHookRollsBackWithFailedEventAndSkipsReplay(t *testing.T) {
+	s, ag := ingestFixture(t)
+	if _, err := s.DB.Exec("CREATE TRIGGER fail_dns BEFORE INSERT ON dns_seen BEGIN SELECT RAISE(ABORT,'injected DNS failure'); END"); err != nil {
+		t.Fatal(err)
+	}
+	ev := event("dns-hook", 1, "dns", protocol.DNSPayload{Name: "cdn.example.test", IP: "203.0.113.10", Kind: "a"})
+	calls := 0
+	run := func() ingest.Result {
+		t.Helper()
+		var result ingest.Result
+		if err := s.Update(func(tx *sql.Tx) error {
+			result = ingest.ApplyBatchWithHooks(tx, ag, []protocol.Event{ev}, 120000, func(protocol.Event) error {
+				calls++
+				var count int
+				if err := tx.QueryRow("SELECT COUNT(*) FROM dns_seen").Scan(&count); err != nil {
+					return err
+				}
+				if count != 0 {
+					return fmt.Errorf("before hook ran after insertion")
+				}
+				_, err := tx.Exec("UPDATE agents SET policy_rev=policy_rev+1 WHERE agent_id=?", ag.ID)
+				return err
+			}, nil)
+			return result.Fatal
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	rev := func() int64 {
+		t.Helper()
+		var v int64
+		if err := s.DB.QueryRow("SELECT policy_rev FROM agents WHERE agent_id=?", ag.ID).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	before := rev()
+	if result := run(); result.Err == "" || len(result.Ack) != 0 || rev() != before {
+		t.Fatalf("failed event leaked hook writes: %+v rev=%d", result, rev())
+	}
+	if _, err := s.DB.Exec("DROP TRIGGER fail_dns"); err != nil {
+		t.Fatal(err)
+	}
+	if result := run(); result.Err != "" || len(result.Ack) != 1 || rev() != before+1 {
+		t.Fatalf("retry did not commit together: %+v rev=%d", result, rev())
+	}
+	if result := run(); result.Err != "" || len(result.Ack) != 1 || rev() != before+1 || calls != 2 {
+		t.Fatalf("replay ran hooks again: %+v rev=%d calls=%d", result, rev(), calls)
+	}
+}

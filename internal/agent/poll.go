@@ -18,6 +18,7 @@ import (
 	pol "netmonitor/internal/policy"
 	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
+	"netmonitor/internal/svcnet"
 )
 
 func (a *Agent) pollLoop() {
@@ -191,6 +192,14 @@ func (a *Agent) adoptViewLocked(pr protocol.PollRes) {
 	}
 }
 func (a *Agent) applyPoll(pr protocol.PollRes) error {
+	rules, reports := a.attachResolved(pr.Rules)
+	pr.Rules = rules
+	for _, rec := range reports {
+		if err := a.Enqueue("dns", 6, rec); err != nil {
+			logAgentError("имя DNS", err)
+			a.forgetReported(rec)
+		}
+	}
 	unlock, lockErr := a.lockFirewall()
 	if lockErr != nil {
 		return lockErr
@@ -313,6 +322,15 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 			uninstall = c.ID
 		case "update":
 			updateID, updatePayload = c.ID, c.Payload
+		case svcnet.AdmitKind:
+			if err != nil {
+				break
+			}
+			if admitErr := admitCommand(c.Payload); admitErr != nil {
+				logAgentError("адрес службы монитора", admitErr)
+				break
+			}
+			ack = append(ack, c.ID)
 		default:
 			if err == nil {
 				ack = append(ack, c.ID)

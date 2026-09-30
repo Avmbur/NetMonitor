@@ -9,6 +9,30 @@ import (
 	"time"
 )
 
+// Наборы адресов «по запросу»: служба вписывает адрес перед соединением.
+const (
+	onDemand4 = "@svc4"
+	onDemand6 = "@svc6"
+)
+
+// ruleNets — адреса правила для строк nft: "" — любой адрес, пусто — ни одного.
+func ruleNets(m policy.Match) []string {
+	if len(m.OnDemand) > 0 {
+		return append(append([]string(nil), m.Networks...), onDemand4, onDemand6)
+	}
+	if m.Networks == nil {
+		return []string{""}
+	}
+	return m.Networks
+}
+
+func netFamily(n string) string {
+	if strings.Contains(n, ":") || n == onDemand6 {
+		return "ip6"
+	}
+	return "ip"
+}
+
 func onceSetName(id string) string {
 	sum := sha256.Sum256([]byte(id))
 	return "o" + hex.EncodeToString(sum[:6])
@@ -53,7 +77,8 @@ func emitPolicyRules(rs []policy.Rule, add func(string, string)) error {
 			continue
 		}
 		m := r.Match
-		if m.Networks != nil && len(m.Networks) == 0 {
+		nets := ruleNets(m)
+		if len(nets) == 0 {
 			continue
 		}
 		proc, err := processTerms(r)
@@ -66,10 +91,6 @@ func emitPolicyRules(rs []policy.Rule, add func(string, string)) error {
 		dirs := []string{"in", "out"}
 		if m.Direction == "in" || m.Direction == "out" {
 			dirs = []string{m.Direction}
-		}
-		nets := m.Networks
-		if nets == nil {
-			nets = []string{""}
 		}
 		for _, dir := range dirs {
 			for _, reply := range []bool{false, true} {
@@ -100,11 +121,7 @@ func emitPolicyRules(rs []policy.Rule, add func(string, string)) error {
 				for _, n := range nets {
 					terms := []string{"ct direction " + ctdir}
 					if n != "" {
-						fam := "ip"
-						if strings.Contains(n, ":") {
-							fam = "ip6"
-						}
-						terms = append(terms, fam+" "+remote+" "+n)
+						terms = append(terms, netFamily(n)+" "+remote+" "+n)
 					}
 					proto := m.Protocol
 					if proto == "icmpv6" {
@@ -181,24 +198,17 @@ func emitForwardRules(rs []policy.Rule, chain string, inbound bool, add func(str
 			continue
 		}
 		m := r.Match
-		if m.Networks != nil && len(m.Networks) == 0 {
+		nets := ruleNets(m)
+		if len(nets) == 0 {
 			continue
 		}
 		if m.Direction == "in" && !inbound || m.Direction == "out" && inbound {
 			continue
 		}
-		nets := m.Networks
-		if nets == nil {
-			nets = []string{""}
-		}
 		for _, n := range nets {
 			var terms []string
 			if n != "" {
-				fam := "ip"
-				if strings.Contains(n, ":") {
-					fam = "ip6"
-				}
-				terms = append(terms, "ct original "+fam+" "+remote+" "+n)
+				terms = append(terms, "ct original "+netFamily(n)+" "+remote+" "+n)
 			}
 			proto := m.Protocol
 			if proto == "icmpv6" {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -269,6 +270,9 @@ func TestOnceRuleDeletedAfterSpend(t *testing.T) {
 }
 
 func TestRuleDNSNameStored(t *testing.T) {
+	prev := lookupNameIPs
+	lookupNameIPs = func(string) ([]netip.Addr, error) { return nil, nil }
+	t.Cleanup(func() { lookupNameIPs = prev })
 	s, _ := batchFixture(t)
 	r := ruleRequest(t, s, `{"kind":"allow","addr":"security.ubuntu.com","proto":"tcp","port":443,"hosts":["h"]}`, 200)
 	if len(r.Match.Names) != 1 || r.Match.Names[0] != "security.ubuntu.com" {

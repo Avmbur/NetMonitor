@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"netmonitor/internal/policy"
 	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
+	"netmonitor/internal/svcnet"
 )
 
 type uiGroup struct {
@@ -66,6 +68,21 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		in.Hosts = json.RawMessage(`"all"`)
 	}
 	pol := mapGroupPolicy(in.Policy)
+	// Ссылки качаем до транзакции: адрес вписывает агент монитора, а его
+	// подтверждение тоже пишется в базу и ждало бы конца этой транзакции.
+	fetched := map[string][]string{}
+	for _, line := range strings.Split(in.Members, "\n") {
+		line = strings.TrimSpace(line)
+		if _, done := fetched[line]; done || !memberURL(line) {
+			continue
+		}
+		items, err := fetchMemberList(r.Context(), line, s.admitOnMonitor)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		fetched[line] = items
+	}
 	now := store.NowMS()
 	err := s.st.Update(func(tx *sql.Tx) error {
 		for _, h := range append(append([]string{}, hosts...), in.Except...) {
@@ -122,7 +139,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 			if line == "" {
 				continue
 			}
-			items, src, err := expandMember(line)
+			items, src, err := expandMember(line, fetched)
 			if err != nil {
 				return err
 			}
@@ -478,10 +495,17 @@ func answerGroupQuestions(tx *sql.Tx, now int64) error {
 	return nil
 }
 
-func expandMember(line string) ([]string, string, error) {
-	if strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "http://") {
-		items, err := fetchMemberList(line)
-		return items, "url", err
+func memberURL(line string) bool {
+	return strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "http://")
+}
+
+func expandMember(line string, fetched map[string][]string) ([]string, string, error) {
+	if memberURL(line) {
+		items, ok := fetched[line]
+		if !ok {
+			return nil, "url", fmt.Errorf("импорт %s: список не скачан", line)
+		}
+		return items, "url", nil
 	}
 	path := line
 	if strings.HasPrefix(line, "file://") {
@@ -510,9 +534,15 @@ func looksLikeMemberFile(line string) bool {
 	return err == nil && !st.IsDir()
 }
 
-func fetchMemberList(url string) ([]string, error) {
-	cl := &http.Client{Timeout: 10 * time.Second}
-	res, err := cl.Get(url)
+// fetchMemberList качает список по ссылке. HTTPS идёт через служебное правило
+// nmserver: адрес ссылки вписывается в фильтр до соединения.
+func fetchMemberList(ctx context.Context, url string, admit svcnet.AdmitFunc) ([]string, error) {
+	cl := svcnet.ImportClient(admit, 10*time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("импорт %s: %w", url, err)
+	}
+	res, err := cl.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("импорт %s: %w", url, err)
 	}
@@ -550,6 +580,7 @@ func parseMemberList(src string, body []byte) ([]string, error) {
 	return out, nil
 }
 
+// refreshDNS runs before inserting the DNS observation, in the same savepoint.
 func refreshDNS(tx *sql.Tx, ev protocol.Event) error {
 	var p protocol.DNSPayload
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
@@ -562,7 +593,25 @@ func refreshDNS(tx *sql.Tx, ev protocol.Event) error {
 	if err != nil || !ok {
 		return err
 	}
+	fresh, err := dnsPairFresh(tx, p)
+	if err != nil || !fresh {
+		return err
+	}
 	return bumpTrusted(tx)
+}
+
+// dnsPairFresh checks the global pair before insertion. Event timestamps and
+// the reporting host do not affect whether policy addresses have changed.
+func dnsPairFresh(tx *sql.Tx, p protocol.DNSPayload) (bool, error) {
+	ip, err := netipx.Parse(p.IP)
+	if err != nil {
+		return false, err
+	}
+	name := strings.ToLower(strings.TrimSuffix(p.Name, "."))
+	var exists bool
+	err = tx.QueryRow("SELECT EXISTS(SELECT 1 FROM dns_seen WHERE name=? AND ip_bin=?)",
+		name, netipx.Bin16(ip)).Scan(&exists)
+	return !exists, err
 }
 
 func dnsTouchesPatterns(tx *sql.Tx, name string) (bool, error) {

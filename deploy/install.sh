@@ -261,6 +261,69 @@ nm_do_agent() {
     printf 'Снято: %s\n' "${nm_off:-ничего}"
 }
 
+# Служебное правило пускает nm-update только на адреса GitHub, которые вписаны
+# в фильтр агента до соединения. curl идёт ровно на вписанный адрес, каждую
+# переадресацию разбираем сами и пускаем только на имена GitHub.
+nm_github_host() {
+    case "$1" in
+        github.com|release-assets.githubusercontent.com|objects.githubusercontent.com) return 0 ;;
+    esac
+    return 1
+}
+
+# Печатает адреса имени и вписывает их в svc4/svc6 на сутки. Наборов нет —
+# нет и правила, которое их ждёт: вписывать некуда и не нужно.
+nm_admit_host() {
+    nm_gh_list=
+    nm_gh_batch=
+    for nm_gh_ip in $(getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u); do
+        case "$nm_gh_ip" in
+            127.*|0.*|::|::1|fe80:*|::ffff:*) continue ;;
+            *:*) nm_gh_set=svc6 ;;
+            *) nm_gh_set=svc4 ;;
+        esac
+        nm_gh_list="$nm_gh_list $nm_gh_ip"
+        nm_gh_batch="${nm_gh_batch}add element inet netmon $nm_gh_set { $nm_gh_ip timeout 86400s }
+delete element inet netmon $nm_gh_set { $nm_gh_ip }
+add element inet netmon $nm_gh_set { $nm_gh_ip timeout 86400s }
+"
+    done
+    [ -n "$nm_gh_list" ] || return 1
+    if nft list set inet netmon svc4 >/dev/null 2>&1; then
+        printf '%s' "$nm_gh_batch" | nft -f - || return 1
+    fi
+    printf '%s\n' $nm_gh_list
+}
+
+nm_fetch_github() {
+    nm_gh_url=$1
+    nm_gh_hop=0
+    while :; do
+        nm_gh_hop=$((nm_gh_hop + 1))
+        [ "$nm_gh_hop" -le 5 ] || { printf 'Слишком много переадресаций\n' >&2; return 1; }
+        case "$nm_gh_url" in https://*) ;; *) printf 'Не https: %s\n' "$nm_gh_url" >&2; return 1 ;; esac
+        nm_gh_host=${nm_gh_url#https://}
+        nm_gh_host=${nm_gh_host%%/*}
+        nm_gh_host=${nm_gh_host%%\?*}
+        nm_github_host "$nm_gh_host" || { printf 'Чужой адрес: %s\n' "$nm_gh_host" >&2; return 1; }
+        nm_gh_addrs=$(nm_admit_host "$nm_gh_host") || { printf 'Адрес %s не вписан в фильтр\n' "$nm_gh_host" >&2; return 1; }
+        nm_gh_res=
+        for nm_gh_ip in $nm_gh_addrs; do
+            nm_gh_to=$nm_gh_ip
+            case "$nm_gh_ip" in *:*) nm_gh_to="[$nm_gh_ip]" ;; esac
+            nm_gh_res=$(curl -sS --proto '=https' --max-time 180 --resolve "$nm_gh_host:443:$nm_gh_to" \
+                -o "$2" -w '%{http_code} %{redirect_url}' "$nm_gh_url") && break
+            nm_gh_res=
+        done
+        [ -n "$nm_gh_res" ] || return 1
+        case "${nm_gh_res%% *}" in
+            200) return 0 ;;
+            301|302|303|307|308) nm_gh_url=${nm_gh_res#* } ;;
+            *) printf 'GitHub ответил %s\n' "${nm_gh_res%% *}" >&2; return 1 ;;
+        esac
+    done
+}
+
 # Агент на монитор по кнопке в морде: nmserver пишет файл запроса, nmagent-self.path
 # запускает этот же скрипт с --mode self-request.
 # Обновление монитора по кнопке в морде: nmserver пишет update.request,
@@ -286,7 +349,7 @@ nm_update_request() {
         *) die "Чужой адрес комплекта" 2 ;;
     esac
     if [ -n "$nm_sum" ] && [ "${#nm_sum}" -ne 64 ]; then die "Неверная сумма" 2; fi
-    curl -fsSL --proto '=https' --max-time 180 -o "$nm_tmp/pkg.tar.gz" "$nm_url" || die "Не скачался комплект"
+    nm_fetch_github "$nm_url" "$nm_tmp/pkg.tar.gz" || die "Не скачался комплект"
     if [ -n "$nm_sum" ]; then
         printf '%s  %s\n' "$nm_sum" "$nm_tmp/pkg.tar.gz" | sha256sum -c - || die "Сумма не сошлась"
     fi

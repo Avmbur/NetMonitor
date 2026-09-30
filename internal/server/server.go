@@ -26,7 +26,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.2"
+var Version = "1.0.3"
 
 type Config struct {
 	ArtifactDir string
@@ -462,12 +462,14 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
-		res = ingest.ApplyBatchWith(tx, ag, batch.Events, now, func(ev protocol.Event) error {
-			if ag.Trust != "trusted" {
-				return nil
-			}
-			if ev.Kind == "dns" {
+		res = ingest.ApplyBatchWithHooks(tx, ag, batch.Events, now, func(ev protocol.Event) error {
+			if ag.Trust == "trusted" && ev.Kind == "dns" {
 				return refreshDNS(tx, ev)
+			}
+			return nil
+		}, func(ev protocol.Event) error {
+			if ag.Trust != "trusted" || ev.Kind == "dns" {
+				return nil
 			}
 			return autoban(tx, ag, ev, now)
 		})

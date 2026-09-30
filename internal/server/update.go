@@ -17,6 +17,7 @@ import (
 	"netmonitor/internal/idgen"
 	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
+	"netmonitor/internal/svcnet"
 	"netmonitor/internal/tlsutil"
 )
 
@@ -62,7 +63,7 @@ type updateView struct {
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	rel, err := fetchRelease(r.Context())
+	rel, err := fetchRelease(r.Context(), s.admitOnMonitor)
 	if err != nil {
 		if r.Method == http.MethodGet {
 			writeJSON(w, updateView{Current: Version, Arch: runtime.GOARCH, Error: err.Error(), Agents: []updateAgent{}})
@@ -305,14 +306,14 @@ func manualMonitorCommand(url, arch string) string {
 	return "sudo sh -c " + shellQuote(inner)
 }
 
-func fetchRelease(ctx context.Context) (releaseInfo, error) {
+func fetchRelease(ctx context.Context, admit svcnet.AdmitFunc) (releaseInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, releaseAPI, nil)
 	if err != nil {
 		return releaseInfo{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "netmonitor")
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := svcnet.Client(admit, 20*time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		return releaseInfo{}, fmt.Errorf("github: %w", err)
