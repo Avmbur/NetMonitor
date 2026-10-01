@@ -64,8 +64,10 @@ func (s *owner) prepareRotation() error {
 	// These connection-local triggers protect the current write, including an
 	// update of an old aggregate. They create no additional persistent database.
 	for i, h := range historyTables {
+		key := historyKey(h, "new.")
 		for _, event := range []string{"INSERT", "UPDATE"} {
-			q := fmt.Sprintf("CREATE TEMP TRIGGER rotation_%d_%s AFTER %s ON main.%s BEGIN INSERT OR IGNORE INTO rotation_touched VALUES(%d,%s); END", i, event, event, h.name, i, historyKey(h, "new."))
+			// Повтор той же строки в одной транзакции роняет INSERT OR IGNORE (1555).
+			q := fmt.Sprintf("CREATE TEMP TRIGGER rotation_%d_%s AFTER %s ON main.%s BEGIN INSERT INTO rotation_touched(source,key) SELECT %d,%s WHERE NOT EXISTS (SELECT 1 FROM rotation_touched WHERE source=%d AND key=%s); END", i, event, event, h.name, i, key, i, key)
 			if _, err := s.conn.ExecContext(ctx, q); err != nil {
 				return err
 			}

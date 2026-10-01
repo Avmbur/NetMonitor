@@ -15,22 +15,31 @@ type hostDecision struct {
 	groups []policy.Rule
 	rules  []policy.Rule
 	mode   string
+	plain  string // режим без карантина; карантин его не затирает
 	storm  bool
 }
 
+// hostMode — режим хоста без карантина: свой, а если он пустой или «парк», то режим парка.
+func hostMode(ctrl hostControl, park string) string {
+	if ctrl.Mode != "" && ctrl.Mode != "park" {
+		return ctrl.Mode
+	}
+	if park == "" {
+		return "learn"
+	}
+	return park
+}
+
 func loadHostDecision(db policyReader, host string, never []netip.Prefix, park string) (hostDecision, error) {
-	d := hostDecision{never: never, mode: park}
+	d := hostDecision{never: never}
 	ctrl, err := readControl(db, host)
 	if err != nil {
 		return d, err
 	}
+	d.plain = hostMode(ctrl, park)
+	d.mode = d.plain
 	if ctrl.Quarantine {
 		d.mode = "quarantine"
-	} else if ctrl.Mode != "park" && ctrl.Mode != "" {
-		d.mode = ctrl.Mode
-	}
-	if d.mode == "" {
-		d.mode = "learn"
 	}
 	d.storm = d.mode != "quarantine" && stormActive(db, host, store.NowMS())
 	bans, err := readBans(db, `WHERE state='active' AND (expires_at_ms IS NULL OR expires_at_ms>?)`, store.NowMS())
@@ -220,6 +229,11 @@ func closeCoveredQuestions(tx *sql.Tx, host string, now int64) error {
 	d, err := loadHostDecision(tx, host, neverPrefixes(tx), settingValue(tx, "park_mode", "learn"))
 	if err != nil {
 		return err
+	}
+	// Карантин сам по себе не ответ. Закрытие смотрит режим, который был бы без него.
+	// Шторм остаётся выключенным: в фильтре карантин его тоже гасит.
+	if d.mode == "quarantine" {
+		d.mode = d.plain
 	}
 	rows, err := tx.Query("SELECT question_id,host_id,direction,protocol,remote_ip,COALESCE(local_port,0),COALESCE(remote_port,0),COALESCE(proc_path,''),COALESCE(proc_comm,'') FROM learn_questions WHERE status='open' AND host_id=?", host)
 	if err != nil {

@@ -35,7 +35,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.3"
+var Version = "1.0.4"
 
 type Config struct {
 	Pin         string

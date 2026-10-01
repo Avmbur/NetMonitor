@@ -1909,6 +1909,7 @@ function defaultUi() {
     report: "maxaddr",
     hidden: [],
     sort: { col: null, dir: 1 },
+    policySort: {},
     fwCols: {}
   };
 }
@@ -1989,6 +1990,13 @@ function loadUi() {
     if (o.sort && typeof o.sort === "object") {
       const col = COL_DEF.some(c => c.id === o.sort.col) ? o.sort.col : null;
       d.sort = { col, dir: o.sort.dir === -1 ? -1 : 1 };
+    }
+    if (o.policySort && typeof o.policySort === "object") {
+      ["rules", "groups"].forEach(id => {
+        const s = o.policySort[id];
+        if (!s || typeof s !== "object" || !Number.isInteger(s.col) || s.col < 0 || s.col > 7) return;
+        d.policySort[id] = { col: s.col, dir: s.dir === -1 ? -1 : 1 };
+      });
     }
     if (o.fwCols && typeof o.fwCols === "object") d.fwCols = o.fwCols;
     return d;
@@ -2366,10 +2374,13 @@ function fwTable(headers, rows, rowFn, kinds, tableId) {
   const th = headers.map((h, i) => {
     const grip = tableId ? `<div class="grip" title="раздвинуть колонку" data-fw-id="${esc(tableId)}" data-fw-col="${i}"></div>` : "";
     const report = tableId && String(tableId).indexOf("report:") === 0;
-    const sort = reportSortOf(tableId);
-    const arrow = report && sort.col === i ? `<span class="sarrow">${sort.dir === -1 ? "↓" : "↑"}</span>` : "";
-    const cls = "c-" + kinds[i] + (report ? " sortable" : "");
-    const sortAttr = report ? ` data-rep-sort="${i}" title="клик — сортировка"` : "";
+    const policySortable = tableId === "rules" || tableId === "groups";
+    const sort = report ? reportSortOf(tableId) : policySortOf(tableId);
+    const arrow = (report || policySortable) && sort.col === i ? `<span class="sarrow">${sort.dir === -1 ? "↓" : "↑"}</span>` : "";
+    const cls = "c-" + kinds[i] + ((report || policySortable) ? " sortable" : "");
+    const sortAttr = report
+      ? ` data-rep-sort="${i}" title="клик — сортировка"`
+      : (policySortable ? ` data-pol-sort="${i}" data-pol-table="${esc(tableId)}" title="клик — сортировка"` : "");
     return `<th class="${cls}"${sortAttr}>${esc(h)}${arrow}${grip}</th>`;
   }).join("");
   const tb = rows.map((r, i) => {
@@ -2930,6 +2941,39 @@ function cycleReportSort(id, col) {
   else if (s.dir === 1) LIVE.reportSortBy[id] = { col, dir: -1 };
   else LIVE.reportSortBy[id] = { col: null, dir: 1 };
 }
+function policySortOf(id) {
+  const all = ui.policySort || {};
+  const s = all[id];
+  if (!s || s.col == null || s.col < 0) return { col: null, dir: 1 };
+  return { col: s.col, dir: s.dir === -1 ? -1 : 1 };
+}
+function cyclePolicySort(id, col) {
+  if (id !== "rules" && id !== "groups") return;
+  ui.policySort = ui.policySort || {};
+  const s = policySortOf(id);
+  if (s.col !== col) ui.policySort[id] = { col, dir: 1 };
+  else if (s.dir === 1) ui.policySort[id] = { col, dir: -1 };
+  else delete ui.policySort[id];
+  persist();
+}
+function policyCellVal(s) {
+  s = cellPlain(s).trim();
+  const n = s.match(/^(\d+)\s+запис/);
+  if (n) return Number(n[1]);
+  return reportCellVal(s);
+}
+function sortPolicyItems(id, items) {
+  const s = policySortOf(id);
+  if (s.col == null) return items;
+  return items.map((x, i) => ({ x, i })).sort((a, b) => {
+    const va = policyCellVal((a.x.cells || [])[s.col] || "");
+    const vb = policyCellVal((b.x.cells || [])[s.col] || "");
+    let c = 0;
+    if (typeof va === "number" && typeof vb === "number") c = va - vb;
+    else c = String(va).localeCompare(String(vb), "ru");
+    return (c * (s.dir || 1)) || (a.i - b.i);
+  }).map(z => z.x);
+}
 function logPageInfo(total, page) {
   const n = Math.max(0, total | 0);
   const pages = Math.max(1, Math.ceil(n / LOG_PAGE) || 1);
@@ -3472,15 +3516,28 @@ function policyBlocks() {
       </div>`).join("")
     : `<div class="hint">нет открытых вопросов${f.all ? "" : " у выбранных серверов"}</div>`;
   const groups = GROUPS.filter(g => hostTouchesShown(g));
+  const groupItems = sortPolicyItems("groups", groups.map((g, i) => ({
+    g,
+    cells: [
+      String(i + 1), esc(g.name), groupPolicyHtml(g.policy),
+      nRecords(groupMemberCount(g.members)),
+      esc(hostsLabel(g.hosts, g.except)), g.mute ? "глушит" : "нет"
+    ]
+  })));
   const rules = RULES.filter(r => hostTouchesShown(r) && !r.once && !ruleExpired(r));
+  const ruleItems = rules.map((r, i) => ({
+    r,
+    cells: [
+      String(i + 1), esc(r.name), esc(ruleKindText(r)),
+      esc(hostsLabel(r.hosts, r.except)), ruleStatusHtml(r)
+    ]
+  }));
+  const ruleSorted = sortPolicyItems("rules", ruleItems);
+  const ruleRows = ruleItems.map(x => x.cells);
   const alerts = alertTileRows();
   const banList = f.all ? BANS : BANS.filter(b => hostTouchesShown(b));
   const banView = banRowsWithPacks(banList);
   const nMeta = n => n ? String(n) : "нет";
-  const ruleRows = rules.map((r, i) => [
-    String(i + 1), esc(r.name), esc(ruleKindText(r)),
-    esc(hostsLabel(r.hosts, r.except)), ruleStatusHtml(r)
-  ]);
   const nameN = colContentLen("имя", ruleRows, 1);
   const serverN = colContentLen("сервер", ruleRows, 3);
   const ruleKinds = serverN >= nameN
@@ -3495,12 +3552,8 @@ function policyBlocks() {
       id: "groups", title: "Группы", sub: nMeta(groups.length), act: "новая группа",
       html: policyTable(
         ["№", "имя", "политика", "состав", "сервер", "тревоги"],
-        groups.map((g, i) => {
-          const pol = groupPolicyHtml(g.policy);
-          const n = groupMemberCount(g.members);
-          return [String(i + 1), esc(g.name), pol, nRecords(n), esc(hostsLabel(g.hosts, g.except)), g.mute ? "глушит" : "нет"];
-        }),
-        (_, i) => groups[i] ? ` data-group="${esc(groups[i].id)}"` : "",
+        groupItems.map(x => x.cells),
+        (_, i) => groupItems[i] ? ` data-group="${esc(groupItems[i].g.id)}"` : "",
         null, "groups"
       )
     },
@@ -3508,8 +3561,8 @@ function policyBlocks() {
       id: "rules", title: "Правила", sub: nMeta(rules.length), act: "новое правило",
       html: policyTable(
         ["№", "имя", "тип", "сервер", "статус"],
-        ruleRows,
-        (_, i) => rules[i] ? ` data-rule="${esc(rules[i].id)}"` : "",
+        ruleSorted.map(x => x.cells),
+        (_, i) => ruleSorted[i] ? ` data-rule="${esc(ruleSorted[i].r.id)}"` : "",
         ruleKinds, "rules"
       )
     },
@@ -3607,6 +3660,7 @@ function renderPolicy() {
   restoreScrolls(el);
 }
 function onGroupRowPointer(ev) {
+  if (policySortOf("groups").col != null) return false;
   const tr = ev.target.closest("tr[data-group]");
   if (!tr || ev.button !== 0) return false;
   const src = tr.dataset.group;
@@ -5908,6 +5962,12 @@ document.getElementById("policy").addEventListener("contextmenu", ev => {
   }
 });
 document.getElementById("policy").addEventListener("click", ev => {
+  const sortTh = ev.target.closest("th[data-pol-sort]");
+  if (sortTh && !ev.target.closest(".grip")) {
+    cyclePolicySort(sortTh.dataset.polTable, Number(sortTh.dataset.polSort));
+    renderPolicy();
+    return;
+  }
   const chev = ev.target.closest(".chev");
   if (chev) {
     const tile = chev.closest(".ptile");
@@ -6226,7 +6286,7 @@ function openBrandModal() {
       <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
     </div>`;
-  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.3 · 30.09.2026", body, ""), "brand");
+  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.4 · 01.10.2026", body, ""), "brand");
 }
 
 document.getElementById("profile").addEventListener("click", openProfileModal);

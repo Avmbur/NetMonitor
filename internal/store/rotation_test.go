@@ -147,6 +147,55 @@ func TestRotationProtectsUpdatedOldRecord(t *testing.T) {
 	}
 }
 
+func TestRotationKeepsMinuteTouchedTwiceInOneBatch(t *testing.T) {
+	st, err := OpenMonitor(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Update(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO traffic_1m(host_id,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,samples) VALUES('h',100,'out','internet',1,1,1)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO audit_log(audit_id,at_ms,actor,action) VALUES('later',400,'adm','test')`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Update(func(tx *sql.Tx) error {
+		for _, n := range []int{10, 20} {
+			if _, err := tx.Exec(`
+INSERT INTO traffic_1m(host_id,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,samples)
+VALUES('h',100,'out','internet',?,0,1)
+ON CONFLICT(host_id,bucket_start_ms,direction,remote_scope) DO UPDATE SET
+  bytes_out=bytes_out+excluded.bytes_out,
+  samples=samples+1`, n); err != nil {
+				return err
+			}
+		}
+		if err := deleteOldestHistory(context.Background(), tx, NowMS()); err != nil {
+			return err
+		}
+		var out, samples int
+		if err := tx.QueryRow(`SELECT bytes_out,samples FROM traffic_1m WHERE bucket_start_ms=100`).Scan(&out, &samples); err != nil {
+			return err
+		}
+		if out != 31 || samples != 3 {
+			return fmt.Errorf("touched minute %d/%d", out, samples)
+		}
+		var audits int
+		if err := tx.QueryRow(`SELECT count(*) FROM audit_log`).Scan(&audits); err != nil {
+			return err
+		}
+		if audits != 0 {
+			return fmt.Errorf("rotation left the newer audit: %d", audits)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRotationOrdersMinuteAndHourHistoryAndProtectsUpdate(t *testing.T) {
 	st, err := OpenMonitor(t.TempDir())
 	if err != nil {

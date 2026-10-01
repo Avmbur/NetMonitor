@@ -1,9 +1,11 @@
 package server
 
 import (
+	"database/sql"
+	"testing"
+
 	"netmonitor/internal/policy"
 	"netmonitor/internal/store"
-	"testing"
 )
 
 func TestFlowVerdictObservePassesAndAlertCuts(t *testing.T) {
@@ -73,5 +75,94 @@ func TestFlowVerdictObservePassesAndAlertCuts(t *testing.T) {
 	name, st, _ = d.explain(policy.Contact{RemoteIP: "9.9.9.9", Host: "h"}, now)
 	if name != "блокировать" || st != "block" || d.needsQuestion(policy.Contact{RemoteIP: "9.9.9.9", Host: "h"}, now) {
 		t.Fatal(name, st)
+	}
+}
+
+func TestQuarantineKeepsUnansweredLearnQuestions(t *testing.T) {
+	s, _ := batchFixture(t)
+	setHostControl(t, s, `{"mode":"learn","quarantine":true}`)
+	if _, err := s.st.DB.Exec(`INSERT INTO settings(k,v) VALUES('host_storm:h','9000000000000')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB.Exec(`INSERT INTO blocks(block_id,scope_kind,remote_ip,remote_ip_bin,direction,state,reason,source,created_by,created_at_ms)
+		VALUES('b','all','198.18.0.2',zeroblob(16),'both','active','тест','manual','test',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB.Exec(`INSERT INTO policy_rules(rule_id,version,sort_order,payload) VALUES('r-allow',1,1,?)`,
+		`{"id":"r-allow","name":"dns","enabled":true,"action":"allow","match":{"direction":"out","protocol":"tcp","networks":["1.1.1.1/32"],"remote_port":443}}`); err != nil {
+		t.Fatal(err)
+	}
+	groupReq(t, s, `{"name":"сигнал","policy":"alert","members":"203.0.113.8","hosts":["h"]}`, 200)
+	insertOpenQuestion(t, s, "q-open", "in", "9.9.9.9", 443)
+	insertOpenQuestion(t, s, "q-ban", "out", "198.18.0.2", 80)
+	insertOpenQuestion(t, s, "q-allow", "out", "1.1.1.1", 443)
+	insertOpenQuestion(t, s, "q-alert", "out", "203.0.113.8", 80)
+	if _, err := s.st.DB.Exec(`INSERT INTO learn_questions(question_id,host_id,dedup_key,opened_at_ms,repeats,last_seen_ms,direction,protocol,remote_ip,remote_port,status,answer)
+		VALUES('q-old','h','q-old',1,1,1,'out','tcp','203.0.113.9',9,'answered','deny')`); err != nil {
+		t.Fatal(err)
+	}
+	closeHostQuestions(t, s)
+	questionIs(t, s, "q-open", "open", "")
+	questionIs(t, s, "q-ban", "answered", "deny")
+	questionIs(t, s, "q-allow", "answered", "allow")
+	questionIs(t, s, "q-alert", "open", "")
+	questionIs(t, s, "q-old", "answered", "deny")
+
+	setHostControl(t, s, `{"mode":"block","quarantine":true}`)
+	closeHostQuestions(t, s)
+	questionIs(t, s, "q-open", "answered", "deny")
+	questionIs(t, s, "q-alert", "open", "")
+
+	setHostControl(t, s, `{"mode":"park","quarantine":true}`)
+	if _, err := s.st.DB.Exec(`INSERT INTO settings(k,v) VALUES('park_mode','block')`); err != nil {
+		t.Fatal(err)
+	}
+	insertOpenQuestion(t, s, "q-park-block", "out", "8.8.4.4", 53)
+	closeHostQuestions(t, s)
+	questionIs(t, s, "q-park-block", "answered", "deny")
+
+	if _, err := s.st.DB.Exec(`UPDATE settings SET v='learn' WHERE k='park_mode'`); err != nil {
+		t.Fatal(err)
+	}
+	insertOpenQuestion(t, s, "q-park-learn", "out", "6.6.6.6", 53)
+	closeHostQuestions(t, s)
+	questionIs(t, s, "q-park-learn", "open", "")
+	questionIs(t, s, "q-park-block", "answered", "deny")
+	questionIs(t, s, "q-old", "answered", "deny")
+}
+
+func setHostControl(t *testing.T, s *Server, raw string) {
+	t.Helper()
+	if _, err := s.st.DB.Exec(`INSERT INTO settings(k,v) VALUES('host_control:h',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertOpenQuestion(t *testing.T, s *Server, id, dir, ip string, port int) {
+	t.Helper()
+	_, err := s.st.DB.Exec(`INSERT INTO learn_questions(question_id,host_id,dedup_key,opened_at_ms,repeats,last_seen_ms,direction,protocol,remote_ip,remote_port,status)
+		VALUES(?,?,?,1,1,1,?,?,?,?,'open')`, id, "h", id, dir, "tcp", ip, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func closeHostQuestions(t *testing.T, s *Server) {
+	t.Helper()
+	if err := s.st.Update(func(tx *sql.Tx) error {
+		return closeCoveredQuestions(tx, "h", store.NowMS())
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func questionIs(t *testing.T, s *Server, id, status, answer string) {
+	t.Helper()
+	var gotStatus, gotAnswer string
+	if err := s.st.DB.QueryRow(`SELECT status, COALESCE(answer,'') FROM learn_questions WHERE question_id=?`, id).Scan(&gotStatus, &gotAnswer); err != nil {
+		t.Fatal(id, err)
+	}
+	if gotStatus != status || gotAnswer != answer {
+		t.Fatalf("%s: %s/%s, want %s/%s", id, gotStatus, gotAnswer, status, answer)
 	}
 }
