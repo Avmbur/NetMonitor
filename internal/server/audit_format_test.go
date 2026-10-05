@@ -2,6 +2,7 @@ package server
 
 import (
 	"testing"
+	"time"
 
 	"netmonitor/internal/store"
 )
@@ -30,6 +31,7 @@ func TestPolishAuditHidesIDsAndJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	db := &checkedRead{db: s.st.DB}
+	banUntilWant := time.Date(2026, 10, 4, 0, 59, 27, 0, time.UTC).In(time.Local).Format("02.01.2006 15:04:05")
 	cases := []struct{ actor, action, object, detail, src, wantActor, wantAction, wantObject string }{
 		{"adm", "вход", "", "", "192.168.10.50", "adm", "вход", "с 192.168.10.50"},
 		{"adm", "управление сервером: mode", "h", `{"mode":"learn","quarantine":false}`, "", "adm", "сменил режим", "dev-postgres · обучение"},
@@ -40,6 +42,8 @@ func TestPolishAuditHidesIDsAndJSON(t *testing.T) {
 		{"adm", "правило: delete", "rule-1", "", "", "adm", "удалил правило", "SSH"},
 		{"adm", "группа: member", "g1", "", "", "adm", "добавил в группу", "телеметрия"},
 		{"auto", "перебор SSH", "192.168.10.184", "ssh", "", "автомат", "перебор SSH", "192.168.10.184"},
+		{"auto", "скан портов", "217.60.76.226", "все серверы · до 2026-10-04 00:59:27", "", "автомат", "скан портов", "217.60.76.226 · все серверы · до " + banUntilWant},
+		{"adm", "забанил", "203.0.113.5", "все серверы · навсегда", "", "adm", "забанил", "203.0.113.5 · все серверы · навсегда"},
 		{"a", "восстановлен firewall", "h", "", "", "dev-postgres", "восстановил firewall", "dev-postgres"},
 		{"adm", "правило: delete", "01234567-89ab-7cde-8f01-23456789abcd", "", "", "adm", "удалил правило", "удалённое правило"},
 	}
@@ -58,6 +62,7 @@ func TestReadUIAuditKindsAndWho(t *testing.T) {
 	rows := []struct{ actor, action string }{
 		{"adm", "забанил"},
 		{"auto", "скан портов"},
+		{"auto", "бан истёк"},
 		{"auto", "шторм: внешние подключения закрыты"},
 		{"adm", "убрал тревогу в историю"},
 		{"auto", "тревога закрыта: адрес забанен"},
@@ -80,8 +85,8 @@ func TestReadUIAuditKindsAndWho(t *testing.T) {
 		action, who string
 		want        int
 	}{
-		{"ban", "", 2},
-		{"ban", "auto", 1},
+		{"ban", "", 3},
+		{"ban", "auto", 2},
 		{"alert", "", 2},
 		{"storm", "", 1},
 		{"mode", "", 1},
@@ -89,7 +94,7 @@ func TestReadUIAuditKindsAndWho(t *testing.T) {
 		{"settings", "", 1},
 		{"login", "", 1},
 		{"", "me", 5},
-		{"", "auto", 4},
+		{"", "auto", 5},
 		{"пароль", "", 1},
 	}
 	for _, c := range cases {

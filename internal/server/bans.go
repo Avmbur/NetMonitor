@@ -39,6 +39,7 @@ type banRecord struct {
 	State     string
 	CreatedAt int64
 	UpdatedAt int64
+	RemovedAt int64
 	Version   int64
 	Escalate  int
 }
@@ -172,7 +173,7 @@ func readScope(kind, hostID, hostsJSON, exceptJSON string) (hosts, except []stri
 
 const banColumns = `block_id,scope_kind,COALESCE(host_id,''),COALESCE(hosts_json,''),COALESCE(except_json,''),
 	COALESCE(remote_ip,''),COALESCE(protocol,''),COALESCE(port,0),COALESCE(local_port,0),direction,
-	COALESCE(expires_at_ms,0),state,reason,source,created_by,created_at_ms,COALESCE(updated_at_ms,created_at_ms),version,escalate_step`
+	COALESCE(expires_at_ms,0),state,reason,source,created_by,created_at_ms,COALESCE(updated_at_ms,created_at_ms),version,escalate_step,COALESCE(removed_at_ms,0)`
 
 type rowScanner interface{ Scan(...any) error }
 
@@ -181,7 +182,7 @@ func scanBan(row rowScanner) (banRecord, error) {
 	var kind, hostID, hostsJSON, exceptJSON string
 	err := row.Scan(&b.ID, &kind, &hostID, &hostsJSON, &exceptJSON,
 		&b.RemoteIP, &b.Protocol, &b.Port, &b.LocalPort, &b.Direction,
-		&b.ExpiresAt, &b.State, &b.Reason, &b.Source, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt, &b.Version, &b.Escalate)
+		&b.ExpiresAt, &b.State, &b.Reason, &b.Source, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt, &b.Version, &b.Escalate, &b.RemovedAt)
 	if err != nil {
 		return b, err
 	}
@@ -615,12 +616,71 @@ func auditBan(tx *sql.Tx, actor, action string, b banSpec, now int64) error {
 	return err
 }
 
+// banListFilter chooses which rows the tile asks for. The default, an empty
+// view, is the live set. History is explicit and bounded.
+type banListFilter struct {
+	View  string
+	IP    string
+	Since int64
+	ID    string
+}
+
+func banIPQueryOK(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // listBans shows the stored scope and the confirmed coverage, never the
 // intention alone: «применено N из M» counts agent acknowledgements.
-// Плитка показывает все живые баны: что стоит в nft, то и видно.
-func (s *Server) listBans(db *checkedRead) []uiBan {
-	bans, err := readBans(db.db, "WHERE state='active' AND (expires_at_ms IS NULL OR expires_at_ms>?) ORDER BY created_at_ms DESC", store.NowMS())
+// Живые баны приходят всегда: по ним карточки продлевают и возвращают бан.
+// Истёкшие и снятые — добавкой по запросу, фильтр адреса только для них.
+func (s *Server) listBans(db *checkedRead, f banListFilter) []uiBan {
+	now := store.NowMS()
+	bans, err := readBans(db.db, "WHERE state='active' AND (expires_at_ms IS NULL OR expires_at_ms>?) ORDER BY created_at_ms DESC", now)
 	db.record(err)
+	since := f.Since
+	if since <= 0 {
+		since = now - 7*24*time.Hour.Milliseconds()
+	}
+	var where string
+	switch f.View {
+	case "expired":
+		where = "state='expired' AND COALESCE(expires_at_ms, created_at_ms)>=?"
+	case "removed":
+		where = "state='removed' AND COALESCE(removed_at_ms, updated_at_ms, created_at_ms)>=?"
+	}
+	if where != "" {
+		args := []any{since}
+		if ip := strings.TrimSpace(f.IP); banIPQueryOK(ip) {
+			where += " AND instr(remote_ip,?)>0"
+			args = append(args, ip)
+		}
+		old, err := readBans(db.db, "WHERE "+where+" ORDER BY created_at_ms DESC LIMIT 300", args...)
+		db.record(err)
+		bans = append(bans, old...)
+	}
+	if f.ID != "" {
+		seen := false
+		for _, b := range bans {
+			seen = seen || b.ID == f.ID
+		}
+		if !seen {
+			if b, err := readBan(db.db, f.ID); err == nil {
+				bans = append(bans, b)
+			} else if err != sql.ErrNoRows {
+				db.record(err)
+			}
+		}
+	}
 	confirmations, err := readConfirmations(db.db)
 	db.record(err)
 	pauses, err := readBanPauses(db.db)
@@ -628,10 +688,10 @@ func (s *Server) listBans(db *checkedRead) []uiBan {
 	out := []uiBan{}
 	for _, b := range bans {
 		u := uiBan{
-			ID: b.ID, IP: b.RemoteIP, Target: b.targetLabel(), State: b.State, UntilMS: b.ExpiresAt,
+			ID: b.ID, IP: b.RemoteIP, Target: b.targetLabel(), State: banShownState(b, now), UntilMS: b.ExpiresAt,
 			Reason: banReasonText(b.Reason), Source: b.Source, Protocol: b.Protocol, Direction: b.Direction,
 			Port: b.Port, LocalPort: b.LocalPort, Except: b.Except, Persist: b.Escalate > 0,
-			Until: "навсегда",
+			Until: "навсегда", CreatedMS: b.CreatedAt, RemovedMS: b.RemovedAt,
 		}
 		if b.ExpiresAt > 0 {
 			u.Until = time.UnixMilli(b.ExpiresAt).Local().Format("2006-01-02 15:04:05")

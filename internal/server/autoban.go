@@ -245,16 +245,35 @@ func banInTx(tx *sql.Tx, ip, hostID string, all bool, reason, source string, now
 	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(
-		`INSERT INTO audit_log(audit_id, at_ms, actor, action, object, detail) VALUES(?,?,?,?,?,?)`,
-		idgen.NewV7(), now, "auto", reason, b.RemoteIP, source,
-	); err != nil {
+	// Тот же журнал, что у ручного бана: охват и срок в detail, действие — причина.
+	if err = auditBan(tx, "auto", reason, b, now); err != nil {
 		return err
 	}
 	// Вернулся после 7 суток — отдельная тревога: забанить навсегда или нет.
 	// Обычный автобан тоже в ленту: красная строка и сирена, пока карточку не закрыли.
+	// Тревога хранит id этого бана, а не только адрес: старая карточка не откроет новый бан.
 	if exhausted {
-		return raiseAlert(tx, hostID, "persist", withAlertIP(b.RemoteIP, "вернулся после бана на 7 суток"), now, b.RemoteIP)
+		if err = raiseAlert(tx, hostID, "persist", withAlertIP(b.RemoteIP, "вернулся после бана на 7 суток"), now, b.RemoteIP); err != nil {
+			return err
+		}
+		return linkAlertBlock(tx, "persist/"+hostID+"/"+b.RemoteIP, id)
 	}
-	return raiseAlertDedup(tx, hostID, source, source+"/"+id, withAlertIP(b.RemoteIP, reason), now, b.RemoteIP)
+	key := source + "/" + id
+	if err = raiseAlertDedup(tx, hostID, source, key, withAlertIP(b.RemoteIP, reason), now, b.RemoteIP); err != nil {
+		return err
+	}
+	return linkAlertBlock(tx, key, id)
+}
+
+func linkAlertBlock(tx *sql.Tx, dedupKey, blockID string) error {
+	if dedupKey == "" || blockID == "" {
+		return nil
+	}
+	var aid string
+	err := tx.QueryRow(`SELECT alert_id FROM alerts WHERE dedup_key=? AND closed_at_ms IS NULL`, dedupKey).Scan(&aid)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT OR IGNORE INTO alert_refs(alert_id,ref_kind,ref_id) VALUES(?,'block',?)`, aid, blockID)
+	return err
 }

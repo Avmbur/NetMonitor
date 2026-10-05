@@ -547,15 +547,19 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	q := r.URL.Query()
 	st := s.uiStateQ(stateQuery{
-		Server:  q.Get("server"),
-		Section: q.Get("section"),
-		Addr:    q.Get("addr"),
-		Action:  q.Get("action"),
-		Who:     q.Get("who"),
-		Process: q.Get("process"),
-		FromMS:  parseMS(q.Get("from_ms")),
-		ToMS:    parseMS(q.Get("to_ms")),
-		After:   parseMS(q.Get("after")),
+		Server:   q.Get("server"),
+		Section:  q.Get("section"),
+		Addr:     q.Get("addr"),
+		Action:   q.Get("action"),
+		Who:      q.Get("who"),
+		Process:  q.Get("process"),
+		FromMS:   parseMS(q.Get("from_ms")),
+		ToMS:     parseMS(q.Get("to_ms")),
+		After:    parseMS(q.Get("after")),
+		BanView:  q.Get("ban_view"),
+		BanIP:    q.Get("ban_ip"),
+		BanSince: parseMS(q.Get("ban_since")),
+		BanID:    q.Get("ban_id"),
 	})
 	if st.err != nil {
 		http.Error(w, st.err.Error(), 500)
@@ -572,6 +576,8 @@ func parseMS(s string) int64 {
 type stateQuery struct {
 	Server, Section, Addr, Action, Who, Process string
 	FromMS, ToMS, After                         int64
+	BanView, BanIP, BanID                       string
+	BanSince                                    int64
 }
 
 type uiState struct {
@@ -636,6 +642,8 @@ type uiBan struct {
 	Persist   bool            `json:"persist"`
 	Paused    []string        `json:"paused,omitempty"`
 	Missed    []string        `json:"missed,omitempty"`
+	CreatedMS int64           `json:"created_ms,omitempty"`
+	RemovedMS int64           `json:"removed_ms,omitempty"`
 }
 
 type uiAudit struct {
@@ -695,23 +703,30 @@ type uiAgent struct {
 }
 
 type uiAlert struct {
-	ID        string `json:"id"`
-	Rule      string `json:"rule"`
-	HostID    string `json:"host_id"`
-	VM        string `json:"vm"`
-	At        string `json:"at"`
-	OpenedMS  int64  `json:"opened_ms"`
-	Text      string `json:"text"`
-	Addr      string `json:"addr,omitempty"`
-	Hist      bool   `json:"hist"`
-	Kind      string `json:"kind"`
-	Hint      string `json:"hint,omitempty"`
-	State     string `json:"state"` // red — активна, yellow — снята и не видел, green — видел
-	Seen      bool   `json:"seen"`
-	Closed    string `json:"closed,omitempty"`
-	ClosedBy  string `json:"closed_by,omitempty"`
-	CloseText string `json:"close_text,omitempty"`
-	IPTables  bool   `json:"iptables,omitempty"`
+	ID         string `json:"id"`
+	Rule       string `json:"rule"`
+	HostID     string `json:"host_id"`
+	VM         string `json:"vm"`
+	At         string `json:"at"`
+	OpenedMS   int64  `json:"opened_ms"`
+	Text       string `json:"text"`
+	Addr       string `json:"addr,omitempty"`
+	Hist       bool   `json:"hist"`
+	Kind       string `json:"kind"`
+	Hint       string `json:"hint,omitempty"`
+	State      string `json:"state"` // red — активна, yellow — снята и не видел, green — видел
+	Seen       bool   `json:"seen"`
+	Closed     string `json:"closed,omitempty"`
+	ClosedBy   string `json:"closed_by,omitempty"`
+	CloseText  string `json:"close_text,omitempty"`
+	IPTables   bool   `json:"iptables,omitempty"`
+	BanID      string `json:"ban_id,omitempty"`
+	BanState   string `json:"ban_state,omitempty"`
+	BanAt      string `json:"ban_at,omitempty"`
+	BanUntil   string `json:"ban_until,omitempty"`
+	BanGone    string `json:"ban_gone,omitempty"`
+	BanScope   string `json:"ban_scope,omitempty"`
+	BanUntilMS int64  `json:"ban_until_ms,omitempty"`
 }
 
 type uiFlow struct {
@@ -921,7 +936,7 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 		}
 	}
 	if sectionIn(section, "policy") {
-		st.Bans = s.listBans(db)
+		st.Bans = s.listBans(db, banListFilter{View: q.BanView, IP: q.BanIP, Since: q.BanSince, ID: q.BanID})
 		if st.Bans == nil {
 			st.Bans = []uiBan{}
 		}
@@ -1512,24 +1527,26 @@ func readUIAudit(db *checkedRead, q stateQuery) []uiAudit {
 const alertFeedMax = 50
 
 func listUIAlerts(db *checkedRead) []uiAlert {
-	rows, err := db.Query(`SELECT alert_id, rule_id, host_id, opened_at_ms, closed_at_ms, summary, backfill, seen_at_ms, COALESCE(closed_by,''), COALESCE(close_note,'')
+	rows, err := db.Query(`SELECT alert_id, rule_id, host_id, opened_at_ms, closed_at_ms, summary, backfill, seen_at_ms, COALESCE(closed_by,''), COALESCE(close_note,''), dedup_key
 		FROM alerts WHERE closed_at_ms IS NULL
-		UNION ALL SELECT * FROM (SELECT alert_id, rule_id, host_id, opened_at_ms, closed_at_ms, summary, backfill, seen_at_ms, COALESCE(closed_by,''), COALESCE(close_note,'')
+		UNION ALL SELECT * FROM (SELECT alert_id, rule_id, host_id, opened_at_ms, closed_at_ms, summary, backfill, seen_at_ms, COALESCE(closed_by,''), COALESCE(close_note,''), dedup_key
 		FROM alerts WHERE closed_at_ms IS NOT NULL ORDER BY opened_at_ms DESC LIMIT ?)
 		ORDER BY 4 DESC`, alertFeedMax)
 	if err != nil {
 		return []uiAlert{}
 	}
 	var raw []uiAlert
+	var dedups []string
 	for rows.Next() {
 		var a uiAlert
 		var closed, seen sql.NullInt64
 		var backfill int
 		var opened int64
-		var by, note string
-		if rows.Scan(&a.ID, &a.Rule, &a.HostID, &opened, &closed, &a.Text, &backfill, &seen, &by, &note) != nil {
+		var by, note, dedup string
+		if rows.Scan(&a.ID, &a.Rule, &a.HostID, &opened, &closed, &a.Text, &backfill, &seen, &by, &note, &dedup) != nil {
 			continue
 		}
+		dedups = append(dedups, dedup)
 		a.VM = a.HostID
 		if a.HostID == "monitor" || a.HostID == "" {
 			a.VM = "monitor"
@@ -1548,8 +1565,13 @@ func listUIAlerts(db *checkedRead) []uiAlert {
 		raw = append(raw, a)
 	}
 	rows.Close()
+	now := store.NowMS()
 	out := make([]uiAlert, 0, len(raw))
-	for _, a := range raw {
+	for i, a := range raw {
+		dedup := ""
+		if i < len(dedups) {
+			dedup = dedups[i]
+		}
 		if a.Rule == "storm" {
 			var backend string
 			_ = db.db.QueryRow(`SELECT COALESCE(fw_backend,'') FROM agents WHERE host_id=? AND trust_state='trusted' LIMIT 1`, a.HostID).Scan(&backend)
@@ -1563,6 +1585,12 @@ func listUIAlerts(db *checkedRead) []uiAlert {
 		if a.Addr == "" {
 			a.Addr = lastIPv4(a.Text)
 		}
+		// Карточка «вернулся после 7 суток» одна на адрес и копит баны; id v7 — берём последний.
+		var blockRef string
+		if err := db.db.QueryRow(`SELECT ref_id FROM alert_refs WHERE alert_id=? AND ref_kind='block' ORDER BY ref_id DESC LIMIT 1`, a.ID).Scan(&blockRef); err != nil && err != sql.ErrNoRows {
+			db.record(err)
+		}
+		attachAlertBan(db, &a, alertBanID(a.Rule, dedup, blockRef), now)
 		title := hostTitle(db.db, a.HostID)
 		a.Text = alertEventText(a, title)
 		a.Hint = alertHint(a.Rule, a.Hist)
@@ -1572,6 +1600,64 @@ func listUIAlerts(db *checkedRead) []uiAlert {
 		out = []uiAlert{}
 	}
 	return out
+}
+
+// alertBanID is the ban this alert is about. New alerts store it in alert_refs.
+// Older scan and ssh alerts keep it in the dedup key: «scan/<id>».
+func alertBanID(rule, dedup, ref string) string {
+	if ref != "" {
+		return ref
+	}
+	if rule != "scan" && rule != "ssh" {
+		return ""
+	}
+	prefix := rule + "/"
+	if !strings.HasPrefix(dedup, prefix) {
+		return ""
+	}
+	id := dedup[len(prefix):]
+	if id == "" || strings.Contains(id, "/") {
+		return ""
+	}
+	return id
+}
+
+func banShownState(b banRecord, now int64) string {
+	if b.State == "active" && b.ExpiresAt > 0 && b.ExpiresAt <= now {
+		return "expired"
+	}
+	return b.State
+}
+
+func attachAlertBan(db *checkedRead, a *uiAlert, id string, now int64) {
+	if a == nil || id == "" {
+		return
+	}
+	a.BanID = id
+	b, err := readBan(db.db, id)
+	if err == sql.ErrNoRows {
+		a.BanState = "missing"
+		return
+	}
+	if err != nil {
+		db.record(err)
+		return
+	}
+	a.BanState = banShownState(b, now)
+	a.BanAt = fmtMS(b.CreatedAt)
+	a.BanUntilMS = b.ExpiresAt
+	if b.ExpiresAt > 0 {
+		a.BanUntil = fmtMS(b.ExpiresAt)
+	} else {
+		a.BanUntil = "навсегда"
+	}
+	a.BanScope = scopeLabel(b.Hosts, b.Except)
+	switch a.BanState {
+	case "removed":
+		a.BanGone = fmtMS(b.RemovedAt)
+	case "expired":
+		a.BanGone = fmtMS(b.ExpiresAt)
+	}
 }
 
 func (s *Server) handleAlert(w http.ResponseWriter, r *http.Request) {

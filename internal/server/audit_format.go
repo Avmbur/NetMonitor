@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"netmonitor/internal/policy"
@@ -12,7 +13,7 @@ import (
 // Пункты «действие» в фильтре журнала. Условия — по сырому action в
 // audit_log: подпись в морде собирает polishAudit уже после выборки.
 var auditKinds = map[string]string{
-	"ban":      `action IN ('забанил','изменил бан','снял бан','вернул бан','бан снят на сервере','скан портов','перебор SSH')`,
+	"ban":      `action IN ('забанил','изменил бан','снял бан','вернул бан','бан снят на сервере','бан истёк','скан портов','перебор SSH')`,
 	"agent":    `action IN ('подтвердил агента','отклонил агента','отозвал сертификат','удалил агента','забыл агента','запросил снятие агента','снял агента с сервера','запросил обновление монитора','запросил обновление агентов','обновил агента','карантин клона')`,
 	"group":    `action='сохранил группу' OR action LIKE 'группа:%'`,
 	"alert":    `action LIKE '%тревог%'`,
@@ -201,6 +202,29 @@ func formatControlAudit(op, host, detail string) (action, object string) {
 	}
 }
 
+func banAuditAction(action string) bool {
+	switch action {
+	case "забанил", "изменил бан", "снял бан", "вернул бан", "бан истёк", "скан портов", "перебор SSH":
+		return true
+	default:
+		return false
+	}
+}
+
+// auditBan пишет срок в UTC; в журнале он местный, как время строки и карточки.
+func banUntilLocal(d string) string {
+	const mark = " · до "
+	i := strings.LastIndex(d, mark)
+	if i < 0 {
+		return d
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", d[i+len(mark):], time.UTC)
+	if err != nil {
+		return d
+	}
+	return d[:i+len(mark)] + t.In(time.Local).Format("02.01.2006 15:04:05")
+}
+
 func polishAudit(db *checkedRead, actor, action, object, detail, src string) (string, string, string) {
 	rawActor := actor
 	rawDetail := detail
@@ -267,6 +291,11 @@ func polishAudit(db *checkedRead, actor, action, object, detail, src string) (st
 		action = "снял бан аварийно"
 		object = auditHostName(db, rawActor)
 		actor = object
+	case banAuditAction(action):
+		// Срок и охват лежат в detail. Старые автобаны писали туда только «scan»/«ssh» — это не срок.
+		if d := stripJSON(rawDetail); strings.Contains(d, "·") && object != "" && !strings.Contains(object, d) {
+			object = object + " · " + banUntilLocal(d)
+		}
 	case action == "подтвердил агента" || action == "отклонил агента" || action == "отозвал сертификат":
 		head, rest := firstToken(object)
 		if looksAuditID(head) {

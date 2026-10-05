@@ -1443,6 +1443,43 @@ const GROUP_POLICIES = [
   { id: "block", title: "блокировать", hint: "совпадения режем" }
 ];
 const BANS = [];
+// Плитка банов: по умолчанию только живые. pin — бан, который открыли из карточки.
+const banListQuery = { view: "active", ip: "", days: 7, pin: "" };
+function banStateParams() {
+  const q = banListQuery;
+  let s = "";
+  if (q.view && q.view !== "active") s += "&ban_view=" + encodeURIComponent(q.view);
+  const ip = String(q.ip || "").trim();
+  if (ip) s += "&ban_ip=" + encodeURIComponent(ip);
+  if (q.view && q.view !== "active") {
+    const days = Number(q.days) || 7;
+    s += "&ban_since=" + (Date.now() - days * 86400000);
+  }
+  if (q.pin) s += "&ban_id=" + encodeURIComponent(q.pin);
+  return s;
+}
+function banRowShown(b) {
+  if (!b) return false;
+  const q = banListQuery;
+  if (q.pin && b.id === q.pin) return true;
+  const ip = String(q.ip || "").trim().toLowerCase();
+  if (ip && String(b.ip || b.addr || "").toLowerCase().indexOf(ip) < 0) return false;
+  if (q.view === "expired") return b.state === "expired";
+  if (q.view === "removed") return b.state === "removed";
+  return banLive(b);
+}
+// В BANS при просмотре истории лежат и завершённые: действия по бану — только с живыми.
+function banLive(b) {
+  return !!b && (!b.state || b.state === "active") && (!b.untilMS || b.untilMS > Date.now());
+}
+function banBarHtml() {
+  const q = banListQuery;
+  const chip = (id, title) => `<button type="button" class="al-chip${q.view === id ? " on" : ""}" data-ban-view="${id}">${title}</button>`;
+  const days = q.view === "active" ? "" : `<select data-ban-days title="за какой срок">${[1, 7, 30].map(n =>
+    `<option value="${n}"${Number(q.days) === n ? " selected" : ""}>${n === 1 ? "сутки" : n + " суток"}</option>`).join("")}</select>`;
+  return `<div class="log-bar">${chip("active", "живые")}${chip("expired", "истёкшие")}${chip("removed", "снятые")}
+    <input data-ban-ip placeholder="адрес" value="${esc(q.ip || "")}">${days}</div>`;
+}
 const NEVER = [];
 const PERIODS = [
   { id: "5m", title: "5 мин" },
@@ -3115,6 +3152,8 @@ function banReasonText(b) {
 }
 function banLeftHtml(b) {
   if (!b) return "";
+  if (b.state === "expired") return "истёк";
+  if (b.state === "removed") return "снят";
   if (!b.untilMS) {
     const t = b.ttl || "навсегда";
     return esc(t === "навсегда" ? "навсегда" : t);
@@ -3148,7 +3187,7 @@ function nAddrs(n) {
 function banPackKey(b) {
   const reason = banReasonText(b);
   const auto = b && (b.source === "scan" || b.source === "ssh" || !b.source && (reason === "скан портов" || reason === "перебор SSH"));
-  return auto ? reason + "|" + hostsLabel(b.hosts, b.except) : "";
+  return auto ? (b.state || "active") + "|" + reason + "|" + hostsLabel(b.hosts, b.except) : "";
 }
 function banRowsWithPacks(list) {
   const packs = new Map();
@@ -3174,7 +3213,8 @@ function banPackCells(p) {
   const b0 = p.bans[0];
   const forever = p.bans.some(b => !b.untilMS && (b.ttl || "навсегда") === "навсегда");
   const last = p.bans.reduce((m, b) => Math.max(m, b.untilMS || 0), 0);
-  const left = forever ? "навсегда" : "до " + remainingDur(last - Date.now()).text;
+  const left = b0.state === "removed" ? "снят" : b0.state === "expired" ? "истёк" :
+    forever ? "навсегда" : "до " + remainingDur(last - Date.now()).text;
   const back = p.bans.filter(b => b.persist).length;
   return [
     `${banPackOpen.has(p.pack) ? "▾" : "▸"} ${nAddrs(p.bans.length)}`,
@@ -3216,8 +3256,16 @@ function alertEventText(a) {
 }
 function alertHint(a) {
   if (a && a.hist) return CATCHUP_HINT;
-  if (a && a.hint) return a.hint;
   const k = alertKind(a);
+  if ((k === "scan" || k === "ssh") && a && a.banState) {
+    if (a.banState === "expired") return "срок этого бана кончился.";
+    if (a.banState === "removed") return "этот бан сняли.";
+    if (a.banState === "missing") return "записи бана уже нет.";
+    if (a.banState === "active" && a.banUntil && a.banUntil !== "навсегда") {
+      return "адрес забанен до " + whenText(a.banUntil) + ". закрой карточку — строка просмотрена, сирена молчит.";
+    }
+  }
+  if (a && a.hint) return a.hint;
   if (k === "scan-cap" || k === "ssh-cap") return "старая тревога: потолка автобана нет, баны ставятся";
   if (k === "storm") return "много атак за минуту. автобан идёт, внешние подключения закрыты. снимутся через 10 мин после атак.";
   if (k === "scan" || k === "ssh") return "адрес забанен. закрой карточку — строка просмотрена, сирена молчит.";
@@ -3236,8 +3284,14 @@ function alertDone(a) {
   if (k === "storm") return a.iptables
     ? "автобан. iptables — внешние подключения не закрываются"
     : "автобан, внешние подключения закрыты";
-  if (k === "scan" || k === "ssh") return "поставил бан";
-  if (k === "persist") return "поставил бан ещё на 7 суток";
+  if (k === "scan" || k === "ssh" || k === "persist") {
+    if (a.banState === "expired") return "поставил бан, срок кончился";
+    if (a.banState === "removed") return "поставил бан, потом его сняли";
+    if (a.banState === "missing") return "поставил бан, записи уже нет";
+    if (a.banState === "active" && a.banUntil && a.banUntil !== "навсегда") return "поставил бан до " + whenText(a.banUntil);
+    if (k === "persist") return "поставил бан ещё на 7 суток";
+    return "поставил бан";
+  }
   if (k === "paused_local" || k === "paused") return "бан на этом сервере не ставится, пока его не вернут";
   if (k === "clone") return "перевёл агента в карантин";
   if (k === "disk-90") return "остановил запись трафика, баны и правила работают";
@@ -3247,19 +3301,46 @@ function alertDone(a) {
   if (a && a.hist) return "ничего — это досланная история";
   return "";
 }
-// Кнопки карточки: [op, подпись, главная?]. Только для активной тревоги.
+// Кнопки карточки: [op, подпись, главная?]. «Открыть бан» остаётся и у просмотренной.
+function banFactText(a) {
+  if (!a || (!a.banId && !a.banState)) return "";
+  const scope = a.banScope || "";
+  const at = a.banAt ? whenText(a.banAt) : "";
+  const until = a.banUntil ? whenText(a.banUntil) : "";
+  const gone = a.banGone ? whenText(a.banGone) : "";
+  const placed = at ? "поставлен " + at + ". " : "";
+  const where = scope ? " " + scope + "." : "";
+  if (a.banState === "active") {
+    const till = !until || until === "навсегда" ? "без срока" : "до " + until;
+    return placed + "действует " + till + "." + where;
+  }
+  if (a.banState === "expired") return placed + "истёк " + (gone || until) + "." + where;
+  if (a.banState === "removed") {
+    return placed + "снят" + (gone ? " " + gone : "") + (until && until !== "навсегда" ? ". был до " + until : "") + "." + where;
+  }
+  if (a.banState === "missing") return "запись бана не найдена";
+  return "";
+}
+function banGoneText(a) {
+  if (a && a.banState === "expired") return "бан истёк " + whenText((a && (a.banGone || a.banUntil)) || "");
+  if (a && a.banState === "removed") return "бан снят " + whenText((a && a.banGone) || "");
+  if (a && a.banState === "missing") return "запись бана не найдена";
+  return "бан не найден";
+}
 function alertActions(a) {
-  if (alertState(a) !== "red") return [];
   const k = alertKind(a);
   const out = [];
+  const live = alertState(a) === "red";
+  if ((k === "scan" || k === "ssh" || k === "persist") && (a.banId || a.addr)) {
+    out.push(["openban", "открыть бан", !live || k !== "persist"]);
+  }
+  if (!live) return out;
   if (k === "storm") {
     if (!a.seen) out.push(["keep", "не снимать", true]);
     out.push(["open", "снять шторм", false]);
     out.push(["bans", "показать баны", false]);
   } else if (k === "persist") {
     out.push(["forever", "забанить навсегда", true]);
-  } else if ((k === "scan" || k === "ssh") && a.addr) {
-    out.push(["openban", "открыть бан", true]);
   } else if (k === "paused_local" || k === "paused") {
     out.push(["restore", "вернуть бан", true]);
   } else if ((k === "scan-cap" || k === "ssh-cap") && a.addr) {
@@ -3283,6 +3364,7 @@ function openAlertCard(id) {
   const st = alertState(a);
   const acts = alertActions(a);
   const done = alertDone(a);
+  const fact = banFactText(a);
   const closed = st !== "red"
     ? `<div class="ac-sec"><b>как закрыта</b>${esc([a.closeText || "закрыта", a.closed ? whenText(a.closed) : ""].filter(Boolean).join(" · "))}</div>`
     : "";
@@ -3290,6 +3372,7 @@ function openAlertCard(id) {
     <div class="ac-state ${st}"><i></i>${esc(ALERT_STATE_TEXT[st] || st)}${st === "red" && a.seen ? " · просмотрена, сирена молчит" : ""}</div>
     <div class="ac-sec"><b>что случилось</b>${esc(alertHint(a) || alertEventText(a))}</div>
     ${done ? `<div class="ac-sec"><b>что монитор уже сделал</b>${esc(done)}</div>` : ""}
+    ${fact ? `<div class="ac-sec"><b>бан</b>${esc(fact)}</div>` : ""}
     ${closed}
     ${acts.length ? `<div class="ac-acts">${acts.map(([op, t, main]) =>
       `<button type="button" data-a="alertop" data-op="${esc(op)}"${main ? ` class="main"` : ""}>${esc(t)}</button>`).join("")}</div>` : ""}`;
@@ -3369,7 +3452,7 @@ function alertEventHtml(a) {
 function banByAlert(a) {
   if (!a || !a.addr) return null;
   const ip = banFilterAddr(a.addr);
-  return BANS.find(b => banFilterAddr(b.ip || b.addr) === ip) || null;
+  return BANS.find(b => banLive(b) && banFilterAddr(b.ip || b.addr) === ip) || null;
 }
 function alertMain(a) {
   const k = alertKind(a);
@@ -3388,15 +3471,25 @@ function withFreshBans(done) {
   window.nmLoadBans().then(done).catch(() => toastMsg("не удалось открыть бан"));
 }
 function openAlertBan(al) {
+  if (!al) return;
+  if (al.banState === "expired" || al.banState === "removed") {
+    banListQuery.view = al.banState;
+    banListQuery.ip = banFilterAddr(al.addr || "");
+  } else {
+    banListQuery.view = "active";
+    banListQuery.ip = "";
+  }
+  banListQuery.pin = al.banId || "";
   withFreshBans(() => {
-    const ban = banByAlert(al);
-    if (!ban) { toastMsg("бан уже снят"); return; }
+    // Старые карточки без id бана — по адресу, как раньше.
+    const ban = al.banId ? BANS.find(b => b.id === al.banId) : banByAlert(al);
+    if (!ban) { toastMsg(banGoneText(al)); return; }
     revealBan(ban);
   });
 }
 function openStormBans(a) {
   withFreshBans(() => {
-    const on = b => b.hosts === "all" || (Array.isArray(b.hosts) && b.hosts.indexOf(a.vm) >= 0);
+    const on = b => banLive(b) && (b.hosts === "all" || (Array.isArray(b.hosts) && b.hosts.indexOf(a.vm) >= 0));
     const ban = BANS.find(b => (b.source === "ssh" || b.source === "scan") && on(b)) || BANS.find(on);
     if (!ban) { toastMsg("бан уже снят"); return; }
     revealBan(ban);
@@ -3404,6 +3497,9 @@ function openStormBans(a) {
 }
 function revealBan(ban) {
   if (!ban) return;
+  banListQuery.view = ban.state === "removed" ? "removed" : banLive(ban) ? "active" : "expired";
+  banListQuery.ip = "";
+  banListQuery.pin = ban.id;
   const k = banPackKey(ban);
   if (k && BANS.filter(b => banPackKey(b) === k).length >= BAN_PACK_MIN) banPackOpen.add(k);
   ui.policyExpanded.bans = true;
@@ -3535,7 +3631,7 @@ function policyBlocks() {
   const ruleSorted = sortPolicyItems("rules", ruleItems);
   const ruleRows = ruleItems.map(x => x.cells);
   const alerts = alertTileRows();
-  const banList = f.all ? BANS : BANS.filter(b => hostTouchesShown(b));
+  const banList = (f.all ? BANS : BANS.filter(b => hostTouchesShown(b))).filter(banRowShown);
   const banView = banRowsWithPacks(banList);
   const nMeta = n => n ? String(n) : "нет";
   const nameN = colContentLen("имя", ruleRows, 1);
@@ -3569,7 +3665,7 @@ function policyBlocks() {
     bans: {
       id: "bans", title: "Баны", tip: "отсечение адреса на срок, не правило",
       sub: nMeta(banList.length), act: "забанить",
-      html: policyTable(
+      html: banBarHtml() + (banView.length ? "" : `<div class="hint">${banListQuery.view === "active" ? "живых банов нет" : "за этот срок ничего нет"}</div>`) + policyTable(
         ["цель", "причина", "сервер", "осталось", "возвращался"],
         banView.map(v => v.pack ? banPackCells(v) : banCells(v.ban)),
         (_, i) => {
@@ -3629,6 +3725,9 @@ function groupMemberCount(members) {
 
 function renderPolicy() {
   const el = document.getElementById("policy");
+  const ae = document.activeElement;
+  const keepBan = ae && el.contains(ae) && ae.dataset && ae.dataset.banIp != null
+    ? { from: ae.selectionStart, to: ae.selectionEnd } : null;
   if (state.emptyPark) {
     el.className = "tiles n1 fill";
     el.style.gridTemplateColumns = "";
@@ -3658,6 +3757,13 @@ function renderPolicy() {
   }).join("");
   applyTileGrid(el, ids, ui.policyExpanded);
   restoreScrolls(el);
+  if (keepBan) {
+    const next = el.querySelector("[data-ban-ip]");
+    if (next) {
+      next.focus();
+      try { next.setSelectionRange(keepBan.from, keepBan.to); } catch (e) {}
+    }
+  }
 }
 function onGroupRowPointer(ev) {
   if (policySortOf("groups").col != null) return false;
@@ -4298,12 +4404,14 @@ function openMenu(x, y, ctx) {
        <button type="button" data-a="sortdef">сброс сортировки</button>`;
   } else if (ctx.type === "ban") {
     const b = ctx.ban;
+    const live = banLive(b);
+    const mark = b.state === "removed" ? "снят" : b.state === "expired" ? "истёк" : "";
     menu.innerHTML = `
-      <div class="sub">${esc(b.addr)} · ${esc(b.reason)}</div>
-      <button type="button" data-a="unban1">снять разово</button>
+      <div class="sub">${esc(b.addr)} · ${esc(b.reason)}${mark ? " · " + mark : ""}</div>
+      ${live ? `<button type="button" data-a="unban1">снять разово</button>
       <button type="button" data-a="extend">продлить…</button>
       <button type="button" data-a="banvms">на каких серверах</button>
-      <div class="sep"></div>
+      <div class="sep"></div>` : ""}
       <button type="button" data-a="whois">whois</button>
       <button type="button" data-a="persist">история этого адреса</button>`;
   } else if (ctx.type === "question") {
@@ -5926,6 +6034,21 @@ document.addEventListener("contextmenu", ev => {
   openMenu(ev.clientX, ev.clientY, { type: "whois", ip: cell.dataset.ip });
 });
 document.getElementById("policy").addEventListener("pointerdown", onPolicyPointer);
+document.getElementById("policy").addEventListener("input", ev => {
+  const ip = ev.target.closest && ev.target.closest("[data-ban-ip]");
+  if (!ip) return;
+  banListQuery.ip = ip.value;
+  banListQuery.pin = "";
+  clearTimeout(banListQuery.timer);
+  banListQuery.timer = setTimeout(() => { if (window.nmRefresh) window.nmRefresh(true); }, 300);
+});
+document.getElementById("policy").addEventListener("change", ev => {
+  const days = ev.target.closest && ev.target.closest("[data-ban-days]");
+  if (!days) return;
+  banListQuery.days = Number(days.value) || 7;
+  banListQuery.pin = "";
+  if (window.nmRefresh) window.nmRefresh(true);
+});
 document.getElementById("policy").addEventListener("contextmenu", ev => {
   const trB = ev.target.closest("tr[data-ban]");
   if (trB) {
@@ -6016,6 +6139,15 @@ document.getElementById("policy").addEventListener("click", ev => {
     renderPolicy();
     return;
   }
+  const banViewBtn = ev.target.closest("[data-ban-view]");
+  if (banViewBtn) {
+    banListQuery.view = banViewBtn.dataset.banView || "active";
+    banListQuery.pin = "";
+    renderPolicy();
+    if (window.nmRefresh) window.nmRefresh(true);
+    return;
+  }
+  if (ev.target.closest("[data-ban-ip], [data-ban-days]")) return;
   const chip = ev.target.closest("[data-al-color]");
   if (chip) {
     ui.alertColors = Object.assign({}, ui.alertColors || {});
@@ -6286,7 +6418,7 @@ function openBrandModal() {
       <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
     </div>`;
-  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.4 · 01.10.2026", body, ""), "brand");
+  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.5 · 05.10.2026", body, ""), "brand");
 }
 
 document.getElementById("profile").addEventListener("click", openProfileModal);
@@ -6937,12 +7069,12 @@ requestAnimationFrame(() => {
     AGENTS.splice(0, AGENTS.length, ...ag);
     const bansLive = liveArr(d, "bans");
     if (bansLive) {
-    const bans = bansLive.filter(b => b.state === "active").map(b => {
+    const bans = bansLive.filter(b => b && b.state).map(b => {
       const hosts = Array.isArray(b.hosts) ? b.hosts : "all";
       const except = b.except || [];
       return {
         id: b.id, addr: b.target || b.ip, ip: b.ip, reason: b.reason || "ручной", source: b.source || "",
-        ttl: b.until || "навсегда", untilMS: b.until_ms || 0,
+        state: b.state, ttl: b.until || "навсегда", untilMS: b.until_ms || 0,
         proto: b.proto || "", dir: b.direction || "both", port: b.port || 0, localPort: b.local_port || 0,
         hosts, except, applied: b.applied || 0, total: b.total || 0,
         persist: !!b.persist, paused: b.paused || [], missed: b.missed || []
@@ -7010,7 +7142,10 @@ requestAnimationFrame(() => {
       id: a.id, kind: a.kind || a.rule || "", vm: a.vm || a.host_id, at: a.at || "",
       text: a.text || "", addr: a.addr || "", rule: a.rule || "", hist: !!a.hist, hint: a.hint || "",
       state: a.state || "red", seen: !!a.seen, closed: a.closed || "", closedBy: a.closed_by || "",
-      closeText: a.close_text || "", iptables: !!a.iptables
+      closeText: a.close_text || "", iptables: !!a.iptables,
+      banId: a.ban_id || "", banState: a.ban_state || "", banAt: a.ban_at || "",
+      banUntil: a.ban_until || "", banGone: a.ban_gone || "", banScope: a.ban_scope || "",
+      banUntilMS: a.ban_until_ms || 0
     }));
     ALERTS.splice(0, ALERTS.length, ...alerts);
     noteSounds();
@@ -7130,7 +7265,7 @@ requestAnimationFrame(() => {
   let policyReady = false;
   let policyFetch = null;
   function loadPolicy() {
-    return fetch("/ui/api/state?section=policy").then(r => {
+    return fetch("/ui/api/state?section=policy" + banStateParams()).then(r => {
       if (r.status === 401) { showLogin(); throw new Error("auth"); }
       if (!r.ok) throw new Error("http");
       return r.json();
@@ -7177,6 +7312,7 @@ requestAnimationFrame(() => {
       if (sectionHasVmPicker() && f && !f.all && f.shown && f.shown.length === 1) {
         url += "&server=" + encodeURIComponent(f.shown[0]);
       }
+      if (state.section === "policy") url += banStateParams();
       if (state.section === "log") {
         const hf = state.histFilter || {};
         const af = state.auditApplied || state.auditFilter || {};

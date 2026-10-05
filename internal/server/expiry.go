@@ -12,13 +12,43 @@ import (
 
 func (s *Server) expireBlocks(now int64) error {
 	return s.st.Update(func(tx *sql.Tx) error {
-		res, err := tx.Exec("UPDATE blocks SET state='expired' WHERE state='active' AND expires_at_ms IS NOT NULL AND expires_at_ms<=?", now)
+		rows, err := tx.Query("SELECT "+banColumns+" FROM blocks WHERE state='active' AND expires_at_ms IS NOT NULL AND expires_at_ms<=?", now)
 		if err != nil {
 			return err
 		}
-		n, err := res.RowsAffected()
+		var due []banRecord
+		for rows.Next() {
+			b, err := scanBan(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			due = append(due, b)
+		}
+		err = rows.Err()
+		rows.Close()
 		if err != nil {
 			return err
+		}
+		n := 0
+		for _, b := range due {
+			res, err := tx.Exec("UPDATE blocks SET state='expired' WHERE block_id=? AND state='active'", b.ID)
+			if err != nil {
+				return err
+			}
+			changed, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if changed != 1 {
+				continue
+			}
+			b.State = "expired"
+			// Одна строка на бан: повторный проход уже не видит state='active'.
+			if err = auditBan(tx, "auto", "бан истёк", b.banSpec, now); err != nil {
+				return err
+			}
+			n++
 		}
 		if n > 0 {
 			return bumpTrusted(tx)
