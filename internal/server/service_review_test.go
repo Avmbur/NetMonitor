@@ -91,7 +91,7 @@ func TestServiceFirewallRestoredAudited(t *testing.T) {
 	}
 }
 
-// Новый адрес имени из группы попадает в dns_seen и в политику; чужое имя диск не трогает.
+// Каждая новая пара попадает в dns_seen один раз; политику двигает только имя из группы.
 func TestServiceDNSFeedsPolicyNames(t *testing.T) {
 	s, send := serviceFixture(t)
 	if err := s.st.Update(func(tx *sql.Tx) error {
@@ -112,7 +112,7 @@ func TestServiceDNSFeedsPolicyNames(t *testing.T) {
 	if code, _ := send(dns("d1", 1, "api.github.com", "140.82.112.6"), dns("d2", 2, "example.org", "93.184.216.34")); code != 200 {
 		t.Fatal(code)
 	}
-	if n := countTable(t, s, "dns_seen"); n != 1 {
+	if n := countTable(t, s, "dns_seen"); n != 2 {
 		t.Fatalf("dns_seen %d", n)
 	}
 	var rev2 int
@@ -127,6 +127,14 @@ func TestServiceDNSFeedsPolicyNames(t *testing.T) {
 	_ = s.st.DB.QueryRow(`SELECT policy_rev FROM agents WHERE agent_id='a'`).Scan(&rev3)
 	if rev3 != rev2 {
 		t.Fatal("repeat pair bumped policy")
+	}
+	if code, _ := send(dns("d4", 4, "other.example.org", "93.184.216.35")); code != 200 {
+		t.Fatal(code)
+	}
+	var rev4 int
+	_ = s.st.DB.QueryRow(`SELECT policy_rev FROM agents WHERE agent_id='a'`).Scan(&rev4)
+	if rev4 != rev2 || countTable(t, s, "dns_seen") != 3 {
+		t.Fatal("name outside policy bumped policy or was not stored", rev4, rev2)
 	}
 }
 

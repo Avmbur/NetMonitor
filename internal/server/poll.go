@@ -143,6 +143,10 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, errOldAgentUninstall, http.StatusConflict)
 		return
 	}
+	if err = s.recordAdmitted(ag.ID, in.ServiceAdmitted); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	if err = s.recordOnceUsed(ag.ID, in.ConsumedOnce); err != nil {
 		http.Error(w, err.Error(), 400)
 		return

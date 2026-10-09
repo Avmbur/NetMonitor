@@ -57,7 +57,7 @@ func (s *Server) registerStream(agentID, instance string) (bool, error) {
 // Only call after the database commit. Failed batches cannot change the UI pulse.
 func (s *Server) publishPulse(j *batchJob) {
 	for _, ev := range j.applied {
-		if ev.Kind == "dns" {
+		if ev.Kind == "dns" && j.ag.Trust == "trusted" {
 			s.noteLiveDNS(j.ag.HostID, ev, j.now)
 		}
 		if ev.Kind != "health" {

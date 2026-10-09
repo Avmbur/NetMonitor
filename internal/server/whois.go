@@ -108,6 +108,6 @@ func (s *Server) handleDNSLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	db := &checkedRead{db: s.st.DB}
-	name := lookupDNS(db, "", ip, "", 0)
+	name := s.lookupDNS(db, "", ip, "", 0)
 	writeJSON(w, map[string]string{"ip": ip, "name": name})
 }

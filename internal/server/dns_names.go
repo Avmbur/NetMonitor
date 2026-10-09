@@ -88,6 +88,41 @@ ON CONFLICT(host_id, name, ip_bin) DO UPDATE SET
 	return nil
 }
 
+// rememberLiveNames переносит в базу пары имён правила, которые монитор видел
+// в памяти. Пара могла прийти до правила или до обновления монитора: без неё
+// вопрос по этому адресу не закрылся бы.
+func (s *Server) rememberLiveNames(tx *sql.Tx, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	type pair struct{ host, name, ip string }
+	var found []pair
+	s.nameMu.Lock()
+	for key, v := range s.liveNames {
+		for _, n := range names {
+			if patternMatches(v.name, n) {
+				host, ip, _ := strings.Cut(key, "\n")
+				found = append(found, pair{host, v.name, ip})
+				break
+			}
+		}
+	}
+	s.nameMu.Unlock()
+	now := store.NowMS()
+	for _, p := range found {
+		ip, err := netip.ParseAddr(p.ip)
+		if err != nil {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO dns_seen(host_id, name, ip_bin, ip, first_seen_ms, last_seen_ms)
+			SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM agents WHERE host_id=? AND trust_state='trusted')
+			ON CONFLICT(host_id, name, ip_bin) DO NOTHING`, p.host, p.name, netipx.Bin16(ip), netipx.Canonical(ip), now, now, p.host); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func expandRuleNames(db policyReader, r policy.Rule) (policy.Rule, error) {
 	if len(r.Match.Names) == 0 {
 		return r, nil
@@ -143,14 +178,25 @@ func (s *Server) noteLiveDNS(host string, ev protocol.Event, now int64) {
 	s.liveNames[key] = serviceName{name: strings.ToLower(strings.TrimSuffix(p.Name, ".")), at: now}
 }
 
+// lookupDNS: свежее имя из памяти, потом пары из базы. Без сервера (клик по
+// адресу) память смотрится по всему парку, берётся самое свежее имя.
 func (s *Server) lookupDNS(db *checkedRead, host, ip, proto string, port int) string {
-	{
-		s.nameMu.Lock()
-		v, ok := s.liveNames[host+"\n"+canonIP(ip)]
-		s.nameMu.Unlock()
-		if ok && store.NowMS()-v.at < 3600000 {
-			return v.name
+	now := store.NowMS()
+	s.nameMu.Lock()
+	var best serviceName
+	if host != "" {
+		best = s.liveNames[host+"\n"+canonIP(ip)]
+	} else {
+		suffix := "\n" + canonIP(ip)
+		for k, v := range s.liveNames {
+			if strings.HasSuffix(k, suffix) && v.at > best.at {
+				best = v
+			}
 		}
+	}
+	s.nameMu.Unlock()
+	if best.name != "" && now-best.at < 3600000 {
+		return best.name
 	}
 	return lookupDNS(db, host, ip, proto, port)
 }

@@ -36,7 +36,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.7"
+var Version = "1.0.8"
 
 type Config struct {
 	Pin         string
@@ -1558,7 +1558,7 @@ func (a *Agent) questionLocked(c pol.Contact) bool {
 	if d, ok := pol.Evaluate(a.groups, a.hostID, c, now); ok {
 		return d.Action == "alert"
 	}
-	if _, ok := pol.Evaluate(a.rules, a.hostID, c, now); ok {
+	if _, ok := pol.Evaluate(pol.WithAdmitted(a.rules, admittedNow(now)), a.hostID, c, now); ok {
 		return false
 	}
 	mode, storm := fw.SplitMode(a.mode)

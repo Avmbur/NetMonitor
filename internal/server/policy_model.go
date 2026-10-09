@@ -466,6 +466,9 @@ func (s *Server) handlePolicyRule(w http.ResponseWriter, r *http.Request) {
 			if err = rememberResolved(tx, rule.Hosts, seed, now); err != nil {
 				return err
 			}
+			if err = s.rememberLiveNames(tx, rule.Match.Names); err != nil {
+				return err
+			}
 			if err := s.flushQuestionRepeats(tx, now); err != nil {
 				return err
 			}

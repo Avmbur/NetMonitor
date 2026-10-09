@@ -232,13 +232,18 @@ func TestReviewServiceLivePulseIsCurrent(t *testing.T) {
 		t.Fatalf("live host shown stale: %d %+v %v", n, rows, err)
 	}
 }
-func TestReviewServiceDNSIsMemoryOnly(t *testing.T) {
+
+// Обычная пара DNS пишется на диск один раз, повтор диск не трогает.
+func TestReviewServiceDNSStoredOnce(t *testing.T) {
 	s, send := serviceFixture(t)
 	raw, _ := json.Marshal(protocol.DNSPayload{Name: "fresh.example.org", IP: "203.0.113.20", Kind: "a"})
 	if code, _ := send(protocol.Event{EventID: "dns", Seq: 1, Kind: "dns", ObservedAtMS: store.NowMS(), Payload: raw}); code != 200 {
 		t.Fatal(code)
 	}
-	if n := countTable(t, s, "dns_seen"); n != 0 {
+	if code, _ := send(protocol.Event{EventID: "dns2", Seq: 2, Kind: "dns", ObservedAtMS: store.NowMS(), Payload: raw}); code != 200 {
+		t.Fatal(code)
+	}
+	if n := countTable(t, s, "dns_seen"); n != 1 {
 		t.Fatalf("ordinary DNS on disk %d", n)
 	}
 	if name := s.lookupDNS(nil, "h", "203.0.113.20", "tcp", 443); name != "fresh.example.org" {

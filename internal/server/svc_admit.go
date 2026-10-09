@@ -5,15 +5,91 @@ import (
 	"database/sql"
 	"fmt"
 	"net/netip"
+	"sync"
 	"time"
 
 	"netmonitor/internal/idgen"
+	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
 	"netmonitor/internal/svcnet"
 )
 
 // admitWait — сколько ждать, пока агент этой машины впишет адрес. Тесты подменяют.
 var admitWait = 4 * time.Second
+
+// svcAdmitted — вписанные агентом адреса по серверам, со сроком. Оценка
+// монитора видит их так же, как фильтр агента: без них соединение службы
+// горит в активности и держит вопрос. После перезапуска монитора пусто
+// до следующего допуска.
+var svcAdmitted = struct {
+	sync.Mutex
+	until map[string]map[netip.Addr]int64
+}{until: map[string]map[netip.Addr]int64{}}
+
+func noteAdmitted(host string, ips []netip.Addr, ttl time.Duration) {
+	until := store.NowMS() + ttl.Milliseconds()
+	svcAdmitted.Lock()
+	defer svcAdmitted.Unlock()
+	m := svcAdmitted.until[host]
+	if m == nil {
+		m = map[netip.Addr]int64{}
+		svcAdmitted.until[host] = m
+	}
+	for _, ip := range ips {
+		m[ip.Unmap()] = until
+	}
+}
+
+// Accept observations only for the authenticated agent's own trusted host.
+// Merge, rather than clear: nft admissions survive an agent process restart.
+func (s *Server) recordAdmitted(agentID string, entries []protocol.ServiceAdmission) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	var host, trust string
+	if err := s.st.DB.QueryRow(`SELECT host_id,trust_state FROM agents WHERE agent_id=?`, agentID).Scan(&host, &trust); err != nil {
+		return err
+	}
+	if trust != "trusted" {
+		return nil
+	}
+	now := store.NowMS()
+	valid := make(map[netip.Addr]int64)
+	for _, entry := range entries {
+		ip, err := netip.ParseAddr(entry.IP)
+		if err != nil || ip.Zone() != "" || entry.UntilMS > now+2*svcnet.AdmitTTL.Milliseconds() {
+			return fmt.Errorf("invalid service admission")
+		}
+		if entry.UntilMS > now {
+			valid[ip.Unmap()] = entry.UntilMS
+		}
+	}
+	svcAdmitted.Lock()
+	defer svcAdmitted.Unlock()
+	m := svcAdmitted.until[host]
+	if m == nil {
+		m = map[netip.Addr]int64{}
+		svcAdmitted.until[host] = m
+	}
+	for ip, until := range valid {
+		m[ip] = until
+	}
+	return nil
+}
+
+func admittedFor(host string, now int64) []netip.Addr {
+	svcAdmitted.Lock()
+	defer svcAdmitted.Unlock()
+	var out []netip.Addr
+	for ip, until := range svcAdmitted.until[host] {
+		if until <= now {
+			delete(svcAdmitted.until[host], ip)
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
+}
 
 // admitOnMonitor просит агента этой машины вписать адреса GitHub в фильтр до
 // соединения nmserver: сам nmserver работает без root и nft не трогает.
@@ -56,6 +132,7 @@ func (s *Server) admitOnMonitor(ctx context.Context, ips []netip.Addr) error {
 			return err
 		}
 		if acked.Valid {
+			noteAdmitted(ag.HostID, ips, svcnet.AdmitTTL)
 			return nil
 		}
 		select {

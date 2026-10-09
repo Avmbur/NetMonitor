@@ -56,10 +56,10 @@ events:
 			// Не staged: после коммита noteImmediateFirewall кладёт удар в ленту журнала.
 			res.Ack = append(res.Ack, ev.EventID)
 		case "dns":
-			// На диск — только новая пара имени из правил и групп: по ней растёт политика.
-			// Закрытие вопросов — один раз на пачку, и только если пара действительно новая.
+			// На диск — каждая новая пара, один раз. Политика сдвигается, только если
+			// имя есть в правиле или группе. Закрытие вопросов — один раз на пачку.
 			if ag.Trust == "trusted" {
-				added, err := noteRuleDNS(tx, ag, ev)
+				added, err := noteDNS(tx, ag, ev)
 				if err != nil {
 					return res, err
 				}
@@ -255,10 +255,11 @@ func (s *Server) noteHealth(tx *sql.Tx, ag ingest.Agent, ev protocol.Event, now 
 	return "", nil
 }
 
-// noteRuleDNS пишет пару имя–адрес, только если имя есть в правиле или группе
-// и такой пары ещё нет. Прочие DNS-ответы живут только в памяти агента.
-// true — пара записана и политика сдвинулась.
-func noteRuleDNS(tx *sql.Tx, ag ingest.Agent, ev protocol.Event) (bool, error) {
+// noteDNS пишет каждую новую пару имя–адрес один раз. Повтор пары диск не
+// трогает. У имени бывает несколько адресов, у адреса несколько имён: по этим
+// парам правило по имени закрывает вопрос, а клик по адресу находит имя.
+// true — пара новая для всего парка, имя есть в правиле или группе, политика сдвинулась.
+func noteDNS(tx *sql.Tx, ag ingest.Agent, ev protocol.Event) (bool, error) {
 	var p protocol.DNSPayload
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
 		return false, err
@@ -266,19 +267,18 @@ func noteRuleDNS(tx *sql.Tx, ag ingest.Agent, ev protocol.Event) (bool, error) {
 	if p.Kind == "ptr" {
 		return false, nil
 	}
-	ok, err := dnsTouchesPatterns(tx, p.Name)
-	if err != nil || !ok {
-		return false, err
-	}
-	fresh, err := dnsPairFresh(tx, p)
-	if err != nil || !fresh {
-		return false, err
+	name := strings.ToLower(strings.TrimSuffix(p.Name, "."))
+	if name == "" {
+		return false, nil
 	}
 	ip, err := netipx.Parse(p.IP)
 	if err != nil {
 		return false, err
 	}
-	name := strings.ToLower(strings.TrimSuffix(p.Name, "."))
+	fresh, err := dnsPairFresh(tx, p)
+	if err != nil {
+		return false, err
+	}
 	res, err := tx.Exec(`INSERT INTO dns_seen(host_id, name, ip_bin, ip, first_seen_ms, last_seen_ms) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(host_id, name, ip_bin) DO NOTHING`,
 		ag.HostID, name, netipx.Bin16(ip), netipx.Canonical(ip), ev.ObservedAtMS, ev.ObservedAtMS)
@@ -289,8 +289,12 @@ func noteRuleDNS(tx *sql.Tx, ag ingest.Agent, ev protocol.Event) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if n == 0 {
+	if n == 0 || !fresh {
 		return false, nil
+	}
+	ok, err := dnsTouchesPatterns(tx, name)
+	if err != nil || !ok {
+		return false, err
 	}
 	if err = bumpTrusted(tx); err != nil {
 		return false, err

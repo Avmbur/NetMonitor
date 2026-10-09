@@ -95,6 +95,7 @@ func (a *Agent) pollOnce() error {
 
 func (a *Agent) exchangePoll(in protocol.PollReq) (protocol.PollRes, error) {
 	var out protocol.PollRes
+	in.ServiceAdmitted = admittedReport(store.NowMS())
 	raw, err := json.Marshal(in)
 	if err != nil {
 		return out, err

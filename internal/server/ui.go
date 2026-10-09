@@ -1125,9 +1125,6 @@ func lookupDNS(db *checkedRead, host, ip, proto string, port int) string {
 	if err == nil && name != "" {
 		return name
 	}
-	if err := db.db.QueryRow(`SELECT ptr_name FROM ip_names WHERE ip=? AND ptr_name IS NOT NULL AND ptr_name!=''`, ip).Scan(&name); err == nil {
-		return name
-	}
 	return ntpUbuntuName(ip, proto, port)
 }
 

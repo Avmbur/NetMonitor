@@ -56,6 +56,7 @@ func loadHostDecision(db policyReader, host string, never []netip.Prefix, park s
 		return d, err
 	}
 	d.rules, err = hostRules(db, host)
+	d.rules = policy.WithAdmitted(d.rules, admittedFor(host, store.NowMS()))
 	return d, err
 }
 

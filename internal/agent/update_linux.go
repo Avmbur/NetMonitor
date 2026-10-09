@@ -96,7 +96,7 @@ func (a *Agent) launchUpdate(state agentUpdateState, spec updatePayload, outcome
 	if err != nil {
 		return err
 	}
-	bin, err := downloadAgentBinary(url, sum, runtime.GOARCH)
+	bin, err := a.downloadAgentBinary(url, sum, runtime.GOARCH)
 	if err != nil {
 		return err
 	}
@@ -110,9 +110,9 @@ func (a *Agent) launchUpdate(state agentUpdateState, spec updatePayload, outcome
 	return nil
 }
 
-func downloadAgentBinary(url, sum, arch string) ([]byte, error) {
+func (a *Agent) downloadAgentBinary(url, sum, arch string) ([]byte, error) {
 	// Адрес GitHub вписывается в фильтр этого агента до соединения.
-	client := svcnet.Client(admitLocal, 3*time.Minute)
+	client := svcnet.Client(a.admitLocal, 3*time.Minute)
 	res, err := client.Get(url)
 	if err != nil {
 		return nil, err

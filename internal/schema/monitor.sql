@@ -208,6 +208,8 @@ CREATE TABLE dns_seen(
   first_seen_ms INTEGER NOT NULL,
   last_seen_ms INTEGER NOT NULL,
   PRIMARY KEY(host_id, name, ip_bin)) WITHOUT ROWID;
+CREATE INDEX dns_seen_name ON dns_seen(name, ip_bin);
+CREATE INDEX dns_seen_ip ON dns_seen(ip);
 
 CREATE TABLE ip_groups(
   hosts_json TEXT NOT NULL DEFAULT '"all"',

@@ -549,6 +549,11 @@ func (s *Server) groupOperation(w http.ResponseWriter, in uiGroup) {
 		if err := s.flushQuestionRepeats(tx, store.NowMS()); err != nil {
 			return err
 		}
+		if pats, err := policyStrings(tx, "SELECT DISTINCT pattern FROM ip_group_patterns"); err != nil {
+			return err
+		} else if err := s.rememberLiveNames(tx, pats); err != nil {
+			return err
+		}
 		if err := answerGroupQuestions(tx, store.NowMS()); err != nil {
 			return err
 		}

@@ -188,12 +188,19 @@ type ApplyStatus struct {
 	CommandIDs []string `json:"command_ids,omitempty"`
 }
 
+// ServiceAdmission reports a successfully installed address without renewing its expiry.
+type ServiceAdmission struct {
+	IP      string `json:"ip"`
+	UntilMS int64  `json:"until_ms"`
+}
+
 type PollReq struct {
-	Instance     string       `json:"instance,omitempty"`
-	Status       *ApplyStatus `json:"status,omitempty"`
-	Rev          int64        `json:"rev"`
-	Ack          []string     `json:"ack"`
-	ConsumedOnce []string     `json:"consumed_once,omitempty"`
+	ServiceAdmitted []ServiceAdmission `json:"service_admitted,omitempty"`
+	Instance        string             `json:"instance,omitempty"`
+	Status          *ApplyStatus       `json:"status,omitempty"`
+	Rev             int64              `json:"rev"`
+	Ack             []string           `json:"ack"`
+	ConsumedOnce    []string           `json:"consumed_once,omitempty"`
 	// Legacy pre-removal claim. Never evidence of completed cleanup.
 	Uninstalled string `json:"uninstalled,omitempty"`
 }

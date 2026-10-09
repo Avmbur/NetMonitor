@@ -111,6 +111,36 @@ func (m Match) Matches(c Contact) bool {
 	}
 	return false
 }
+
+// WithAdmitted подставляет в правила «по запросу» адреса, которые служба уже
+// вписала в фильтр и срок которых не истёк. Без них Matches такие правила не
+// пускает, и проверка вопроса расходится с фильтром. Исходный срез не меняется.
+func WithAdmitted(rs []Rule, ips []netip.Addr) []Rule {
+	if len(ips) == 0 {
+		return rs
+	}
+	nets := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		ip = ip.Unmap()
+		nets = append(nets, netip.PrefixFrom(ip, ip.BitLen()).String())
+	}
+	out := rs
+	copied := false
+	for i, r := range rs {
+		if len(r.Match.OnDemand) == 0 {
+			continue
+		}
+		if !copied {
+			out = append([]Rule(nil), rs...)
+			copied = true
+		}
+		r.Match.Networks = append(append([]string{}, r.Match.Networks...), nets...)
+		r.Match.OnDemand = nil
+		out[i] = r
+	}
+	return out
+}
+
 func Validate(r Rule) error {
 	if r.Action != "allow" && r.Action != "deny" && r.Action != "observe" && r.Action != "alert" {
 		return fmt.Errorf("unknown action")

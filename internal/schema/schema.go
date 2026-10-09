@@ -14,7 +14,7 @@ var MonitorSQL string
 //go:embed agent.sql
 var AgentSQL string
 
-const version = 16
+const version = 17
 const agentVersion = 6
 const monitorID = 0x4e4d4f4e // NMON
 const agentID = 0x4e4d4147   // NMAG
@@ -263,6 +263,17 @@ func apply(db *sql.DB, script string, appID int, required, forbidden string) err
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO settings(k,v) SELECT 'db_max_mb',CAST(MIN(99,MAX(1,CAST(v AS INTEGER)))*1024 AS TEXT) FROM settings WHERE k='db_max_gb'`); err != nil {
 			return err
+		}
+	}
+	// v17: каждая новая пара DNS снова на диске. Правила ищут по имени, клик по адресу — по IP.
+	if ver < 17 && appID == monitorID {
+		for _, stmt := range []string{
+			`CREATE INDEX IF NOT EXISTS dns_seen_name ON dns_seen(name, ip_bin)`,
+			`CREATE INDEX IF NOT EXISTS dns_seen_ip ON dns_seen(ip)`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("v17: %w", err)
+			}
 		}
 	}
 	// Collector and policy schema changes use a fresh test database; do not silently upgrade incompatible data.
