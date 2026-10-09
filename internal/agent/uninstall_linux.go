@@ -57,7 +57,12 @@ func (a *Agent) scheduleUninstall(commandID string) error {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	// The worker keeps the lock while it stops this agent; waiting here would
+	// hold the poll loop and the agent could not exit. A held lock means removal is running.
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if err == syscall.EWOULDBLOCK {
+			return nil
+		}
 		return err
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)

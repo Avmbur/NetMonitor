@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
@@ -35,7 +36,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.6"
+var Version = "1.0.7"
 
 type Config struct {
 	Pin         string
@@ -66,6 +67,7 @@ type Agent struct {
 	fwError       string
 	askedMu       sync.Mutex
 	cfg           Config
+	presentCert   bool // только переподключение предъявляет прежний сертификат агента
 	st            *store.Store
 	client        *http.Client
 	id            string
@@ -302,6 +304,13 @@ func (a *Agent) enroll() error {
 	pinTLS, err := tlsutil.PinnedTLSConfig(a.cfg.Pin)
 	if err != nil {
 		return err
+	}
+	if a.presentCert {
+		pair, err := a.clientPair()
+		if err != nil {
+			return err
+		}
+		pinTLS.Certificates = []tls.Certificate{pair}
 	}
 	tr := &http.Transport{
 		TLSClientConfig:     pinTLS,

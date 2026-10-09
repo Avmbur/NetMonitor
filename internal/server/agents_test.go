@@ -10,6 +10,20 @@ import (
 	"time"
 )
 
+func TestPendingAgentCanBeRemoved(t *testing.T) {
+	s, _ := batchFixture(t)
+	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='pending' WHERE agent_id='a'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.changeAgent("a", "remove", "", "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.st.DB.QueryRow(`SELECT COUNT(*) FROM commands WHERE agent_id='a' AND kind='uninstall' AND acked_at_ms IS NULL`).Scan(&n); err != nil || n != 1 {
+		t.Fatal(n, err)
+	}
+}
+
 func TestAgentLifecycleAndEmptyPark(t *testing.T) {
 	s, cert := batchFixture(t)
 	s.hostSeen = map[string]int64{"h": store.NowMS()}
@@ -95,7 +109,8 @@ func TestRemoveAgentQueuesUntilAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.hostSeen = map[string]int64{"h": store.NowMS()}
-	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='pending'`); err != nil {
+	// Ожидающего снимать можно (TestPendingAgentCanBeRemoved), отозванного — нет.
+	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='revoked'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.changeAgent("a", "remove", "", ""); !errors.Is(err, errAgentState) {

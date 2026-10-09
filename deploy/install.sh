@@ -359,6 +359,55 @@ nm_update_request() {
     sh "$nm_kit/install.sh" --mode monitor --self-agent no
 }
 
+# Удаление монитора по кнопке в морде: nmserver пишет remove.request,
+# nm-remove.path запускает этот же скрипт с --mode remove-request.
+nm_remove_request() {
+    nm_req=${NM_REMOVE_REQUEST:-/var/lib/nmserver/remove.request}
+    [ -f "$nm_req" ] || return 0
+    nm_agents=0
+    nm_wait=0
+    while IFS= read -r nm_line || [ -n "$nm_line" ]; do
+        case "$nm_line" in
+            agents=*) nm_agents=${nm_line#agents=} ;;
+            wait=*) nm_wait=${nm_line#wait=} ;;
+        esac
+    done < "$nm_req"
+    rm -f "$nm_req"
+    case "$nm_wait" in ''|*[!0-9]*) nm_wait=0 ;; esac
+    if [ "$nm_wait" -gt 0 ]; then
+        sleep "$nm_wait"
+    fi
+    for nm_unit in nmserver.service nmagent.service nmagent-restore.service nmagent-self.path nmagent-self.service nm-update.path nm-update.service nm-remove.path nmagent-uninstall.service; do
+        nm_state=$(systemctl show "$nm_unit" -p LoadState --value 2>/dev/null || true)
+        if [ "$nm_state" != "not-found" ] && [ -n "$nm_state" ]; then
+            systemctl disable --now "$nm_unit" || true
+        fi
+    done
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet netmon 2>/dev/null || true
+        nft delete table inet netmon_collect 2>/dev/null || true
+    fi
+    rm -rf /var/lib/nmserver /var/lib/nmagent /var/lib/nmagent-uninstall /usr/local/lib/netmonitor
+    if [ "$nm_agents" = 1 ]; then
+        rm -rf /var/lib/nm-trust
+    fi
+    rm -f /usr/local/bin/nmserver /usr/local/bin/nmserver.next \
+        /usr/local/bin/nmagent /usr/local/bin/nmagent.stage /usr/local/bin/nmagent.next /usr/local/bin/nmagent.prev \
+        /etc/systemd/system/nmserver.service \
+        /etc/systemd/system/nmagent.service /etc/systemd/system/nmagent-restore.service \
+        /etc/systemd/system/nmagent-self.service /etc/systemd/system/nmagent-self.path \
+        /etc/systemd/system/nm-update.service /etc/systemd/system/nm-update.path \
+        /etc/systemd/system/nm-remove.service /etc/systemd/system/nm-remove.path \
+        /etc/systemd/system/nmagent-uninstall.service
+    systemctl daemon-reload || true
+    id nmserver >/dev/null 2>&1 && userdel nmserver || true
+    if [ "$nm_agents" = 1 ]; then
+        printf 'Монитор снят. Агентам была отправлена команда удаления.\n'
+    else
+        printf 'Монитор снят. Агенты на других серверах не трогались.\n'
+    fi
+}
+
 nm_self_request() {
     nm_req=${NM_SELF_REQUEST:-/var/lib/nmserver/self-agent.request}
     [ -f "$nm_req" ] || return 0
@@ -400,7 +449,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/nmserver
+ReadWritePaths=/var/lib/nmserver -/var/lib/nm-trust
 
 [Install]
 WantedBy=multi-user.target
@@ -447,9 +496,30 @@ Unit=nm-update.service
 [Install]
 WantedBy=multi-user.target
 NM_UPDATE_PATH
+    cat > /etc/systemd/system/nm-remove.service <<'NM_REMOVE'
+[Unit]
+Description=Remove NetMonitor from this machine
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/netmonitor/install.sh --mode remove-request
+NM_REMOVE
+    cat > /etc/systemd/system/nm-remove.path <<'NM_REMOVE_PATH'
+[Unit]
+Description=Watch for a request to remove this NetMonitor
+
+[Path]
+PathChanged=/var/lib/nmserver/remove.request
+Unit=nm-remove.service
+
+[Install]
+WantedBy=multi-user.target
+NM_REMOVE_PATH
     chmod 644 /etc/systemd/system/nmserver.service /etc/systemd/system/nmagent-self.service \
         /etc/systemd/system/nmagent-self.path /etc/systemd/system/nm-update.service \
-        /etc/systemd/system/nm-update.path
+        /etc/systemd/system/nm-update.path /etc/systemd/system/nm-remove.service \
+        /etc/systemd/system/nm-remove.path
 }
 
 nm_self_agent() {
@@ -552,6 +622,12 @@ nm_do_monitor() {
     [ "$nm_need_pass" = 0 ] || [ -n "$nm_password" ] || die "Пустой пароль"
     id nmserver >/dev/null 2>&1 || useradd --system --home /var/lib/nmserver --shell /usr/sbin/nologin nmserver
     install -d -o nmserver -g nmserver -m 700 /var/lib/nmserver
+    install -d -o nmserver -g nmserver -m 700 /var/lib/nm-trust
+    if [ ! -f /var/lib/nmserver/tls/ca.key ] && [ -f /var/lib/nm-trust/ca.key ] && [ -f /var/lib/nm-trust/ca.crt ]; then
+        install -d -o nmserver -g nmserver -m 700 /var/lib/nmserver/tls
+        install -o nmserver -g nmserver -m 644 /var/lib/nm-trust/ca.crt /var/lib/nmserver/tls/ca.crt
+        install -o nmserver -g nmserver -m 600 /var/lib/nm-trust/ca.key /var/lib/nmserver/tls/ca.key
+    fi
     install -d -m 755 /usr/local/lib/netmonitor
     install -m 755 "$nm_srv" /usr/local/bin/nmserver.next
     if systemctl is-active --quiet nmserver.service 2>/dev/null; then systemctl stop nmserver.service; fi
@@ -566,10 +642,11 @@ nm_do_monitor() {
     fi
     chown -R nmserver:nmserver /var/lib/nmserver
     systemctl daemon-reload
-    systemctl enable nmserver.service nmagent-self.path nm-update.path
+    systemctl enable nmserver.service nmagent-self.path nm-update.path nm-remove.path
     systemctl restart nmserver.service
     systemctl restart nmagent-self.path
     systemctl restart nm-update.path
+    systemctl restart nm-remove.path
     systemctl is-active --quiet nmserver.service
     nm_i=0
     nm_code=000
@@ -642,6 +719,10 @@ main() {
     case "$nm_monitor" in *"/"*|*" "*|*'$'*|*";"*) die "Неверный адрес монитора" 2 ;; esac
 
     [ "$(id -u)" = 0 ] || die "Нужен root"
+    if [ "$nm_mode" = remove-request ]; then
+        nm_remove_request
+        return 0
+    fi
     nm_a=$(nm_arch)
     nm_tmp=$(mktemp -d /tmp/nm-install.XXXXXX)
     trap 'rm -rf "$nm_tmp"; [ -z "$nm_work" ] || rm -f "$nm_work"; if [ -t 0 ]; then stty echo 2>/dev/null || true; fi' EXIT

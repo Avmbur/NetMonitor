@@ -54,6 +54,32 @@ func TestRemovalRequiresExplicitHTTPAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestPendingUninstallStillStarts(t *testing.T) {
+	a, f, reports, _ := agentFixture(t)
+	started := 0
+	a.startRemoval = func(id string) error {
+		if id != "remove" {
+			t.Fatal(id)
+		}
+		started++
+		return nil
+	}
+	pr := policy(1)
+	pr.Authorized = false
+	pr.Commands = []protocol.Command{{ID: "remove", Kind: "uninstall"}}
+	if err := a.applyPoll(pr); err != nil {
+		t.Fatal(err)
+	}
+	if started != 1 || f.calls != 0 {
+		t.Fatal(started, f.calls)
+	}
+	for _, r := range *reports {
+		if r.Uninstalled != "" || len(r.Ack) > 0 {
+			t.Fatal("pending removal claimed success", r)
+		}
+	}
+}
+
 func TestRemovalSchedulingNeverClaimsCompletion(t *testing.T) {
 	for _, failFW := range []bool{false, true} {
 		a, f, reports, _ := agentFixture(t)

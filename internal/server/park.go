@@ -223,6 +223,7 @@ func fileSize(path string) int64 {
 func (s *Server) fillMonitor(st *uiState) {
 	st.Monitor["uptime_ms"] = store.NowMS() - s.startedMS
 	st.Monitor["db_bytes"] = fileSize(s.st.Path()) + fileSize(s.st.Path()+"-wal")
+	st.Knocks = s.formerAgents()
 	if pct, err := diskPercent(s.dataDir()); err == nil {
 		st.Monitor["disk_pct"] = pct
 	} else if v, err := store.SettingDB(s.st.DB, "disk_pct"); err == nil {

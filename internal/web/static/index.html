@@ -386,8 +386,8 @@
   }
   .fnav button:hover { background: #1e222c; color: var(--text); }
   .fnav button.on { background: #2a3140; color: var(--text); box-shadow: inset 3px 0 0 var(--sel); }
-  .fnav button.alert { color: var(--warn); background: #2a2414; }
-  .fnav button.alert.on { background: #3a3018; color: var(--warn); box-shadow: inset 3px 0 0 var(--warn); }
+  .fnav button.alert, .fnav .nav-row.alert { color: var(--warn); background: #2a2414; }
+  .fnav button.alert.on, .fnav .nav-row.alert.on { background: #3a3018; color: var(--warn); box-shadow: inset 3px 0 0 var(--warn); }
   .empty {
     color: var(--muted); padding: 24px; font-size: 13px;
   }
@@ -991,7 +991,11 @@
   .cfg-stats .blab { text-align: center; }
   .cfg-stats .dbmax { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
   .cfg-stats .dbmax > span:first-child { font-size: 12px; color: var(--muted); white-space: nowrap; }
-  .cfg-stats .dbmax .step input { width: 36px; height: 26px; }
+  .cfg-stats .dbmax .step input { width: 7ch; height: 26px; }
+  .db-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .knocks { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .knock { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .knock .hint { padding: 0; }
   .cfg-stats .dbmax .step button { width: 22px; height: 26px; }
   .cfg-stats > .hint { padding: 2px 0 0; width: 0; min-width: 100%; font-size: 11px; line-height: 1.3; }
   .cfg-wrap .form.cfg { flex: 1; min-width: 0; padding: 0; }
@@ -1004,13 +1008,42 @@
   .snd-int { flex: 0 0 auto; }
   .snd-int input { width: 36px; }
   .snd-int button { width: 22px; height: 26px; }
-  .fnav .snd-mute {
-    margin-left: auto; width: 22px; height: 22px; flex: 0 0 auto;
-    display: inline-flex; align-items: center; justify-content: center;
-    border-radius: 4px; color: inherit; cursor: pointer;
+  .fnav .nav-row {
+    display: flex; align-items: center; gap: 6px;
+    border-radius: 4px; color: var(--muted);
   }
-  .fnav .snd-mute.on { color: #fff; background: #5a2222; }
-  .fnav .snd-mute:hover { background: #0005; }
+  .fnav .nav-row:hover { background: #1e222c; color: var(--text); }
+  .fnav .nav-row.on { background: #2a3140; color: var(--text); box-shadow: inset 3px 0 0 var(--sel); }
+  .fnav .nav-row .nav-main {
+    flex: 1 1 auto; min-width: 0; padding: 7px 0 7px 10px;
+    background: transparent; border: 0; box-shadow: none; color: inherit;
+    font: inherit; text-align: left; cursor: pointer;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .fnav .nav-row .nav-main:hover,
+  .fnav .nav-row.on .nav-main,
+  .fnav .nav-row.alert .nav-main { background: transparent; box-shadow: none; color: inherit; }
+  .fnav .snd-mute {
+    width: 16px; height: 16px; flex: 0 0 16px; margin: 0 8px 0 0; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 3px; color: inherit; cursor: pointer;
+    background: transparent; border: 1px solid currentColor; box-shadow: none;
+    --snd-x: #f4f6fa;
+  }
+  .fnav .snd-mute:hover { background: transparent; }
+  .fnav .snd-mute svg { width: 12px; height: 12px; display: block; }
+  .fnav .nav-row.alert .snd-mute,
+  .fnav .nav-row.alert-yellow .snd-mute {
+    color: #ffe066; background: #4a3a10; --snd-x: #140e04;
+  }
+  .fnav .nav-row.alert-red .snd-mute,
+  .fnav .nav-row.alert-redhold .snd-mute {
+    color: #ffb4b4; background: #6a2424; --snd-x: #140606;
+  }
+  .fnav .nav-row.alert .snd-mute:hover,
+  .fnav .nav-row.alert-yellow .snd-mute:hover { background: #5c4814; }
+  .fnav .nav-row.alert-red .snd-mute:hover,
+  .fnav .nav-row.alert-redhold .snd-mute:hover { background: #7c2e2e; }
   .snd-pick {
     width: 100%; max-width: none; justify-content: flex-start !important;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1055,24 +1088,27 @@
     0%, 100% { background: #3a1818; color: #f04040; }
     50% { background: #5a2222; color: #ff8080; }
   }
-  .fnav button.alert-red, .fnav button.alert-red.on {
+  .fnav button.alert-red, .fnav button.alert-red.on,
+  .fnav .nav-row.alert-red, .fnav .nav-row.alert-red.on {
     color: var(--block); background: #3a1818;
     animation: blink-alert 1.4s ease-in-out infinite;
   }
-  .fnav button.alert-red.on { box-shadow: inset 3px 0 0 var(--block); }
+  .fnav button.alert-red.on, .fnav .nav-row.alert-red.on { box-shadow: inset 3px 0 0 var(--block); }
   /* активные тревоги, которые админ уже видел: красное без мигания и звука */
-  .fnav button.alert-redhold, .fnav button.alert-redhold.on { color: var(--block); background: #3a1818; }
-  .fnav button.alert-redhold.on { box-shadow: inset 3px 0 0 var(--block); }
+  .fnav button.alert-redhold, .fnav button.alert-redhold.on,
+  .fnav .nav-row.alert-redhold, .fnav .nav-row.alert-redhold.on { color: var(--block); background: #3a1818; }
+  .fnav button.alert-redhold.on, .fnav .nav-row.alert-redhold.on { box-shadow: inset 3px 0 0 var(--block); }
   @keyframes blink-yellow {
     0%, 100% { background: #2a2414; color: var(--warn); }
     50% { background: #3e3418; color: #ffe066; }
   }
   /* снятые тревоги, которые ещё не видели: мигает без звука */
-  .fnav button.alert-yellow, .fnav button.alert-yellow.on {
+  .fnav button.alert-yellow, .fnav button.alert-yellow.on,
+  .fnav .nav-row.alert-yellow, .fnav .nav-row.alert-yellow.on {
     color: var(--warn); background: #2a2414;
     animation: blink-yellow 1.4s ease-in-out infinite;
   }
-  .fnav button.alert-yellow.on { box-shadow: inset 3px 0 0 var(--warn); }
+  .fnav button.alert-yellow.on, .fnav .nav-row.alert-yellow.on { box-shadow: inset 3px 0 0 var(--warn); }
   /* лента тревог */
   tr[data-alert-row] { cursor: pointer; }
   tr[data-alert-row] td:first-child { position: relative; padding-left: 10px; }
@@ -1335,12 +1371,9 @@ function playNmSound(kind) {
   } catch (e) {}
 }
 function soundIdleClear() {
-  const was = LIVE.sound.muted;
-  LIVE.sound.muted = false;
   LIVE.sound.running = "";
   stopNmTimer();
   stopNmAudio();
-  if (was) renderNav();
 }
 function soundTick() {
   LIVE.sound.timer = null;
@@ -1408,10 +1441,10 @@ function sndIntHtml(kind, d) {
   </div>`;
 }
 function sndMuteSvg(muted) {
-  const mark = muted
-    ? `<path d="M11.1 5.1l3 5.8M14.1 5.1l-3 5.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`
-    : `<path d="M11 6.1c.7.6.7 3.2 0 3.8M12.5 4.6c1.4 1.3 1.4 5.5 0 6.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>`;
-  return `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.8 6.2h2.4L9 3.2v9.6L5.2 9.8H2.8z" fill="currentColor"/>${mark}</svg>`;
+  const cross = muted
+    ? `<path d="M6 6L26 26M26 6L6 26" fill="none" stroke="var(--snd-x)" stroke-width="2" stroke-linecap="round"/>`
+    : "";
+  return `<svg viewBox="0 0 32 32" aria-hidden="true"><path fill="currentColor" d="M1 11h8.2L30 1.2v29.6L9.2 21H1z"/>${cross}</svg>`;
 }
 const LOG_PAGE = 50;
 const POLICY_IDS = ["questions", "groups", "rules", "bans", "never", "alerts"];
@@ -1671,6 +1704,7 @@ const NAV = [
   { id: "reports", title: "Отчёты" }
 ];
 const AGENTS = [];
+const KNOCKS = [];
 const DROPS = [];
 const AUDIT = [];
 const REPORTS = [
@@ -2194,7 +2228,6 @@ function renderNav() {
     const on = n.id === state.section;
     let cls = on ? "on" : "";
     let extra = "";
-    let mute = "";
     if (n.id === "policy" && policyAlert) {
       cls += (cls ? " " : "") + (sirenAlerts().length ? "alert-red" : hasAlerts ? "alert-redhold" : hasYellow ? "alert-yellow" : "alert");
       extra = hasAlerts
@@ -2202,13 +2235,15 @@ function renderNav() {
         : hasYellow
           ? `<span class="dot ask" title="тревоги сняты, не просмотрены"></span>`
           : `<span class="dot ask" title="обучение"></span>`;
-      mute = `<span class="snd-mute${LIVE.sound.muted ? " on" : ""}" data-snd-mute="1" title="${LIVE.sound.muted ? "звук выключен" : "звук включён"}">${sndMuteSvg(!!LIVE.sound.muted)}</span>`;
     }
     if (n.id === "settings" && settingsAlert) {
       cls += (cls ? " " : "") + "alert";
       extra = `<span class="dot ask" title="агент ждёт подтверждения или карантин"></span>`;
     }
-    return `<button type="button" data-id="${n.id}" class="${cls}">${extra}${esc(n.title)}${mute}</button>`;
+    if (n.id === "policy") {
+      return `<div class="nav-row ${cls}"><button type="button" class="nav-main" data-id="${n.id}">${extra}${esc(n.title)}</button><button type="button" class="snd-mute" data-snd-mute="1" title="${LIVE.sound.muted ? "звук выключен" : "звук включён"}">${sndMuteSvg(!!LIVE.sound.muted)}</button></div>`;
+    }
+    return `<button type="button" data-id="${n.id}" class="${cls}">${extra}${esc(n.title)}</button>`;
   }).join("");
   renderNavBot();
 }
@@ -2476,13 +2511,16 @@ function dbMaxHtml(d) {
   return `<div class="dbmax">
     <span title="горячая база sqlite. при превышении срезаем самое старое">макс размер базы</span>
     <div class="step">
-      <button type="button" data-dbmax-step="-256">−</button>
-      <input type="number" min="64" max="101376" step="1" data-dbmax="1" value="${n}">
-      <button type="button" data-dbmax-step="256">+</button>
+      <button type="button" data-dbmax-step="-1">−</button>
+      <input type="number" min="64" max="101376" step="1" inputmode="numeric" data-dbmax="1" value="${n}">
+      <button type="button" data-dbmax-step="1">+</button>
     </div>
     <span>МБ</span>
   </div>
-  <div class="hint">при превышении срезаем самое старое. действующие баны не вытесняются</div>`;
+  <div class="hint">при превышении срезаем самое старое. действующие баны не вытесняются</div>
+  <div class="db-acts">
+    <button type="button" class="pill" data-db-clean="1">очистить базу…</button>
+  </div>`;
 }
 function keepFieldHtml(label, title, nKey, uKey, d) {
   const n = Math.max(1, Math.floor(Number(d[nKey]) || 1));
@@ -2524,6 +2562,7 @@ function settingsForm() {
           <input data-cfg="lan" value="${esc(d.lan)}">
           <div class="ferr" data-ferr="lan" hidden>CIDR через запятую, как в примере</div>
           <div class="hint">пример: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7</div>
+          <button type="button" class="pill" data-mon-remove="1" style="margin-top:8px">удалить монитор…</button>
         </div>
       </div>
     </div>
@@ -2572,6 +2611,7 @@ function settingsForm() {
 }
 
 function agentStatusHtml(a) {
+  if (a.kind === "former") return `<button type="button" class="pill" data-reconnect="${esc(a.ip)}">переподключить</button>`;
   if (a.stopped) return `<span class="st-block">остановлен</span>`;
   if (a.kind === "revoked") return `<span class="st-block">отозван</span>`;
   if (a.kind === "pending") {
@@ -2631,10 +2671,18 @@ function settingsAgentsMetaHtml() {
   return (pending ? `<span class="tag learn">ожидает ${pending}</span>` : "")
     + (qtn ? `<span class="tag down">карантин ${qtn}</span>` : "");
 }
+function mbLabel(bytes) {
+  const n = Number(bytes) || 0;
+  const mb = n / (1024 * 1024);
+  if (mb < 1) return "меньше 1 МБ";
+  if (mb < 10) return mb.toFixed(1) + " МБ";
+  return Math.round(mb) + " МБ";
+}
 function settingsAgentsBodyHtml() {
   const pending = AGENTS.filter(a => a.kind === "pending").length;
   const qtn = AGENTS.filter(a => a.kind === "quarantine").length;
-  if (state.emptyPark && !pending && !qtn) {
+  const formers = AGENTS.some(a => a.kind === "former");
+  if (state.emptyPark && !pending && !qtn && !formers) {
     return parkEmptyHtml("агентов нет. порт монитора — в плитке слева, команда установки — кнопкой в левой панели. токен одноразовый: один токен — один сервер.", false);
   }
   return agentsTable();
@@ -2668,6 +2716,9 @@ function updateSettingsLive() {
 function agentsTable() {
   const headers = ["сервер", "статус", "контакт", "версия", "политика", "режим", "пауза", "очередь", "ключ", "обучение"];
   const rows = AGENTS.map(a => {
+    if (a.kind === "former") {
+      return [esc(a.name), agentStatusHtml(a), esc(a.ip || "—"), "—", "—", "—", "", "—", "—", "", ""];
+    }
     const pol = `<span title="${esc(a.polTip || "")}" class="${a.polError ? "tag learn" : ""}">${esc(a.pol || "—")}</span>`;
     const mode = a.kind === "trusted"
       ? `<button type="button" class="pill ${agentModeClass(a)}" data-amode="${esc(a.id)}" title="выбрать режим">${esc(agentModeLabel(a))}</button>`
@@ -4932,12 +4983,14 @@ async function runUpdate(target) {
   }
 }
 function agentRemoveCmd() {
-  return "sudo sh -c 'systemctl disable --now nmagent.service nmagent-restore.service; nft delete table inet netmon; rm -f /etc/systemd/system/nmagent.service /etc/systemd/system/nmagent-restore.service /usr/local/bin/nmagent /usr/local/bin/nmagent.stage /usr/local/bin/nmagent.next; rm -rf /var/lib/nmagent; systemctl daemon-reload'";
+  return "sudo sh -c 'systemctl disable --now nmagent.service nmagent-restore.service; nft delete table inet netmon; nft delete table inet netmon_collect; rm -f /etc/systemd/system/nmagent.service /etc/systemd/system/nmagent-restore.service /usr/local/bin/nmagent /usr/local/bin/nmagent.stage /usr/local/bin/nmagent.next; rm -rf /var/lib/nmagent; systemctl daemon-reload'";
 }
 // Команду снятия можно доставить только подтверждённому агенту на связи,
 // который умеет снимать себя.
 function agentRemoveLive(a) {
-  return a.kind === "trusted" && a.status === "online" && a.removing !== "old";
+  if (a.removing === "old") return false;
+  if (a.kind === "pending" || a.kind === "quarantine") return true;
+  return a.kind === "trusted" && a.status === "online";
 }
 function blankGroup() {
   return { name: "", policy: "allow", members: "", hosts: "all", mute: true, except: [] };
@@ -5062,7 +5115,7 @@ function renderAgentModal() {
     } else {
       const why = a.removing === "wait" || a.removing === "error" ? "подтверждения удаления пока нет. Для ручной очистки"
         : a.removing === "old" ? "агент старой сборки снимать себя не умеет: обнови агента или"
-        : a.kind !== "trusted" ? "команду этому агенту не доставить:"
+        : a.kind !== "trusted" && a.kind !== "pending" && a.kind !== "quarantine" ? "команду этому агенту не доставить:"
         : "агент сейчас молчит, команду ему не доставить:";
       inner += `<div class="hint" style="padding:0">${why} выполни на сервере, затем нажми «Забыть» — строка сама не пропадёт.</div>
         <div class="cmdbox">${esc(agentRemoveCmd())}</div>`;
@@ -5635,18 +5688,48 @@ async function takeSnap(dl) {
     if (window.nmRefresh) await window.nmRefresh();
   } catch (e) { toastMsg("снимок: " + ((e && e.message) || e)); }
 }
-async function openInstallModal() {
+async function openInstallModal(hint) {
   try {
     const r = await fetch("/ui/api/install", { method: "POST" });
     const t = await r.text();
     if (!r.ok) throw new Error(t || "не удалось получить команду");
     const j = JSON.parse(t);
     if (!j.command) throw new Error("монитор не прислал команду");
-    state.modal = { kind: "install", token: j.token || "", cmd: j.command };
+    state.modal = { kind: "install", token: j.token || "", cmd: j.command, hint: hint || "" };
     renderInstallModal();
   } catch (e) {
     toastMsg((e && e.message) || "не удалось получить команду установки");
   }
+}
+async function openDbCleanModal() {
+  try {
+    const r = await fetch("/ui/api/db-clean", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const t = await r.text();
+    if (!r.ok) throw new Error(t || "не удалось оценить базу");
+    const j = JSON.parse(t);
+    const nowMb = Math.max(64, Math.round((Number(j.now) || 0) / (1024 * 1024)));
+    state.modal = { kind: "dbclean" };
+    const body = `<div class="rform one">
+      <div class="hint" style="padding:0">Сейчас база ${esc(mbLabel(j.now))}. Укажи, сколько мегабайт оставить. Ниже 64 МБ очистка не опускается: там настройки, правила, агенты и действующие ограничения. Стирается только старая статистика.</div>
+      <div class="rfield"><span>оставить, МБ</span><input type="number" min="64" step="1" inputmode="numeric" data-keep-mb="1" value="${nowMb}"></div>
+    </div>`;
+    const foot = `<button type="button" data-a="cancel">Отмена</button><button type="button" data-a="dbclean">Очистить</button>`;
+    showModal(modalShell("Очистить базу", "", body, foot), "pack");
+  } catch (e) {
+    toastMsg((e && e.message) || "не удалось оценить базу");
+  }
+}
+function openRemoveMonitorModal() {
+  state.modal = { kind: "monremove" };
+  const body = `<div class="hint" style="padding:0">Удалить монитор на этой машине? Пропадут служба, база и сертификаты. Агенты на других серверах сами не снимаются. Если снять и их, каждому уйдёт команда удаления, а монитор остановится примерно через минуту, чтобы они успели её забрать.</div>`;
+  const foot = `<button type="button" data-a="cancel">Отмена</button><button type="button" data-a="mononly">Только монитор</button><button type="button" data-a="monagents">Монитор и агенты</button>`;
+  showModal(modalShell("Удалить монитор", "", body, foot), "pack");
+}
+async function postJson(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const t = await r.text();
+  if (!r.ok) throw new Error(t || r.status);
+  return t ? JSON.parse(t) : {};
 }
 async function installSelfAgent(btn) {
   if (hasMonitorAgent()) return;
@@ -5674,6 +5757,7 @@ function renderInstallModal() {
     <div class="rform one">
       <div class="hint" style="padding:0">монитор ${esc(ep)} · из настроек</div>
       ${dirty ? `<div class="hint" style="padding:0">в форме настроек порт ещё не сохранён — команда берёт ${esc(SETTINGS.listenPort)}. сначала «Сохранить».</div>` : ""}
+      ${m.hint ? `<div class="hint" style="padding:0">${esc(m.hint)}</div>` : ""}
       <div class="cmdbox" id="install-cmd">${esc(installCmd(m))}</div>
       <div class="ops"><button type="button" data-a="copycmd">копировать команду</button></div>
       <div class="hint" style="padding:0">запусти на сервере агента. постучится как «ожидает». имя — при подтверждении. один токен — один сервер: после подключения этот токен гаснет. следующий сервер — снова «установить агента». в журнал токен не пишем.</div>
@@ -6090,7 +6174,9 @@ document.getElementById("settings-tiles").addEventListener("click", ev => {
     const d = getSettingsDraft();
     const inp = dbmBtn.parentElement.querySelector("input[data-dbmax]");
     const cur = Number(inp ? inp.value : d.dbMaxMb);
-    const next = Math.max(64, Math.min(99 * 1024, Math.floor((Number.isFinite(cur) ? cur : 2048) + Number(dbmBtn.dataset.dbmaxStep))));
+    const step = Number(dbmBtn.dataset.dbmaxStep) || 0;
+    const base = Number.isFinite(cur) && String(inp ? inp.value : "").trim() !== "" ? cur : 2048;
+    const next = Math.max(64, Math.min(99 * 1024, Math.floor(base + step)));
     d.dbMaxMb = next;
     if (inp) inp.value = String(next);
     ev.preventDefault();
@@ -6157,6 +6243,21 @@ document.getElementById("settings-tiles").addEventListener("click", ev => {
     openSnapModal();
     return;
   }
+  if (ev.target.closest("[data-db-clean]")) {
+    openDbCleanModal();
+    return;
+  }
+  if (ev.target.closest("[data-mon-remove]")) {
+    openRemoveMonitorModal();
+    return;
+  }
+  const recon = ev.target.closest("[data-reconnect]");
+  if (recon) {
+    postJson("/ui/api/rebind", { ip: recon.dataset.reconnect }).then(() => {
+      toastMsg("агент сам получит новый сертификат и встанет в «ожидает»");
+    }).catch(e => toastMsg(e.message || "не удалось переподключить"));
+    return;
+  }
   if (ev.target.closest("[data-save-cfg]")) return;
   const tr = ev.target.closest("tr[data-agent]");
   const pill = ev.target.closest("[data-a]");
@@ -6171,7 +6272,7 @@ document.getElementById("settings-tiles").addEventListener("contextmenu", ev => 
   if (!tr) return;
   ev.preventDefault();
   const agent = AGENTS.find(x => x.id === tr.dataset.agent);
-  if (agent) openMenu(ev.clientX, ev.clientY, { type: "agent", agent });
+  if (agent && agent.kind !== "former") openMenu(ev.clientX, ev.clientY, { type: "agent", agent });
 });
 function onSettingsField(el) {
   if (!el) return;
@@ -6227,7 +6328,18 @@ function onSoundFile(el) {
   };
   r.readAsDataURL(f);
 }
-document.getElementById("settings-tiles").addEventListener("input", ev => onSettingsField(ev.target));
+document.getElementById("settings-tiles").addEventListener("input", ev => {
+  const el = ev.target;
+  if (el && el.dataset && el.dataset.dbmax) {
+    const raw = String(el.value).trim();
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw);
+      if (n >= 64 && n <= 99 * 1024) getSettingsDraft().dbMaxMb = n;
+    }
+    return;
+  }
+  onSettingsField(el);
+});
 document.getElementById("settings-tiles").addEventListener("change", ev => onSettingsField(ev.target));
 function setProfileName(name) {
   const n = name || "—";
@@ -6276,7 +6388,7 @@ function openBrandModal() {
       <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
     </div>`;
-  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.6 · 09.10.2026", body, ""), "brand");
+  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.7 · 09.10.2026", body, ""), "brand");
 }
 
 document.getElementById("profile").addEventListener("click", openProfileModal);
@@ -6568,6 +6680,32 @@ document.getElementById("modal").addEventListener("click", ev => {
   if (m.kind === "snap") {
     if (a === "snapkeep") { takeSnap(false); return; }
     if (a === "snapdl") { takeSnap(true); return; }
+  }
+  if (a === "dbclean") {
+    const field = document.querySelector("#modal [data-keep-mb]");
+    const keep = Math.floor(Number(field && field.value));
+    if (!Number.isFinite(keep) || keep < 64) {
+      toastMsg("минимум 64 МБ");
+      return;
+    }
+    postJson("/ui/api/db-clean", { confirm: true, keep_mb: keep }).then(j => {
+      closeModal();
+      toastMsg(j.detail || "база очищена");
+      if (window.nmRefresh) return window.nmRefresh();
+    }).catch(e => toastMsg(e.message || "не удалось очистить"));
+    return;
+  }
+  if (a === "mononly" || a === "monagents") {
+    const agents = a === "monagents";
+    postJson("/ui/api/remove-monitor", { agents: agents }).then(j => {
+      closeModal();
+      if (!j.ready) {
+        toastMsg(j.detail || "служба удаления не запущена");
+        return;
+      }
+      toastMsg(agents ? "команда снятия ушла агентам. монитор остановится примерно через " + (j.wait || 45) + " с" : "монитор на этой машине снимается");
+    }).catch(e => toastMsg(e.message || "не удалось удалить монитор"));
+    return;
   }
   if (b.dataset.rhAll === "1" || b.dataset.rh) {
     if (m.kind === "rule") flushRuleDraft();
@@ -6916,7 +7054,22 @@ requestAnimationFrame(() => {
       removalError: a.removalError || "",
       stopped: !!a.stopped
     }));
-    AGENTS.splice(0, AGENTS.length, ...ag);
+    const knocks = (Array.isArray(d.knocks) ? d.knocks : []).filter(k => k && k.ip);
+    KNOCKS.splice(0, KNOCKS.length, ...knocks);
+    const formers = knocks.map(k => ({
+      id: "knock:" + k.ip,
+      name: k.name || k.ip,
+      ip: k.ip,
+      kind: "former",
+      status: "former",
+      key: "—",
+      last: "—",
+      ver: "—",
+      qlen: "—",
+      pol: "—",
+      scopeNote: "сервер держит прежнее удостоверение этого монитора"
+    }));
+    AGENTS.splice(0, AGENTS.length, ...formers, ...ag);
     const bansLive = liveArr(d, "bans");
     if (bansLive) {
     const bans = bansLive.filter(b => b && b.state).map(b => {

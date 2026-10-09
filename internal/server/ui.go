@@ -42,6 +42,9 @@ func (s *Server) mountUI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /ui/api/unblock", s.needSess(s.handleUIUnblock))
 	mux.HandleFunc("POST /ui/api/password", s.needSess(s.handlePassword))
 	mux.HandleFunc("POST /ui/api/snapshot", s.needSess(s.handleSnapshot))
+	mux.HandleFunc("POST /ui/api/db-clean", s.needSess(s.handleDBClean))
+	mux.HandleFunc("POST /ui/api/remove-monitor", s.needSess(s.handleRemoveMonitor))
+	mux.HandleFunc("POST /ui/api/rebind", s.needSess(s.handleRebindApprove))
 	mux.HandleFunc("POST /ui/api/rule", s.needSess(s.handlePolicyRule))
 	mux.HandleFunc("POST /ui/api/groups", s.needSess(s.handleGroups))
 	mux.HandleFunc("POST /ui/api/alert", s.needSess(s.handleAlert))
@@ -587,6 +590,7 @@ type uiState struct {
 	Starter    map[string]bool   `json:"starter,omitempty"`
 	Loaded     []string          `json:"loaded,omitempty"`
 	Monitor    map[string]any    `json:"monitor"`
+	Knocks     []formerAgent     `json:"knocks,omitempty"`
 	User       string            `json:"user,omitempty"`
 }
 

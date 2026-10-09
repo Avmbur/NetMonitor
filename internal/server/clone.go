@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/x509"
 	"database/sql"
 	"fmt"
 	"net"
@@ -26,7 +27,11 @@ func (s *Server) agentFromTLS(r *http.Request) (ingest.Agent, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return ingest.Agent{}, fmt.Errorf("нужен клиентский сертификат")
 	}
-	fp := tlsutil.Fingerprint(r.TLS.PeerCertificates[0].Raw)
+	cert := r.TLS.PeerCertificates[0]
+	if err := s.rejectForeignCert(cert); err != nil {
+		return ingest.Agent{}, err
+	}
+	fp := tlsutil.Fingerprint(cert.Raw)
 	src := requestSrc(r)
 	if ag, ok := s.lookupAgent(fp, src); ok {
 		if ag.Trust == "revoked" {
@@ -49,6 +54,20 @@ func (s *Server) agentFromTLS(r *http.Request) (ingest.Agent, error) {
 		return e
 	})
 	return ag, err
+}
+
+// rejectForeignCert проверяет подпись и срок, если сертификат настоящий.
+// В тестах в запрос кладут отпечаток без ключа: там остаётся проверка отпечатка.
+func (s *Server) rejectForeignCert(cert *x509.Certificate) error {
+	if cert == nil || cert.PublicKey == nil || s.bundle == nil || s.bundle.CACert == nil {
+		return nil
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(s.bundle.CACert)
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		return fmt.Errorf("неизвестный сертификат")
+	}
+	return nil
 }
 
 func (s *Server) lookupAgent(fp, src string) (ingest.Agent, bool) {

@@ -183,21 +183,20 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) queueAgentRemoval(tx *sql.Tx, id, trust, host, name, src string) error {
-	if trust != "trusted" {
+	if trust != "trusted" && trust != "pending" && trust != "quarantined" {
 		return errAgentState
 	}
-	var last int64
-	var err error
-	{
+	if trust == "trusted" {
+		var last int64
 		s.pulseMu.Lock()
 		last = s.hostSeen[host]
 		s.pulseMu.Unlock()
-	}
-
-	if last < store.NowMS()-60000 {
-		return errAgentSilent
+		if last < store.NowMS()-60000 {
+			return errAgentSilent
+		}
 	}
 	var n int
+	var err error
 	if err = tx.QueryRow(`SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='uninstall' AND acked_at_ms IS NULL`, id).Scan(&n); err != nil {
 		return err
 	}

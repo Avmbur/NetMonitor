@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,71 @@ import (
 	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
 )
+
+func TestUninstallPathForEveryLiveTrust(t *testing.T) {
+	for _, trust := range []string{"trusted", "pending", "quarantined"} {
+		t.Run(trust, func(t *testing.T) {
+			s, cert := batchFixture(t)
+			if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state=? WHERE agent_id='a'`, trust); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.st.DB.Exec(`INSERT INTO commands(command_id,agent_id,kind,payload,created_at_ms) VALUES('rm','a','uninstall','{}',1)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.pollSnapshot("a", trust, 0); err != nil {
+				t.Fatal(err)
+			}
+			var delivered sql.NullInt64
+			if err := s.st.DB.QueryRow(`SELECT delivered_at_ms FROM commands WHERE command_id='rm'`).Scan(&delivered); err != nil || !delivered.Valid {
+				t.Fatal("command not delivered", delivered, err)
+			}
+			post := func(phase string) int {
+				raw, _ := json.Marshal(protocol.UninstallResult{CommandID: "rm", Phase: phase})
+				req := httptest.NewRequest("POST", "/v1/uninstall-result", strings.NewReader(string(raw)))
+				req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+				w := httptest.NewRecorder()
+				s.handleUninstallResult(w, req)
+				return w.Code
+			}
+			if code := post("prepare"); code != 200 {
+				t.Fatal("prepare", code)
+			}
+			var result string
+			if err := s.st.DB.QueryRow(`SELECT COALESCE(result,'') FROM commands WHERE command_id='rm'`).Scan(&result); err != nil || result != "removing" {
+				t.Fatal(result, err)
+			}
+			if code := post("complete"); code != 200 {
+				t.Fatal("complete", code)
+			}
+			var n int
+			if err := s.st.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE agent_id='a'`).Scan(&n); err != nil || n != 0 {
+				t.Fatal("agent remains", n, err)
+			}
+		})
+	}
+}
+
+func TestRevokedUninstallReportRejected(t *testing.T) {
+	s, cert := batchFixture(t)
+	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='revoked' WHERE agent_id='a'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB.Exec(`INSERT INTO commands(command_id,agent_id,kind,payload,created_at_ms,delivered_at_ms) VALUES('rm','a','uninstall','{}',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(protocol.UninstallResult{CommandID: "rm", Phase: "prepare"})
+	req := httptest.NewRequest("POST", "/v1/uninstall-result", strings.NewReader(string(raw)))
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+	w := httptest.NewRecorder()
+	s.handleUninstallResult(w, req)
+	if w.Code == 200 {
+		t.Fatal("revoked report accepted")
+	}
+	var n int
+	if err := s.st.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE agent_id='a'`).Scan(&n); err != nil || n != 1 {
+		t.Fatal(n, err)
+	}
+}
 
 func TestRemovalCompletionRetryAndAuthorization(t *testing.T) {
 	s, cert := batchFixture(t)

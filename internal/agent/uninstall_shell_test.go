@@ -30,15 +30,20 @@ systemctl() {
  esac
 }
 TABLE_PRESENT=1
+COLLECT_PRESENT=1
 nft() {
  printf 'nft %s\n' "$*" >&2
  case "$*" in
   "list tables")
    [ "$FAIL" != list ] || return 1
-   if [ "$TABLE_PRESENT" = 1 ]; then echo 'table inet netmon'; fi ;;
+   if [ "$TABLE_PRESENT" = 1 ]; then echo 'table inet netmon'; fi
+   if [ "$COLLECT_PRESENT" = 1 ]; then echo 'table inet netmon_collect'; fi ;;
   "delete table inet netmon")
    [ "$FAIL" != nft ] || return 1
    if [ "$FAIL" != remains ]; then TABLE_PRESENT=0; fi ;;
+  "delete table inet netmon_collect")
+   [ "$FAIL" != collect ] || return 1
+   COLLECT_PRESENT=0 ;;
   *) return 1 ;;
  esac
 }
@@ -47,7 +52,7 @@ rm() {
  [ "$FAIL" != files ]
 }
 `
-	for _, fail := range []string{"", "stop", "alive", "list", "nft", "remains", "files", "reload"} {
+	for _, fail := range []string{"", "stop", "alive", "list", "nft", "remains", "collect", "files", "reload"} {
 		t.Run(fail, func(t *testing.T) {
 			var phases []string
 			var output []byte
@@ -67,6 +72,9 @@ rm() {
 				if strings.Index(text, "disable --now") > strings.Index(text, "delete table") {
 					t.Fatal(text)
 				}
+				if !strings.Contains(text, "nft delete table inet netmon_collect") {
+					t.Fatal("collector table left:", text)
+				}
 			} else {
 				if err == nil || marker || strings.Join(phases, ",") != "prepare,failed" {
 					t.Fatalf("%v %v %s", err, phases, output)
@@ -74,7 +82,7 @@ rm() {
 				if (fail == "stop" || fail == "alive") && strings.Contains(string(output), "nft ") {
 					t.Fatal("firewall touched before confirmed stop")
 				}
-				if (fail == "list" || fail == "nft" || fail == "remains") && strings.Contains(string(output), "rm ") {
+				if (fail == "list" || fail == "nft" || fail == "remains" || fail == "collect") && strings.Contains(string(output), "rm ") {
 					t.Fatal("files removed before firewall cleanup")
 				}
 			}

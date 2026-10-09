@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"netmonitor/internal/collect"
@@ -67,6 +68,13 @@ func (a *Agent) pollOnce() error {
 	a.spoolMu.Unlock()
 	pr, err := a.exchangePoll(protocol.PollReq{Rev: rev, ConsumedOnce: consumed, Instance: instance})
 	if err != nil {
+		if tlsRejected(err) || strings.Contains(err.Error(), "неизвестный сертификат") {
+			rbErr := a.rebindIfReplaced()
+			if rbErr == nil {
+				return nil
+			}
+			log.Printf("переподключение: %v", rbErr)
+		}
 		var networkError net.Error
 		if errors.As(err, &networkError) {
 			if undoErr := a.rollbackAfterLoss(started); undoErr != nil {
@@ -212,6 +220,31 @@ func (a *Agent) adoptViewLocked(pr protocol.PollRes) {
 		}
 	}
 }
+
+// appliedFor drops a revision this monitor never issued: after a monitor
+// reinstall the agent still holds the previous monitor's newer number.
+func appliedFor(actual *int64, desired int64) *int64 {
+	if actual == nil || *actual > desired {
+		return nil
+	}
+	return actual
+}
+
+func (a *Agent) runUninstall(id string) error {
+	if id == "" {
+		return nil
+	}
+	start := a.startRemoval
+	if start == nil {
+		start = a.scheduleUninstall
+	}
+	if removeErr := start(id); removeErr != nil {
+		_ = sendUninstallResult(a.client, a.monitorURL(), protocol.UninstallResult{CommandID: id, Phase: "failed", Error: removeErr.Error()})
+		return fmt.Errorf("schedule removal: %w", removeErr)
+	}
+	return nil
+}
+
 func (a *Agent) applyPoll(pr protocol.PollRes) error {
 	a.beginNamePoll()
 	defer a.endNamePoll()
@@ -233,12 +266,22 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 	if a.firewall == nil {
 		a.firewall = fw.NewController()
 	}
-	status := protocol.ApplyStatus{Backend: a.firewall.Backend(), DesiredRev: pr.PolicyRev, AppliedRev: a.actualRev}
+	status := protocol.ApplyStatus{Backend: a.firewall.Backend(), DesiredRev: pr.PolicyRev, AppliedRev: appliedFor(a.actualRev, pr.PolicyRev)}
 	if !pr.Authorized {
-		// Pending/revoked agents may collect, but must not execute park policy.
+		// Политику парка не применяем. Команду снятия забираем: иначе ожидающий
+		// и карантинный агент останутся после «монитор и агенты».
+		uninstall := ""
+		for _, c := range pr.Commands {
+			if c.Kind == "uninstall" {
+				uninstall = c.ID
+			}
+		}
 		rev := a.rev
 		unlock()
 		_, err := a.exchangePoll(protocol.PollReq{Rev: rev, Status: &status})
+		if uerr := a.runUninstall(uninstall); uerr != nil {
+			return uerr
+		}
 		return err
 	}
 	damaged := a.actualRev != nil && !a.firewall.Alive()
@@ -319,7 +362,7 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 	if err == nil && damaged {
 		err = a.Enqueue("health", 10, protocol.HealthPayload{Kind: "firewall_restored", Note: "восстановлена локальная политика firewall"})
 	}
-	status.AppliedRev = a.actualRev
+	status.AppliedRev = appliedFor(a.actualRev, pr.PolicyRev)
 	// A locally paused ban is intentionally absent. Until the monitor knows
 	// about that exception, claiming the entire desired revision would lie.
 	if err == nil {
@@ -372,16 +415,8 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 	rev := a.rev
 	unlock()
 	_, reportErr := a.exchangePoll(protocol.PollReq{Rev: rev, Ack: ack, Status: &status})
-	if uninstall != "" {
-		// Scheduling never claims success; the durable worker confirms after cleanup.
-		start := a.startRemoval
-		if start == nil {
-			start = a.scheduleUninstall
-		}
-		if removeErr := start(uninstall); removeErr != nil {
-			_ = sendUninstallResult(a.client, a.monitorURL(), protocol.UninstallResult{CommandID: uninstall, Phase: "failed", Error: removeErr.Error()})
-			return fmt.Errorf("schedule removal: %w", removeErr)
-		}
+	if uerr := a.runUninstall(uninstall); uerr != nil {
+		return uerr
 	}
 	// Останавливаемся, только когда монитор принял подтверждение. Иначе команда
 	// осталась бы неподтверждённой, и агент гасил бы себя после каждого запуска.

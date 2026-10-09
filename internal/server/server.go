@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -26,7 +25,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.6"
+var Version = "1.0.7"
 
 type Config struct {
 	ArtifactDir string
@@ -73,6 +72,9 @@ type Server struct {
 	qFlush       int64
 	nameMu       sync.Mutex
 	liveNames    map[string]serviceName
+	knockMu      sync.Mutex
+	knocks       map[string]formerAgent
+	rebindTok    map[string]string
 }
 
 func Init(cfg Config, password string) error {
@@ -81,6 +83,9 @@ func Init(cfg Config, password string) error {
 		return fmt.Errorf("пароль adm задаётся при установке nmserver")
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return err
+	}
+	if err := tlsutil.RestoreTrust(cfg.DataDir); err != nil {
 		return err
 	}
 	st, err := store.OpenMonitor(cfg.DataDir)
@@ -98,6 +103,9 @@ func Init(cfg Config, password string) error {
 	}
 	if err := bundle.WriteServer(nil, listenIPs(cfg.ListenHost)); err != nil {
 		return err
+	}
+	if err := tlsutil.MirrorTrust(cfg.DataDir); err != nil {
+		log.Printf("копия доверия: %v", err)
 	}
 	return st.Update(func(tx *sql.Tx) error {
 		if err := store.PutSetting(tx, "listen_host", cfg.ListenHost); err != nil {
@@ -221,6 +229,10 @@ func Listen(cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
+	if err := tlsutil.RestoreTrust(cfg.DataDir); err != nil {
+		st.Close()
+		return nil, err
+	}
 	ephemeral := cfg.ListenPort < 0
 	cfg = defaults(cfg)
 	if ephemeral {
@@ -236,13 +248,21 @@ func Listen(cfg Config) (*Server, error) {
 		st.Close()
 		return nil, err
 	}
+	if err := tlsutil.MirrorTrust(cfg.DataDir); err != nil {
+		log.Printf("копия доверия: %v", err)
+	}
 	addr := net.JoinHostPort(bindHost(cfg.ListenHost), strconv.Itoa(cfg.ListenPort))
-	ln, err := tls.Listen("tcp", addr, tlsutil.ServerTLSConfig(bundle))
+	s := &Server{cfg: cfg, st: st, bundle: bundle, startedMS: store.NowMS(), batchWait: telemetryBatchWait, session: idgen.NewV7()}
+	if err := s.dropUnusedRebind(); err != nil {
+		st.Close()
+		return nil, err
+	}
+	ln, err := s.listenTLS(addr)
 	if err != nil {
 		st.Close()
 		return nil, fmt.Errorf("порт %s занят или недоступен: %w", addr, err)
 	}
-	s := &Server{cfg: cfg, st: st, bundle: bundle, ln: ln, startedMS: store.NowMS(), batchWait: telemetryBatchWait, session: idgen.NewV7()}
+	s.ln = ln
 	if err := s.ensureMonitorServiceRules(); err != nil {
 		log.Printf("monitor service rules: %v", err)
 	}
@@ -260,6 +280,7 @@ func Listen(cfg Config) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
+	mux.HandleFunc("POST /v1/rebind", s.handleRebind)
 	mux.HandleFunc("POST /v1/batch", s.handleBatch)
 	mux.HandleFunc("GET /v1/poll", s.handlePoll)
 	mux.HandleFunc("POST /v1/poll", s.handlePoll)
@@ -314,7 +335,7 @@ func (s *Server) rebind(host string, port int) error {
 		return err
 	}
 	addr := net.JoinHostPort(bindHost(host), strconv.Itoa(port))
-	ln, err := tls.Listen("tcp", addr, tlsutil.ServerTLSConfig(s.bundle))
+	ln, err := s.listenTLS(addr)
 	if err != nil {
 		return fmt.Errorf("порт занят")
 	}
@@ -407,6 +428,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		hostname = "pending"
 	}
 	src, _, _ := net.SplitHostPort(r.RemoteAddr)
+	var boundFP string
 	err = s.st.Update(func(tx *sql.Tx) error {
 		var used sql.NullInt64
 		err := tx.QueryRow(`SELECT used_at_ms FROM enroll_tokens WHERE token_hash=?`, hash).Scan(&used)
@@ -418,6 +440,23 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		}
 		if used.Valid {
 			return fmt.Errorf("токен уже использован")
+		}
+		var bound sql.NullString
+		if err := tx.QueryRow(`SELECT v FROM settings WHERE k=?`, "rebind:"+hash).Scan(&bound); err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if bound.Valid {
+			peer := ""
+			if c := peerCert(r); c != nil {
+				peer = tlsutil.Fingerprint(c.Raw)
+			}
+			if peer != bound.String {
+				return fmt.Errorf("токен привязан к другому агенту")
+			}
+			if _, err := tx.Exec(`DELETE FROM settings WHERE k=?`, "rebind:"+hash); err != nil {
+				return err
+			}
+			boundFP = bound.String
 		}
 		if _, err := tx.Exec(`UPDATE enroll_tokens SET used_at_ms=?, used_by_agent=? WHERE token_hash=?`, now, agentID, hash); err != nil {
 			return err
@@ -435,6 +474,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+	s.dropFormer(boundFP)
 	host, port := s.cfg.ListenHost, strconv.Itoa(s.cfg.ListenPort)
 	if host == "0.0.0.0" || host == "::" || host == "" {
 		if h, _, e := net.SplitHostPort(r.Host); e == nil {

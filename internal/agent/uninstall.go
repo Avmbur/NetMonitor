@@ -22,14 +22,16 @@ for unit in nmagent.service nmagent-restore.service; do
   case "$state" in inactive|failed) ;; *) echo "$unit is still running" >&2; exit 1 ;; esac
  fi
 done
-tables=$(nft list tables)
-if printf '%s\n' "$tables" | grep -qx 'table inet netmon'; then
- nft delete table inet netmon
-fi
-tables=$(nft list tables)
-if printf '%s\n' "$tables" | grep -qx 'table inet netmon'; then
- echo 'netmon table remains' >&2; exit 1
-fi
+for table in netmon netmon_collect; do
+ tables=$(nft list tables)
+ if printf '%s\n' "$tables" | grep -qx "table inet $table"; then
+  nft delete table inet "$table"
+ fi
+ tables=$(nft list tables)
+ if printf '%s\n' "$tables" | grep -qx "table inet $table"; then
+  echo "$table table remains" >&2; exit 1
+ fi
+done
 rm -f /etc/systemd/system/nmagent.service /etc/systemd/system/nmagent-restore.service /usr/local/bin/nmagent /usr/local/bin/nmagent.stage /usr/local/bin/nmagent.next
 rm -rf /var/lib/nmagent
 systemctl daemon-reload

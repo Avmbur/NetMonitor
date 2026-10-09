@@ -59,6 +59,27 @@ func policy(rev int64) protocol.PollRes {
 	return protocol.PollRes{Authorized: true, PolicyRev: rev, Mode: "allow", Commands: []protocol.Command{{ID: "cmd"}},
 		Blocks: []protocol.BlockView{{RemoteIP: "198.18.0.2", Direction: "both", State: "active", ExpiresAt: store.NowMS() + 60000}}}
 }
+func TestRevisionOfPreviousMonitorIsNotReported(t *testing.T) {
+	a, _, reports, _ := agentFixture(t)
+	if err := a.applyPoll(policy(500)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.applyPoll(protocol.PollRes{Authorized: false, PolicyRev: 3}); err != nil {
+		t.Fatal(err)
+	}
+	last := (*reports)[len(*reports)-1]
+	if last.Status.AppliedRev != nil || last.Status.DesiredRev != 3 {
+		t.Fatalf("pending reports old revision: %+v", last.Status)
+	}
+	if err := a.applyPoll(policy(3)); err != nil {
+		t.Fatal(err)
+	}
+	last = (*reports)[len(*reports)-1]
+	if last.Status.AppliedRev == nil || *last.Status.AppliedRev != 3 {
+		t.Fatalf("approved %+v", last.Status)
+	}
+}
+
 func TestFailedApplyNeverAcknowledgesOrOverwritesSnapshot(t *testing.T) {
 	a, f, reports, _ := agentFixture(t)
 	one := policy(1)

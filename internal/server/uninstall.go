@@ -32,6 +32,10 @@ func (s *Server) handleUninstallResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+func removalTrust(trust string) bool {
+	return trust == "trusted" || trust == "pending" || trust == "quarantined"
+}
+
 func (s *Server) recordUninstall(fp string, in protocol.UninstallResult) error {
 	if in.CommandID == "" || len(in.CommandID) > 128 || len(in.Error) > 4096 {
 		return fmt.Errorf("invalid removal result")
@@ -70,8 +74,8 @@ func (s *Server) recordUninstall(fp string, in protocol.UninstallResult) error {
 		if err != nil {
 			return err
 		}
-		if owner != fp || trust != "trusted" || kind != "uninstall" || !delivered.Valid || acked.Valid {
-			return fmt.Errorf("removal was not delivered to this trusted agent")
+		if owner != fp || !removalTrust(trust) || kind != "uninstall" || !delivered.Valid || acked.Valid {
+			return fmt.Errorf("removal was not delivered to this agent")
 		}
 		switch in.Phase {
 		case "prepare":

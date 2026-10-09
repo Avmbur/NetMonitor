@@ -216,6 +216,13 @@ func (s *Server) pollSnapshotTx(tx *sql.Tx, agentID, trust string, clientRev int
 	}
 	if trust != "trusted" {
 		res.Mode = ""
+		// Снятие доходит и до ожидающих, и до карантинных: иначе кнопка
+		// «монитор и агенты» их не достаёт.
+		cmds, err := takeCommands(tx, agentID, rev, store.NowMS(), true)
+		if err != nil {
+			return res, err
+		}
+		res.Commands = cmds
 		return res, nil
 	}
 	var hostID string
@@ -277,30 +284,41 @@ func (s *Server) pollSnapshotTx(tx *sql.Tx, agentID, trust string, clientRev int
 	res.ObserveDocker = settingValue(tx, "observe_docker", "") == "1"
 	res.ScanPorts = settingInt(tx, "scan_ports", 5)
 	res.ScanWindowMS = int64(settingInt(tx, "scan_window_s", 60)) * 1000
-	cmds, err := tx.Query(
-		`SELECT command_id, kind, payload, COALESCE(block_id,'') FROM commands WHERE agent_id=? AND acked_at_ms IS NULL ORDER BY created_at_ms LIMIT 50`,
-		agentID)
+	res.Commands, err = takeCommands(tx, agentID, rev, now, false)
+	return res, err
+}
+
+func takeCommands(tx *sql.Tx, agentID string, rev, now int64, uninstallOnly bool) ([]protocol.Command, error) {
+	q := `SELECT command_id, kind, payload, COALESCE(block_id,'') FROM commands WHERE agent_id=? AND acked_at_ms IS NULL`
+	if uninstallOnly {
+		q += ` AND kind='uninstall'`
+	}
+	q += ` ORDER BY created_at_ms LIMIT 50`
+	cmds, err := tx.Query(q, agentID)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
 	defer cmds.Close()
+	var out []protocol.Command
 	for cmds.Next() {
 		var c protocol.Command
 		if err := cmds.Scan(&c.ID, &c.Kind, &c.Payload, &c.BlockID); err != nil {
-			return res, err
+			return nil, err
 		}
-		res.Commands = append(res.Commands, c)
+		out = append(out, c)
 	}
 	if err := cmds.Err(); err != nil {
-		return res, err
+		return nil, err
 	}
-	cmds.Close()
-	for _, c := range res.Commands {
+	if err := cmds.Close(); err != nil {
+		return nil, err
+	}
+	for _, c := range out {
 		if _, err := tx.Exec(`UPDATE commands SET delivered_at_ms=COALESCE(delivered_at_ms,?),delivered_rev=COALESCE(delivered_rev,?) WHERE command_id=? AND agent_id=?`, now, rev, c.ID, agentID); err != nil {
-			return res, err
+			return nil, err
 		}
 	}
-	return res, nil
+	return out, nil
 }
 
 func splitCIDRs(s string) []string {
