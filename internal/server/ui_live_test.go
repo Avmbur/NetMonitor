@@ -12,12 +12,14 @@ import (
 )
 
 func TestNTPNameOnUbuntuPoolFlow(t *testing.T) {
-	s, _ := batchFixture(t)
-	now := store.NowMS()
-	_, err := s.st.DB.Exec(`INSERT INTO flows(flow_uid,host_id,agent_id,boot_id,first_seen_at_ms,last_seen_at_ms,ip_version,protocol,orig_src_ip,orig_src_ip_bin,orig_dst_ip,orig_dst_ip_bin,direction,local_ip,local_ip_bin,remote_ip,remote_ip_bin,remote_port,remote_scope,origin,received_at_ms)
-		VALUES('ntp1','h','a','b',?,?,4,'udp','192.168.10.180',zeroblob(16),'185.125.190.121',zeroblob(16),'out','192.168.10.180',zeroblob(16),'185.125.190.121',zeroblob(16),123,'internet','host',?)`, now, now, now)
-	if err != nil {
-		t.Fatal(err)
+	s, cert := batchFixture(t)
+	p := openFlow("ntp1")
+	p.Protocol = "udp"
+	p.RemoteIP = "185.125.190.121"
+	p.OrigDstIP = p.RemoteIP
+	p.RemotePort = intp(123)
+	if code, ack := sendBatch(t, s, cert, flowEvent("ntp", 1, p)); code != 200 {
+		t.Fatal(code, ack)
 	}
 	st := s.uiState("", "activity")
 	if len(st.Flows) != 1 || st.Flows[0].DNS != "ntp.ubuntu.com" {
@@ -35,12 +37,12 @@ func TestProcNameFromPath(t *testing.T) {
 }
 
 func TestCountersAreContactsNotBans(t *testing.T) {
-	s, _ := batchFixture(t)
+	s, cert := batchFixture(t)
 	now := store.NowMS()
-	s.st.DB.Exec(`INSERT INTO flows(flow_uid,host_id,agent_id,boot_id,first_seen_at_ms,last_seen_at_ms,ip_version,protocol,orig_src_ip,orig_src_ip_bin,orig_dst_ip,orig_dst_ip_bin,direction,local_ip,local_ip_bin,remote_ip,remote_ip_bin,remote_scope,origin,received_at_ms)
-		VALUES('f1','h','a','b',?,?,4,'tcp','1.1.1.1',zeroblob(16),'10.0.0.1',zeroblob(16),'out','10.0.0.1',zeroblob(16),'1.1.1.1',zeroblob(16),'internet','host',?)`, now, now, now)
+	if code, ack := sendBatch(t, s, cert, flowEvent("flow", 1, openFlow("f1")), fwEvent("drop", 2, 3)); code != 200 {
+		t.Fatal(code, ack)
+	}
 	s.st.DB.Exec(`INSERT INTO blocks(block_id,scope_kind,remote_ip,remote_ip_bin,direction,state,reason,source,created_by,created_at_ms) VALUES('b1','all','9.9.9.9',zeroblob(16),'both','active','ручной','ui','adm',?)`, now)
-	s.st.DB.Exec(`INSERT INTO firewall_events(event_id,host_id,observed_at_ms,received_at_ms,hits) VALUES('e1','h',?, ?, 3)`, now, now)
 	st := s.uiState("", "activity")
 	if st.Now.Flows != 1 {
 		t.Fatal("flows", st.Now.Flows)
@@ -191,45 +193,16 @@ func TestUIStateSectionCuts(t *testing.T) {
 	}
 }
 
-func TestFillServerTrafficFromMinutes(t *testing.T) {
-	s, _ := batchFixture(t)
-	now := store.NowMS()
-	if _, err := s.st.DB.Exec(`INSERT INTO traffic_1m(host_id,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,samples) VALUES('h',?,'out','internet',100,50,1)`, now); err != nil {
-		t.Fatal(err)
-	}
-	db := &checkedRead{db: s.st.DB}
-	servers := []uiServer{{HostID: "h"}}
-	fillServerTraffic(db, servers)
-	if servers[0].Rx24 != 50 || servers[0].Tx24 != 100 {
-		t.Fatalf("rx=%d tx=%d", servers[0].Rx24, servers[0].Tx24)
-	}
-}
-
-func TestHistoryFilterByAddr(t *testing.T) {
-	s, _ := batchFixture(t)
-	now := store.NowMS()
-	s.st.DB.Exec(`INSERT INTO flows(flow_uid,host_id,agent_id,boot_id,first_seen_at_ms,last_seen_at_ms,ip_version,protocol,orig_src_ip,orig_src_ip_bin,orig_dst_ip,orig_dst_ip_bin,direction,local_ip,local_ip_bin,remote_ip,remote_ip_bin,remote_scope,origin,received_at_ms,ended_at_ms)
-		VALUES('h1','h','a','b',?,?,4,'tcp','1.1.1.1',zeroblob(16),'10.0.0.1',zeroblob(16),'out','10.0.0.1',zeroblob(16),'8.8.8.8',zeroblob(16),'internet','host',?,?)`, now, now, now, now)
-	st := s.uiStateQ(stateQuery{Section: "log", Addr: "8.8.8.8"})
-	if len(st.History) == 0 {
-		t.Fatal("filtered out")
-	}
-	st = s.uiStateQ(stateQuery{Section: "log", Addr: "9.9.9.9"})
-	if len(st.History) != 0 {
-		t.Fatal("addr leak")
-	}
-}
-
-func TestReportsCatalogAndMaxAddr(t *testing.T) {
+func TestReportsCatalogAndProtection(t *testing.T) {
 	s, _ := batchFixture(t)
 	w := httptest.NewRecorder()
-	s.handleReports(w, httptest.NewRequest("GET", "/ui/api/reports?id=maxaddr", nil))
+	s.handleReports(w, httptest.NewRequest("GET", "/ui/api/reports?id=scanners", nil))
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	var rep uiReport
 	json.Unmarshal(w.Body.Bytes(), &rep)
-	if rep.ID != "maxaddr" || len(rep.Cols) == 0 {
+	if rep.ID != "scanners" || len(rep.Cols) == 0 {
 		t.Fatal(rep)
 	}
 	w = httptest.NewRecorder()
@@ -247,7 +220,7 @@ func TestSettingsSoundAndKeepStored(t *testing.T) {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	st := s.uiState("", "settings")
-	if st.Settings["sound_ask"] != "1" || st.Settings["sound_alert"] != "0" || st.Settings["sound_ask_s"] != "7" || st.Settings["sound_alert_s"] != "15" || st.Settings["samples_n"] != "14" || st.Settings["db_max_gb"] != "3" {
+	if st.Settings["sound_ask"] != "1" || st.Settings["sound_alert"] != "0" || st.Settings["sound_ask_s"] != "7" || st.Settings["sound_alert_s"] != "15" || st.Settings["db_max_mb"] != "3072" {
 		t.Fatal(st.Settings)
 	}
 	var n int

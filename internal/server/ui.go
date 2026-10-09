@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"netmonitor/internal/idgen"
+
 	"netmonitor/internal/passwd"
 	"netmonitor/internal/policy"
 	"netmonitor/internal/protocol"
@@ -145,13 +146,8 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		SoundAlert    *bool           `json:"sound_alert"`
 		SoundAskS     *int            `json:"sound_ask_s"`
 		SoundAlertS   *int            `json:"sound_alert_s"`
-		SamplesN      int             `json:"samples_n"`
-		SamplesU      string          `json:"samples_u"`
-		FlowsN        int             `json:"flows_n"`
-		FlowsU        string          `json:"flows_u"`
-		HoursN        int             `json:"hours_n"`
-		HoursU        string          `json:"hours_u"`
 		DbMaxGb       int             `json:"db_max_gb"`
+		DbMaxMb       int             `json:"db_max_mb"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&in); err != nil {
 		http.Error(w, "json", 400)
@@ -277,21 +273,23 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
-		if err := putKeep(tx, "samples", in.SamplesN, in.SamplesU); err != nil {
-			return err
-		}
-		if err := putKeep(tx, "flows", in.FlowsN, in.FlowsU); err != nil {
-			return err
-		}
-		if err := putKeep(tx, "hours", in.HoursN, in.HoursU); err != nil {
-			return err
-		}
-		if in.DbMaxGb > 0 {
+		if in.DbMaxMb > 0 {
+			n := in.DbMaxMb
+			if n < 64 {
+				n = 64
+			}
+			if n > 99<<10 {
+				n = 99 << 10
+			}
+			if err := store.PutSetting(tx, "db_max_mb", strconv.Itoa(n)); err != nil {
+				return err
+			}
+		} else if in.DbMaxGb > 0 {
 			n := in.DbMaxGb
 			if n > 99 {
 				n = 99
 			}
-			if err := store.PutSetting(tx, "db_max_gb", strconv.Itoa(n)); err != nil {
+			if err := store.PutSetting(tx, "db_max_mb", strconv.Itoa(n<<10)); err != nil {
 				return err
 			}
 		}
@@ -330,18 +328,6 @@ func bool01(v bool) string {
 		return "1"
 	}
 	return "0"
-}
-
-func putKeep(tx *sql.Tx, kind string, n int, u string) error {
-	if n > 0 {
-		if err := store.PutSetting(tx, kind+"_n", strconv.Itoa(n)); err != nil {
-			return err
-		}
-	}
-	if u == "d" || u == "mo" {
-		return store.PutSetting(tx, kind+"_u", u)
-	}
-	return nil
 }
 
 type banInput struct {
@@ -596,6 +582,7 @@ type uiState struct {
 	Rules      []policy.Rule     `json:"rules,omitempty"`
 	Alerts     []uiAlert         `json:"alerts"`
 	Reports    []uiReportMeta    `json:"reports,omitempty"`
+	HostNames  map[string]string `json:"host_names,omitempty"`
 	Settings   map[string]string `json:"settings"`
 	Starter    map[string]bool   `json:"starter,omitempty"`
 	Loaded     []string          `json:"loaded,omitempty"`
@@ -700,6 +687,8 @@ type uiAgent struct {
 	// старой сборки снимать себя не умеет.
 	Removing     string `json:"removing,omitempty"`
 	RemovalError string `json:"removalError,omitempty"`
+	CollectFault string `json:"collect_fault,omitempty"`
+	Stopped      bool   `json:"stopped,omitempty"`
 }
 
 type uiAlert struct {
@@ -786,13 +775,8 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 	st.Settings["sound_alert"] = db.setting("sound_alert")
 	st.Settings["sound_ask_s"] = db.setting("sound_ask_s")
 	st.Settings["sound_alert_s"] = db.setting("sound_alert_s")
-	st.Settings["samples_n"] = db.setting("samples_n")
-	st.Settings["samples_u"] = db.setting("samples_u")
-	st.Settings["flows_n"] = db.setting("flows_n")
-	st.Settings["flows_u"] = db.setting("flows_u")
-	st.Settings["hours_n"] = db.setting("hours_n")
-	st.Settings["hours_u"] = db.setting("hours_u")
 	st.Settings["db_max_gb"] = db.setting("db_max_gb")
+	st.Settings["db_max_mb"] = db.setting("db_max_mb")
 	if st.Settings["lan"] == "" {
 		st.Settings["lan"] = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
 	}
@@ -801,6 +785,7 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 		st.Starter = starterState(db.db)
 	}
 	s.fillMonitor(&st)
+	st.HostNames = hostNames(db.db)
 
 	rows, err := db.Query(`SELECT a.agent_id, a.host_id, COALESCE(a.display_name,h.hostname,''), a.trust_state, a.cert_fingerprint, a.policy_rev, COALESCE(a.fw_backend,'unknown'), COALESCE(fw.v,''),COALESCE(a.scope_note,''),a.ipv6_seen,COALESCE(h.last_seen_ms,0),COALESCE(a.version,''),COALESCE(a.last_src_ip,'')
 		FROM agents a LEFT JOIN hosts h ON h.host_id=a.host_id LEFT JOIN settings fw ON fw.k='fw_status:'||a.agent_id ORDER BY a.first_seen_ms`)
@@ -811,12 +796,14 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 			_ = rows.Scan(&ag.AgentID, &hostID, &ag.Name, &ag.Trust, &fp, &ag.PolicyRev, &ag.FWBackend, &fwJSON, &ag.ScopeNote, &ag.IPv6Seen, &ag.Last, &ag.Version, &lastIP)
 			ag.HostID = hostID
 			ag.Online = ag.Trust == "trusted" && ag.Last > store.NowMS()-60000
+			s.applyPulse(&ag)
 			if inv := db.setting("inventory:" + hostID); inv != "" {
 				var h protocol.HealthPayload
 				if json.Unmarshal([]byte(inv), &h) == nil && h.QueueBytes != nil {
 					ag.Queue = *h.QueueBytes
 				}
 			}
+			s.applyPulse(&ag)
 			if fwJSON != "" {
 				db.record(json.Unmarshal([]byte(fwJSON), &ag.FW))
 			}
@@ -870,6 +857,10 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 			st.Agents[i].Monitor = true
 			st.Agents[i].Name = monitorAgentName
 		}
+		if settingValue(db.db, "agent_stopped:"+st.Agents[i].HostID, "") != "" {
+			st.Agents[i].Stopped = true
+			st.Agents[i].Online = false
+		}
 	}
 	for i := range st.Servers {
 		if mon.HostID != "" && st.Servers[i].HostID == mon.HostID {
@@ -891,41 +882,37 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 			st.Servers[i].RAM = h.RAMPct
 			st.Servers[i].Disk = h.DiskPct
 		}
-	}
-	if sectionIn(section, "activity") {
-		fillServerTraffic(db, st.Servers)
+		s.applyServerPulse(&st.Servers[i])
 	}
 	hostFilter := serverFilter != "" && serverFilter != "all" && section != "settings"
 	countFilter := hostFilter && section != "log"
-	flowQ := `SELECT COUNT(*) FROM flows WHERE ended_at_ms IS NULL AND agent_id IN (SELECT agent_id FROM agents WHERE trust_state='trusted') AND (boot_id=(SELECT boot_id FROM agents a WHERE a.agent_id=flows.agent_id) OR (SELECT boot_id FROM agents a WHERE a.agent_id=flows.agent_id) IS NULL)`
-	pendQ := `SELECT COUNT(*) FROM learn_questions WHERE status='open' AND host_id IN (SELECT host_id FROM agents WHERE trust_state='trusted')`
-	dropQ := `SELECT COALESCE(SUM(hits),0) FROM firewall_events WHERE observed_at_ms>? AND host_id IN (SELECT host_id FROM agents WHERE trust_state='trusted')`
-	flowArgs := []any{}
-	if countFilter {
-		flowQ += ` AND host_id=?`
-		pendQ += ` AND host_id=?`
-		dropQ += ` AND host_id=?`
-		flowArgs = append(flowArgs, serverFilter)
+	// Ж1: живой список и счётчик открытых — из памяти.
+	// Ж4: плитка DROP — диск и ещё не сброшенные hits. Лента DROP — из памяти.
+	n, liveRows, rates, liveErr := s.liveActivity(serverFilter, countFilter, sectionIn(section, "activity"))
+	if liveErr != nil {
+		db.record(liveErr)
 	}
-	_ = db.QueryRow(flowQ, flowArgs...).Scan(&st.Now.Flows)
+	st.Now.Flows = n
+	since := store.NowMS() - 86400000
+	pendQ := `SELECT COUNT(*) FROM learn_questions WHERE status='open' AND host_id IN (SELECT host_id FROM agents WHERE trust_state='trusted')`
 	if countFilter {
+		pendQ += ` AND host_id=?`
 		_ = db.QueryRow(pendQ, serverFilter).Scan(&st.Now.Pending)
-		_ = db.QueryRow(dropQ, store.NowMS()-86400000, serverFilter).Scan(&st.Now.Blocked)
 	} else {
 		_ = db.QueryRow(pendQ).Scan(&st.Now.Pending)
-		_ = db.QueryRow(dropQ, store.NowMS()-86400000).Scan(&st.Now.Blocked)
 	}
+	st.Now.Blocked = s.blockedNow(db, since, serverFilter, countFilter)
 	st.Now.Allowed = st.Now.Flows
 
 	if sectionIn(section, "activity") {
-		st.Flows = readUIFlows(db, serverFilter, hostFilter && section != "log", false)
+		st.Flows = finishFlows(db, liveRows, false, s.lookupDNS)
+		stampLiveRates(st.Flows, rates)
 		if st.Flows == nil {
 			st.Flows = []uiFlow{}
 		}
 	}
 	if sectionIn(section, "log") {
-		st.History = readUIHistory(db, q, hostFilter)
-		st.History = append(st.History, readUIFirewall(db, serverFilter, hostFilter)...)
+		st.History = s.readUIFirewall(db, serverFilter, hostFilter)
 		sort.SliceStable(st.History, func(i, j int) bool { return st.History[i].When > st.History[j].When })
 		if st.History == nil {
 			st.History = []uiFlow{}
@@ -973,7 +960,7 @@ func (s *Server) uiStateQ(q stateQuery) (st uiState) {
 		st.Alerts = []uiAlert{}
 	}
 	if sectionIn(section, "reports") {
-		st.Reports = reportCatalog()
+		st.Reports = s.visibleReports()
 	}
 	st.Loaded = []string{"servers", "agents", "alerts", "questions"}
 	if sectionIn(section, "activity") {
@@ -1025,6 +1012,9 @@ func (s *Server) listQuestions(db *checkedRead, serverFilter string, hostFilter 
 		if err := rows.Scan(&u.ID, &u.HostID, &u.VM, &u.Proc, &u.Path, &u.Container, &u.Dir, &u.Proto, &u.Peer, &rport, &u.Names, &u.Repeats, &opened, &dedupKey); err != nil {
 			continue
 		}
+		s.qMu.Lock()
+		u.Repeats = max(u.Repeats, s.qRep[u.ID])
+		s.qMu.Unlock()
 		u.VM = u.HostID
 		u.Port = int(rport)
 		if _, ip, ok := strings.Cut(dedupKey, "|\u25a3"); ok {
@@ -1036,9 +1026,6 @@ func (s *Server) listQuestions(db *checkedRead, serverFilter string, hostFilter 
 			u.Proc, u.Path = "", ""
 		}
 		u.Proc = displayProc(u.Proc, u.Path)
-		if u.Proc == "" && u.ContainerIP == "" && u.Container == "" {
-			u.Proc = flowProcForQuestion(db, u)
-		}
 		if u.Proc == "" {
 			u.Proc = "—"
 		}
@@ -1053,7 +1040,7 @@ func (s *Server) listQuestions(db *checkedRead, serverFilter string, hostFilter 
 		u.At = fmtMS(opened)
 		u.Inbound = u.Dir == "in"
 		if u.Names == "" {
-			u.Names = lookupDNS(db, u.HostID, u.Peer, u.Proto, int(rport))
+			u.Names = s.lookupDNS(db, u.HostID, u.Peer, u.Proto, int(rport))
 		}
 		out = append(out, u)
 	}
@@ -1125,17 +1112,6 @@ func displayProc(comm, path string) string {
 	return ""
 }
 
-func flowProcForQuestion(db *checkedRead, q uiQuestion) string {
-	var comm, path string
-	err := db.db.QueryRow(`SELECT COALESCE(proc_comm,''),COALESCE(proc_path,'') FROM flows
-		WHERE host_id=? AND remote_ip=? AND protocol=? AND direction=?
-		ORDER BY last_seen_at_ms DESC LIMIT 1`, q.HostID, q.Peer, q.Proto, q.Dir).Scan(&comm, &path)
-	if err != nil {
-		return ""
-	}
-	return displayProc(comm, path)
-}
-
 func lookupDNS(db *checkedRead, host, ip, proto string, port int) string {
 	if ip == "" {
 		return ""
@@ -1168,33 +1144,6 @@ func ntpUbuntuName(ip, proto string, port int) string {
 	return ""
 }
 
-func fillServerTraffic(db *checkedRead, servers []uiServer) {
-	if len(servers) == 0 {
-		return
-	}
-	since := store.NowMS() - 86400000
-	rows, err := db.Query(`SELECT host_id, COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0)
-		FROM traffic_1m WHERE bucket_start_ms>=? GROUP BY host_id`, since)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	by := map[string][2]int64{}
-	for rows.Next() {
-		var id string
-		var inB, outB int64
-		if rows.Scan(&id, &inB, &outB) != nil {
-			continue
-		}
-		by[id] = [2]int64{inB, outB}
-	}
-	for i := range servers {
-		if v, ok := by[servers[i].HostID]; ok {
-			servers[i].Rx24, servers[i].Tx24 = v[0], v[1]
-		}
-	}
-}
-
 func fmtMS(ms int64) string {
 	if ms <= 0 {
 		return ""
@@ -1221,50 +1170,20 @@ func asInt(v any) int {
 	}
 }
 
-func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlow {
-	q := `SELECT f.flow_uid,datetime(f.last_seen_at_ms/1000,'unixepoch','localtime'),f.host_id,COALESCE(h.hostname,''),f.direction,f.protocol,
- f.local_ip,f.local_port,f.remote_ip,f.remote_port,COALESCE(f.proc_comm,''),COALESCE(f.proc_path,''),f.proc_uid,COALESCE(f.proc_cgroup,''),COALESCE(f.container,''),COALESCE(f.dns_name,''),
- COALESCE(f.orig_bytes,0),COALESCE(f.reply_bytes,0),COALESCE(f.state,''),f.ended_at_ms,f.incomplete,f.reply_seen,COALESCE(h.last_seen_ms,0),COALESCE(f.origin,''),COALESCE(f.reply_src_ip,'')
- FROM flows f LEFT JOIN hosts h ON h.host_id=f.host_id WHERE f.agent_id IN (SELECT agent_id FROM agents WHERE trust_state='trusted')`
-	var args []any
-	if !history {
-		q += " AND f.ended_at_ms IS NULL AND (f.boot_id=(SELECT boot_id FROM agents a WHERE a.agent_id=f.agent_id) OR (SELECT boot_id FROM agents a WHERE a.agent_id=f.agent_id) IS NULL)"
+type flowRow struct {
+	f                            uiFlow
+	origin, replySrc             string
+	lip, rip, state, cg, flowDNS string
+	lp, rp, end, puid            sql.NullInt64
+	ob, rb, last                 int64
+	reply                        int
+}
+
+func finishFlows(db *checkedRead, raw []flowRow, withRates bool, names ...func(*checkedRead, string, string, string, int) string) []uiFlow {
+	nameLookup := lookupDNS
+	if len(names) > 0 {
+		nameLookup = names[0]
 	}
-	if filtered {
-		q += " AND f.host_id=?"
-		args = append(args, filter)
-	}
-	q += " ORDER BY f.last_seen_at_ms DESC,f.flow_uid"
-	if history {
-		q += " LIMIT 500"
-	}
-	type flowRow struct {
-		f                            uiFlow
-		origin, replySrc             string
-		lip, rip, state, cg, flowDNS string
-		lp, rp, end, puid            sql.NullInt64
-		ob, rb, last                 int64
-		reply                        int
-	}
-	// Строки вычитываем целиком и закрываем курсор до вложенных запросов:
-	// опрос, держащий курсор и ждущий второе соединение, при тесном пуле
-	// вешал весь монитор, включая запись и агентов (см. uiReadSlots).
-	rows, err := db.Query(q, args...)
-	if err != nil {
-		return nil
-	}
-	var raw []flowRow
-	for rows.Next() {
-		var r flowRow
-		if err = rows.Scan(&r.f.FlowUID, &r.f.When, &r.f.HostID, &r.f.Server, &r.f.Direction, &r.f.Protocol, &r.lip, &r.lp, &r.rip, &r.rp, &r.f.Proc, &r.f.Path, &r.puid, &r.cg, &r.f.Container, &r.flowDNS, &r.ob, &r.rb, &r.state, &r.end, &r.f.Incomplete, &r.reply, &r.last, &r.origin, &r.replySrc); err != nil {
-			rows.Close()
-			db.record(err)
-			return nil
-		}
-		raw = append(raw, r)
-	}
-	db.record(rows.Err())
-	rows.Close()
 	park := db.setting("park_mode")
 	never := neverPrefixes(db.db)
 	decided := map[string]hostDecision{}
@@ -1316,7 +1235,7 @@ func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlo
 		if rp.Valid {
 			rport = int(rp.Int64)
 		}
-		f.DNS = lookupDNS(db, f.HostID, rip, f.Protocol, rport)
+		f.DNS = nameLookup(db, f.HostID, rip, f.Protocol, rport)
 		if f.DNS == "" {
 			f.DNS = flowDNS
 		}
@@ -1379,50 +1298,7 @@ func readUIFlows(db *checkedRead, filter string, filtered, history bool) []uiFlo
 		}
 		out = append(out, f)
 	}
-	if !history {
-		fillFlowRates(db, out)
-	}
 	return out
-}
-
-func fillFlowRates(db *checkedRead, flows []uiFlow) {
-	if len(flows) == 0 {
-		return
-	}
-	now := store.NowMS()
-	ids := make([]string, 0, len(flows))
-	idx := map[string]int{}
-	for i, f := range flows {
-		ids = append(ids, f.FlowUID)
-		idx[f.FlowUID] = i
-	}
-	q := `SELECT flow_uid, bytes_in+bytes_out, t1_ms-t0_ms, t1_ms FROM flow_samples WHERE t1_ms>? AND flow_uid IN (` + placeholders(len(ids)) + `)`
-	args := []any{now - 30000}
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	rows, err := db.Query(q, args...)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	best := map[string]int64{}
-	for rows.Next() {
-		var uid string
-		var nbytes, dur, t1 int64
-		if rows.Scan(&uid, &nbytes, &dur, &t1) != nil {
-			continue
-		}
-		if t1 < best[uid] {
-			continue
-		}
-		best[uid] = t1
-		i := idx[uid]
-		if dur > 0 {
-			flows[i].Rate = nbytes * 1000 / dur
-			flows[i].RateKnown = true
-		}
-	}
 }
 
 func placeholders(n int) string {
@@ -1434,36 +1310,6 @@ func placeholders(n int) string {
 		s += ",?"
 	}
 	return s
-}
-
-func readUIHistory(db *checkedRead, q stateQuery, hostFilter bool) []uiFlow {
-	out := readUIFlows(db, q.Server, hostFilter, true)
-	if q.Addr == "" && q.Process == "" && q.FromMS == 0 && q.ToMS == 0 {
-		return out
-	}
-	var filtered []uiFlow
-	for _, f := range out {
-		if q.Addr != "" && !strings.Contains(strings.ToLower(f.Remote+f.Peer+f.Addr), strings.ToLower(q.Addr)) {
-			continue
-		}
-		if q.Process != "" && !strings.Contains(strings.ToLower(f.Proc+f.Path), strings.ToLower(q.Process)) {
-			continue
-		}
-		if q.FromMS > 0 || q.ToMS > 0 {
-			t, err := time.ParseInLocation("2006-01-02 15:04:05", f.When, time.Local)
-			if err == nil {
-				ms := t.UnixMilli()
-				if q.FromMS > 0 && ms < q.FromMS {
-					continue
-				}
-				if q.ToMS > 0 && ms > q.ToMS {
-					continue
-				}
-			}
-		}
-		filtered = append(filtered, f)
-	}
-	return filtered
 }
 
 func readUIAudit(db *checkedRead, q stateQuery) []uiAudit {
@@ -1651,7 +1497,7 @@ func attachAlertBan(db *checkedRead, a *uiAlert, id string, now int64) {
 	} else {
 		a.BanUntil = "навсегда"
 	}
-	a.BanScope = scopeLabel(b.Hosts, b.Except)
+	a.BanScope = scopeLabel(namedHosts(db.db, b.Hosts), namedHosts(db.db, b.Except))
 	switch a.BanState {
 	case "removed":
 		a.BanGone = fmtMS(b.RemovedAt)
@@ -1753,6 +1599,9 @@ func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := s.st.Update(func(tx *sql.Tx) error {
+		if err := s.flushQuestionRepeats(tx, store.NowMS()); err != nil {
+			return err
+		}
 		res, err := tx.Exec(`UPDATE learn_questions SET status='answered',answer='dismiss' WHERE question_id=? AND status='open'`, in.ID)
 		if err != nil {
 			return err
@@ -1776,52 +1625,4 @@ func flowEndpoint(ip string, port sql.NullInt64) string {
 		return net.JoinHostPort(ip, strconv.FormatInt(port.Int64, 10))
 	}
 	return ip
-}
-
-func readUIFirewall(db *checkedRead, filter string, filtered bool) []uiFlow {
-	q := `SELECT e.event_id,datetime(e.observed_at_ms/1000,'unixepoch','localtime'),e.host_id,COALESCE(h.hostname,''),e.protocol,e.direction,e.local_ip,e.local_port,e.remote_ip,e.remote_port,e.verdict,e.hits
- FROM firewall_events e LEFT JOIN hosts h ON h.host_id=e.host_id WHERE e.host_id IN (SELECT host_id FROM agents WHERE trust_state='trusted')`
-	var args []any
-	if filtered {
-		q += " AND e.host_id=?"
-		args = append(args, filter)
-	}
-	q += " ORDER BY e.observed_at_ms DESC LIMIT 200"
-	rows, err := db.Query(q, args...)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var out []uiFlow
-	for rows.Next() {
-		var f uiFlow
-		var lip, rip, verdict string
-		var lp, rp sql.NullInt64
-		var hits int
-		if err = rows.Scan(&f.FlowUID, &f.When, &f.HostID, &f.Server, &f.Protocol, &f.Direction, &lip, &lp, &rip, &rp, &verdict, &hits); err != nil {
-			db.record(err)
-			return nil
-		}
-		f.Local = flowEndpoint(lip, lp)
-		f.Remote = flowEndpoint(rip, rp)
-		f.Peer = rip
-		f.Addr = "→ " + f.Remote
-		if f.Direction == "in" {
-			port := "—"
-			if lp.Valid {
-				port = ":" + strconv.FormatInt(lp.Int64, 10)
-			}
-			f.Addr = port + " ← " + f.Remote
-		}
-		f.Proc = "—"
-		f.State = "block"
-		f.Rule = "DROP"
-		if verdict == "reject" {
-			f.Rule = "REJECT"
-		}
-		f.Tip = fmt.Sprintf("%s; попыток: %d", f.Rule, hits)
-		out = append(out, f)
-	}
-	db.record(rows.Err())
-	return out
 }

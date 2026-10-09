@@ -10,6 +10,11 @@ import (
 	"netmonitor/internal/protocol"
 )
 
+// ValidatePayload checks one event the same way a batch does, before any write.
+func ValidatePayload(ev protocol.Event) error {
+	return validatePayload(ev)
+}
+
 func validatePayload(ev protocol.Event) error {
 	if raw := bytes.TrimSpace(ev.Payload); len(raw) == 0 || raw[0] != '{' || !json.Valid(raw) {
 		return fmt.Errorf("payload must be a JSON object")

@@ -85,12 +85,33 @@ func markAlertSeen(tx *sql.Tx, id string, now int64) error {
 // «агент замолчал» и «политика не применилась», закрывает тревоги, причина
 // которых ушла сама (диск освободили, клон разобран, агент вернулся).
 func (s *Server) sweepAlerts(now int64) error {
+	seen := map[string]int64{}
+	{
+		s.pulseMu.Lock()
+		for host, at := range s.hostSeen {
+			seen[host] = at
+		}
+		s.pulseMu.Unlock()
+	}
 	return s.st.Update(func(tx *sql.Tx) error {
-		return sweepAlertsTx(tx, now)
+		return sweepAlertsTx(tx, now, s.startedMS, seen)
 	})
 }
 
-func sweepAlertsTx(tx *sql.Tx, now int64) error {
+// silenceAt — момент, с которым сравнивают порог «агент молчит».
+// В боевом режиме это пульс в памяти. Пока пульса не было и процесс моложе
+// порога, решать рано: старая метка в hosts больше не обновляется.
+func silenceAt(started, now int64, seen map[string]int64, host string) (int64, bool) {
+	if t := seen[host]; t > 0 {
+		return t, true
+	}
+	if started > 0 && now-started <= silentAfterMS {
+		return 0, false
+	}
+	return 1, true
+}
+
+func sweepAlertsTx(tx *sql.Tx, now int64, started int64, seen map[string]int64) error {
 	pct, _ := strconv.Atoi(settingValue(tx, "disk_pct", "0"))
 	if pct < 90 {
 		if _, err := closeAlertsWhere(tx, "auto", "место освободилось", now, `rule_id='disk-90'`); err != nil {
@@ -140,11 +161,18 @@ func sweepAlertsTx(tx *sql.Tx, now int64) error {
 	for _, a := range ags {
 		live[a.host] = true
 		name := hostTitle(tx, a.host)
-		if a.last > 0 && now-a.last > silentAfterMS {
+		stopped := settingValue(tx, "agent_stopped:"+a.host, "") != ""
+		if stopped {
+			if _, err = closeAlertsWhere(tx, "auto", "агент остановлен", now, `rule_id='silent' AND host_id=?`, a.host); err != nil {
+				return err
+			}
+		}
+		last, decide := silenceAt(started, now, seen, a.host)
+		if !stopped && decide && last > 0 && now-last > silentAfterMS {
 			if err = raiseAlert(tx, a.host, "silent", name+" — агент молчит", now); err != nil {
 				return err
 			}
-		} else if a.last > 0 {
+		} else if decide && last > 0 {
 			if _, err = closeAlertsWhere(tx, "auto", "агент снова на связи", now, `rule_id='silent' AND host_id=?`, a.host); err != nil {
 				return err
 			}

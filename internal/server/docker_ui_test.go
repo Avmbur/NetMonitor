@@ -37,12 +37,12 @@ func TestDockerUIContactIdentity(t *testing.T) {
 			if e != nil {
 				return e
 			}
-			r := ingest.ApplyBatch(tx, ingest.Agent{ID: "a", HostID: "h", Trust: "trusted"}, []protocol.Event{{EventID: kind, Seq: int64(i + 1), Kind: kind, ObservedAtMS: 1, Payload: raw}}, 1)
-			if r.Fatal != nil {
-				return r.Fatal
-			}
-			if r.Err != "" {
-				t.Fatal(r.Err)
+			if kind == "question" {
+				srv := &Server{}
+				_, err := srv.insertQuestionOnce(tx, ingest.Agent{ID: "a", HostID: "h", Trust: "trusted"}, protocol.Event{EventID: kind, Seq: int64(i + 1), Kind: kind, ObservedAtMS: 1, Payload: raw}, 1)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		// Simulate metadata left by a previous collector. It must not be shown or used.
@@ -54,7 +54,15 @@ func TestDockerUIContactIdentity(t *testing.T) {
 	db := &checkedRead{db: st.DB}
 	s := &Server{st: st}
 	qs := s.listQuestions(db, "", false)
-	fs := readUIFlows(db, "", false, false)
+	port := 8080
+	s.live.install(nil)
+	p := protocol.FlowPayload{FlowUID: "f", BootID: "b", IPVersion: 4, Protocol: "tcp", Direction: "in", Origin: "docker", OrigSrcIP: "203.0.113.50", OrigDstIP: "192.168.10.186", ReplySrcIP: "172.17.0.2", LocalIP: "192.168.10.186", RemoteIP: "203.0.113.50", LocalPort: &port, FirstSeenMS: store.NowMS(), LastSeenMS: store.NowMS(), ProcComm: "docker-proxy", ProcPath: "/usr/bin/docker-proxy", State: "ESTABLISHED"}
+	s.liveApplyFlowLocked(ingest.Agent{ID: "a", HostID: "h"}, flowEvent("live", 3, p), true)
+	_, rows, _, err := s.liveActivity("", false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := finishFlows(db, rows, false)
 	if db.err != nil {
 		t.Fatal(db.err)
 	}

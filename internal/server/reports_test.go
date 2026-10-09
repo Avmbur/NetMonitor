@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"netmonitor/internal/store"
@@ -18,66 +19,33 @@ func insertReportFlow(t *testing.T, s *Server, uid, dir, proto, rip, scope strin
 	}
 }
 
-func TestMaxAddrCountsInternetDownload(t *testing.T) {
+func TestRemovedReportsStayGone(t *testing.T) {
 	s, _ := batchFixture(t)
-	now := store.NowMS()
-	s.st.DB.Exec(`UPDATE hosts SET hostname='dev-postgres' WHERE host_id='h'`)
-	insertReportFlow(t, s, "f1", "out", "tcp", "185.125.190.36", "internet", 41000, 443, 100, 50000, now)
-	_, err := s.st.DB.Exec(`INSERT INTO flow_samples(event_id,flow_uid,agent_id,t0_ms,t1_ms,orig_bytes_delta,reply_bytes_delta,orig_packets_delta,reply_packets_delta,bytes_out,bytes_in,pkts_out,pkts_in,quality,observed_at_ms,received_at_ms)
-		VALUES('s1','f1','a',?,?,100,50000,1,1,100,50000,1,1,'ok',?,?)`, now-1000, now, now, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w := httptest.NewRecorder()
-	s.handleReports(w, httptest.NewRequest("GET", "/ui/api/reports?id=maxaddr", nil))
-	if w.Code != 200 {
-		t.Fatal(w.Code, w.Body.String())
-	}
-	var rep uiReport
-	json.Unmarshal(w.Body.Bytes(), &rep)
-	if len(rep.Rows) == 0 || rep.Rows[0][0] != "185.125.190.36" {
-		t.Fatalf("maxaddr %+v", rep.Rows)
-	}
-}
-
-func TestRuleHitsUsesRuleName(t *testing.T) {
-	s, _ := batchFixture(t)
-	now := store.NowMS()
-	s.st.DB.Exec(`UPDATE hosts SET hostname='dev-postgres' WHERE host_id='h'`)
-	raw := `{"id":"default-ssh","name":"SSH","enabled":true,"action":"allow","match":{"direction":"in","protocol":"tcp","local_port":22}}`
-	if _, err := s.st.DB.Exec(`INSERT INTO policy_rules(rule_id,version,sort_order,payload) VALUES('default-ssh',1,1,?)`, raw); err != nil {
-		t.Fatal(err)
-	}
-	insertReportFlow(t, s, "ssh1", "in", "tcp", "203.0.113.9", "lan", 22, 53101, 200, 50, now)
-	w := httptest.NewRecorder()
-	s.handleReports(w, httptest.NewRequest("GET", "/ui/api/reports?id=rulehits", nil))
-	if w.Code != 200 {
-		t.Fatal(w.Code, w.Body.String())
-	}
-	var rep uiReport
-	json.Unmarshal(w.Body.Bytes(), &rep)
-	found := false
-	for _, row := range rep.Rows {
-		if len(row) > 0 && row[0] == "SSH" {
-			found = true
-			if row[1] != "dev-postgres" {
-				t.Fatalf("server %q", row[1])
-			}
-		}
-		if len(row) > 0 && looksAuditID(row[0]) {
-			t.Fatalf("uuid %q", row[0])
-		}
-	}
-	if !found {
-		t.Fatalf("no SSH %+v", rep.Rows)
-	}
-}
-
-func TestReportCatalogHasNewIDs(t *testing.T) {
-	want := []string{"topproc", "newdns", "drops", "rulenone", "longsess", "lanin", "montraf"}
+	gone := []string{"topout", "new24", "rulehits", "noreply", "topproc", "rulenone", "montraf"}
 	have := map[string]bool{}
 	for _, m := range reportCatalog() {
 		have[m.ID] = true
+	}
+	for _, id := range gone {
+		if have[id] {
+			t.Fatal("still listed", id)
+		}
+		w := httptest.NewRecorder()
+		s.handleReports(w, httptest.NewRequest("GET", "/ui/api/reports?id="+id, nil))
+		if w.Code != 400 {
+			t.Fatalf("%s code %d body %s", id, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestReportCatalogHasKeptIDs(t *testing.T) {
+	want := []string{"scanners", "sshfail", "blocked", "persist"}
+	have := map[string]bool{}
+	for _, m := range reportCatalog() {
+		have[m.ID] = true
+	}
+	if len(have) != len(want) {
+		t.Fatalf("catalog %d, want %d", len(have), len(want))
 	}
 	for _, id := range want {
 		if !have[id] {
@@ -100,64 +68,44 @@ func getReport(t *testing.T, s *Server, id string) uiReport {
 	return rep
 }
 
-func TestNewReportsFill(t *testing.T) {
-	s, _ := batchFixture(t)
+func TestScanBanStoresPortsWithoutPacketHistory(t *testing.T) {
+	s, cert := batchFixture(t)
+	ev := scanEvent("scan-evidence", 1)
+	if code, ack := sendBatch(t, s, cert, ev); code != 200 || len(ack.Ack) != 1 {
+		t.Fatalf("scan %d %+v", code, ack)
+	}
+	var stored string
+	var seen int64
+	if err := s.st.DB.QueryRow(`SELECT scan_ports, scan_seen_ms FROM blocks WHERE remote_ip='203.0.113.50'`).Scan(&stored, &seen); err != nil {
+		t.Fatal(err)
+	}
+	if stored != "22, 80, 443, 3306, 8080" || seen != ev.ObservedAtMS {
+		t.Fatalf("stored %q seen %d event %d", stored, seen, ev.ObservedAtMS)
+	}
 	now := store.NowMS()
-	s.st.DB.Exec(`UPDATE hosts SET hostname='dev-postgres' WHERE host_id='h'`)
-	s.st.DB.Exec(`INSERT OR REPLACE INTO settings(k,v) VALUES('listen_host','192.168.10.185'),('listen_port','8443')`)
-	insertReportFlow(t, s, "p1", "out", "tcp", "185.125.190.36", "internet", 41000, 443, 100, 50000, now)
-	if _, err := s.st.DB.Exec(`UPDATE flows SET proc_comm='apt', proc_path='/usr/bin/apt' WHERE flow_uid='p1'`); err != nil {
+	if _, err := s.st.DB.Exec(`INSERT INTO blocks(block_id,scope_kind,remote_ip,remote_ip_bin,direction,state,reason,source,created_by,created_at_ms) VALUES('oldscan','all','198.51.100.40',zeroblob(16),'both','active','скан портов','scan','auto',?)`, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.st.DB.Exec(`INSERT INTO flow_samples(event_id,flow_uid,agent_id,t0_ms,t1_ms,orig_bytes_delta,reply_bytes_delta,orig_packets_delta,reply_packets_delta,bytes_out,bytes_in,pkts_out,pkts_in,quality,observed_at_ms,received_at_ms)
-		VALUES('s1','p1','a',?,?,100,50000,1,1,100,50000,1,1,'ok',?,?)`, now-1000, now, now, now); err != nil {
-		t.Fatal(err)
-	}
-	insertReportFlow(t, s, "l1", "in", "tcp", "192.168.10.20", "lan", 22, 53101, 200, 50, now)
-	insertReportFlow(t, s, "m1", "out", "tcp", "192.168.10.185", "lan", 41001, 8443, 80, 40, now)
-	if _, err := s.st.DB.Exec(`INSERT INTO dns_seen(host_id,name,ip_bin,ip,first_seen_ms,last_seen_ms) VALUES('h','api.example.test',zeroblob(16),'203.0.113.50',?,?)`, now, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.st.DB.Exec(`INSERT INTO firewall_events(event_id,host_id,observed_at_ms,received_at_ms,remote_ip,verdict,rule_tag,hits) VALUES('e1','h',?,?,'9.9.9.9','drop','обучение',7)`, now, now); err != nil {
-		t.Fatal(err)
-	}
-	raw := `{"id":"quiet","name":"Тихий","enabled":true,"action":"deny","match":{"direction":"out","protocol":"tcp","remote_port":9}}`
-	if _, err := s.st.DB.Exec(`INSERT INTO policy_rules(rule_id,version,sort_order,payload) VALUES('quiet',1,2,?)`, raw); err != nil {
-		t.Fatal(err)
-	}
-
-	top := getReport(t, s, "topproc")
-	if len(top.Rows) == 0 || top.Rows[0][0] != "apt" || top.Rows[0][1] != "dev-postgres" {
-		t.Fatalf("topproc %+v", top.Rows)
-	}
-	dns := getReport(t, s, "newdns")
-	if len(dns.Rows) == 0 || dns.Rows[0][0] != "api.example.test" || dns.Rows[0][1] != "203.0.113.50" {
-		t.Fatalf("newdns %+v", dns.Rows)
-	}
-	drops := getReport(t, s, "drops")
-	if len(drops.Rows) == 0 || drops.Rows[0][0] != "9.9.9.9" || drops.Rows[0][2] != "обучение" || drops.Rows[0][3] != "7" {
-		t.Fatalf("drops %+v", drops.Rows)
-	}
-	none := getReport(t, s, "rulenone")
-	found := false
-	for _, row := range none.Rows {
-		if len(row) > 0 && row[0] == "Тихий" {
-			found = true
+	for _, port := range []int{11, 7, 9} {
+		if _, err := s.st.DB.Exec(`INSERT INTO firewall_events(event_id,host_id,observed_at_ms,received_at_ms,direction,local_port,remote_ip,hits) VALUES(?,?,?,?,'in',?,'198.51.100.40',1)`, "old-"+strconv.Itoa(port), "h", now-1000, now, port); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if !found {
-		t.Fatalf("rulenone %+v", none.Rows)
+	if _, err := s.st.DB.Exec(`INSERT INTO firewall_events(event_id,host_id,observed_at_ms,received_at_ms,direction,local_port,remote_ip,hits) VALUES('decoy','h',?,?,'in',1,'203.0.113.50',1)`, now-1000, now); err != nil {
+		t.Fatal(err)
 	}
-	long := getReport(t, s, "longsess")
-	if len(long.Rows) == 0 {
-		t.Fatal("longsess empty")
+	rows := map[string][]string{}
+	for _, row := range getReport(t, s, "scanners").Rows {
+		if len(row) > 0 {
+			rows[row[0]] = row
+		}
 	}
-	lan := getReport(t, s, "lanin")
-	if len(lan.Rows) == 0 || lan.Rows[0][0] != "192.168.10.20" || lan.Rows[0][2] != "22" {
-		t.Fatalf("lanin %+v", lan.Rows)
+	got := rows["203.0.113.50"]
+	if len(got) < 5 || got[2] != "5" || got[3] != "22, 80, 443, 3306, 8080" || got[4] != "бан" {
+		t.Fatalf("stored report %+v", got)
 	}
-	mon := getReport(t, s, "montraf")
-	if len(mon.Rows) == 0 || mon.Rows[0][2] != "192.168.10.185" {
-		t.Fatalf("montraf %+v", mon.Rows)
+	old := rows["198.51.100.40"]
+	if len(old) < 5 || old[2] != "\u2014" || old[3] != "\u2014" {
+		t.Fatalf("fallback report %+v", old)
 	}
 }

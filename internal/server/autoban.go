@@ -14,7 +14,7 @@ import (
 	"netmonitor/internal/protocol"
 )
 
-func autoban(tx *sql.Tx, ag ingest.Agent, ev protocol.Event, now int64) error {
+func (s *Server) autoban(tx *sql.Tx, ag ingest.Agent, ev protocol.Event, now int64) error {
 	if ev.Kind == "scan" || ev.Kind == "ssh" {
 		if ag.DeliveryLane == "history" || ev.ObservedAtMS > 0 && now-ev.ObservedAtMS > 60_000 {
 			return nil
@@ -65,7 +65,15 @@ func autoban(tx *sql.Tx, ag ingest.Agent, ev protocol.Event, now int64) error {
 		if len(remaining) < 5 {
 			return nil
 		}
-		if err := banInTx(tx, p.IP, ag.HostID, true, "скан портов", "scan", now); err != nil {
+		ports := make([]int, 0, len(remaining))
+		for port := range remaining {
+			ports = append(ports, port)
+		}
+		seen := ev.ObservedAtMS
+		if seen <= 0 {
+			seen = now
+		}
+		if err := banAuto(tx, p.IP, ag.HostID, true, "скан портов", "scan", now, joinScanPorts(ports), seen); err != nil {
 			return err
 		}
 		return stormCheck(tx, ag.HostID, "scan", now)
@@ -82,14 +90,12 @@ func autoban(tx *sql.Tx, ag ingest.Agent, ev protocol.Event, now int64) error {
 				return err
 			}
 		}
-		var n int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM ssh_failures WHERE host_id=? AND remote_ip=? AND observed_at_ms>?`,
-			ag.HostID, p.RemoteIP, now-10*60*1000,
-		).Scan(&n); err != nil {
+		addr, err := netipx.Parse(p.RemoteIP)
+		if err != nil {
 			return err
 		}
-		if n < 5 {
+		// Попытка уже в окне: noteSSH записал её до вызова, повтор того же id — нет.
+		if s.ssh.count(ag.HostID, netipx.Canonical(addr), now) < 5 {
 			return nil
 		}
 		if err := banInTx(tx, p.RemoteIP, ag.HostID, false, "перебор SSH", "ssh", now); err != nil {
@@ -161,8 +167,16 @@ func raiseAlertDedup(tx *sql.Tx, hostID, rule, key, summary string, now int64, i
 			idgen.NewV7(), now, "auto", "тревога: "+summary, aid, ""); err != nil {
 			return err
 		}
-	} else if _, err = tx.Exec(`UPDATE alerts SET summary=? WHERE alert_id=?`, summary, aid); err != nil {
-		return err
+	} else {
+		var cur string
+		if err = tx.QueryRow(`SELECT summary FROM alerts WHERE alert_id=?`, aid).Scan(&cur); err != nil {
+			return err
+		}
+		if cur != summary {
+			if _, err = tx.Exec(`UPDATE alerts SET summary=? WHERE alert_id=?`, summary, aid); err != nil {
+				return err
+			}
+		}
 	}
 	for _, ip := range ips {
 		if ip == "" {
@@ -201,11 +215,15 @@ func nextLadder(tx *sql.Tx, ip, source string) (step int, ttl time.Duration, exh
 }
 
 func banInTx(tx *sql.Tx, ip, hostID string, all bool, reason, source string, now int64) error {
+	return banAuto(tx, ip, hostID, all, reason, source, now, "", 0)
+}
+
+func banAuto(tx *sql.Tx, ip, hostID string, all bool, reason, source string, now int64, scanPorts string, scanSeen int64) error {
 	addr, err := netipx.Parse(ip)
 	if err != nil {
 		return err
 	}
-	b := banSpec{RemoteIP: netipx.Canonical(addr), Direction: "both", Reason: reason, Source: source, CreatedBy: "auto"}
+	b := banSpec{RemoteIP: netipx.Canonical(addr), Direction: "both", Reason: reason, Source: source, CreatedBy: "auto", ScanPorts: scanPorts, ScanSeen: scanSeen}
 	if !all {
 		if hostID == "" {
 			return fmt.Errorf("бан на сервер без host_id")

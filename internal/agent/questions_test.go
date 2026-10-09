@@ -35,6 +35,10 @@ func TestQuestionQueueAtomicOfflineRestartAndAck(t *testing.T) {
 			http.Error(w, "down", 503)
 			return
 		}
+		if r.URL.Path == "/v1/poll" {
+			json.NewEncoder(w).Encode(protocol.PollRes{Session: "test-session"})
+			return
+		}
 		var b protocol.Batch
 		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 			t.Error(err)

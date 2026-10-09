@@ -44,6 +44,10 @@ func TestScanAutoban(t *testing.T) {
 	if _, err := server.TrustPending(srvDir, ""); err != nil {
 		t.Fatal(err)
 	}
+	// Establish the volatile stream before observing the scan.
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if err := a.Enqueue("scan", 9, protocol.ScanPayload{IP: "203.0.113.50", Ports: []int{22, 80, 443, 3306, 8080}}); err != nil {
 		t.Fatal(err)
 	}

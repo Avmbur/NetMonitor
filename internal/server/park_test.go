@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,62 +82,59 @@ func TestDailySnapshotRotatesOldFiles(t *testing.T) {
 	}
 }
 
-func TestRetainKeepsMarkersAndReferencedFlows(t *testing.T) {
+func TestDailySnapshotDoesNotRebuildMain(t *testing.T) {
 	s, _ := batchFixture(t)
-	now := store.NowMS()
-	old := now - 40*86400000
-	gone := now - 100*86400000
-	newer := now - 5*86400000
-	s.st.DB.Exec(`INSERT INTO ingest_events(event_id,agent_id,seq,kind,payload_sha256,observed_at_ms,received_at_ms) VALUES('e1','a',1,'flow','x',?,?)`, gone, gone)
-	s.st.DB.Exec(`INSERT INTO ingest_events(event_id,agent_id,seq,kind,payload_sha256,observed_at_ms,received_at_ms) VALUES('e2','a',2,'flow','y',?,?)`, now, now)
-	s.st.DB.Exec(`INSERT INTO flows(flow_uid,host_id,agent_id,boot_id,first_seen_at_ms,last_seen_at_ms,ended_at_ms,ip_version,protocol,orig_src_ip,orig_src_ip_bin,orig_dst_ip,orig_dst_ip_bin,direction,local_ip,local_ip_bin,remote_ip,remote_ip_bin,remote_scope,origin,received_at_ms)
-		VALUES('oldf','h','a','b',?,?,?,4,'tcp','1.1.1.1',zeroblob(16),'10.0.0.1',zeroblob(16),'out','10.0.0.1',zeroblob(16),'1.1.1.1',zeroblob(16),'internet','host',?)`, gone, gone, gone, gone)
-	s.st.DB.Exec(`INSERT INTO flows(flow_uid,host_id,agent_id,boot_id,first_seen_at_ms,last_seen_at_ms,ended_at_ms,ip_version,protocol,orig_src_ip,orig_src_ip_bin,orig_dst_ip,orig_dst_ip_bin,direction,local_ip,local_ip_bin,remote_ip,remote_ip_bin,remote_scope,origin,received_at_ms)
-		VALUES('keepf','h','a','b',?,?,?,4,'tcp','1.1.1.1',zeroblob(16),'10.0.0.1',zeroblob(16),'out','10.0.0.1',zeroblob(16),'1.1.1.1',zeroblob(16),'internet','host',?)`, newer, newer, newer, newer)
-	s.st.DB.Exec(`INSERT INTO flow_samples(event_id,flow_uid,agent_id,t0_ms,t1_ms,orig_bytes_delta,reply_bytes_delta,orig_packets_delta,reply_packets_delta,bytes_out,bytes_in,pkts_out,pkts_in,quality,observed_at_ms,received_at_ms)
-		VALUES('s-old','keepf','a',?,?,1,0,1,0,1,0,1,0,'ok',?,?)`, old, old+1000, old, old)
-	s.st.DB.Exec(`INSERT INTO flow_samples(event_id,flow_uid,agent_id,t0_ms,t1_ms,orig_bytes_delta,reply_bytes_delta,orig_packets_delta,reply_packets_delta,bytes_out,bytes_in,pkts_out,pkts_in,quality,observed_at_ms,received_at_ms)
-		VALUES('s-new','keepf','a',?,?,1,0,1,0,1,0,1,0,'ok',?,?)`, newer, newer+1000, newer, newer)
-	if err := s.st.Update(func(tx *sql.Tx) error { return store.PutSetting(tx, "samples_n", "30") }); err != nil {
+	if err := s.st.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO audit_log(audit_id,at_ms,actor,action,detail) VALUES('fat',1,'adm','test',?)", strings.Repeat("a", 300000))
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.retainNow(now); err != nil {
+	if err := s.st.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec("DELETE FROM audit_log WHERE audit_id='fat'")
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
-	var samples, flows, markers int
-	s.st.DB.QueryRow(`SELECT COUNT(*) FROM flow_samples`).Scan(&samples)
-	s.st.DB.QueryRow(`SELECT COUNT(*) FROM flows`).Scan(&flows)
-	s.st.DB.QueryRow(`SELECT COUNT(*) FROM ingest_events`).Scan(&markers)
-	if samples != 1 {
-		t.Fatal("samples", samples)
-	}
-	if flows != 1 {
-		t.Fatal("flows", flows)
-	}
-	if markers != 2 {
-		t.Fatal("permanent event receipts", markers)
-	}
-}
-
-func TestDiskNinetySkipsSamplesAndAlerts(t *testing.T) {
-	s, _ := batchFixture(t)
-	prev := diskSizeFn
-	diskSizeFn = func(string) (uint64, uint64, error) { return 100, 5, nil }
-	defer func() { diskSizeFn = prev }()
-	if err := s.refreshDisk(); err != nil {
+	var pages, free int64
+	if err := s.st.DB.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
 		t.Fatal(err)
 	}
-	var skip string
-	s.st.DB.QueryRow(`SELECT v FROM settings WHERE k='disk_skip_samples'`).Scan(&skip)
-	if skip != "1" {
-		t.Fatal(skip)
+	if err := s.st.DB.QueryRow("PRAGMA freelist_count").Scan(&free); err != nil {
+		t.Fatal(err)
 	}
-	st := s.uiState("", "settings")
-	if st.Monitor["disk_pct"] != 95 {
-		t.Fatal(st.Monitor)
+	if free == 0 {
+		t.Fatal("delete left no free pages")
 	}
-	if len(st.Alerts) == 0 {
-		t.Fatal("no disk alert")
+	if err := s.dailySnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	var pages2, free2 int64
+	if err := s.st.DB.QueryRow("PRAGMA page_count").Scan(&pages2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.st.DB.QueryRow("PRAGMA freelist_count").Scan(&free2); err != nil {
+		t.Fatal(err)
+	}
+	if pages2 != pages || free2 == 0 {
+		t.Fatalf("main rebuilt: pages %d->%d free %d->%d", pages, pages2, free, free2)
+	}
+	day := time.Now().UTC().Format("20060102")
+	dest := filepath.Join(s.snapDir(), "netmon-"+day+".sqlite")
+	if err := store.Integrity(dest); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := store.QueryOpen(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	var snapPages int64
+	if err := snap.QueryRow("PRAGMA page_count").Scan(&snapPages); err != nil {
+		t.Fatal(err)
+	}
+	if snapPages >= pages {
+		t.Fatalf("snapshot not compact: %d >= %d", snapPages, pages)
 	}
 }
 

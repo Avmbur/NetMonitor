@@ -7,11 +7,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
+
 	"time"
 
 	"netmonitor/internal/collect"
 	"netmonitor/internal/idgen"
+
 	"netmonitor/internal/store"
 )
 
@@ -48,11 +49,19 @@ func (s *Server) parkOnce() {
 	if err := s.refreshDisk(); err != nil {
 		log.Printf("disk: %v", err)
 	}
-	if err := s.retainNow(store.NowMS()); err != nil {
-		log.Printf("retain: %v", err)
-	}
 	if err := s.enforceDbCap(); err != nil {
 		log.Printf("db cap: %v", err)
+	}
+	now := store.NowMS()
+	if s.qFlush == 0 || now-s.qFlush >= 15*60*1000 {
+		if err := s.st.Update(func(tx *sql.Tx) error { return s.flushQuestionRepeats(tx, now) }); err != nil {
+			log.Printf("question repeats: %v", err)
+		} else {
+			s.qFlush = now
+		}
+	}
+	if err := s.flushSSHBrute(now); err != nil {
+		log.Printf("ssh summary: %v", err)
 	}
 	if err := s.dailySnapshot(); err != nil {
 		log.Printf("daily snapshot: %v", err)
@@ -72,16 +81,11 @@ func (s *Server) refreshDisk() error {
 	if err != nil {
 		return err
 	}
-	skip := "0"
-	if pct >= 90 {
-		skip = "1"
-	}
 	return s.st.Update(func(tx *sql.Tx) error {
-		if err := store.PutSetting(tx, "disk_pct", strconv.Itoa(pct)); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "disk_skip_samples", skip); err != nil {
-			return err
+		if settingValue(tx, "disk_pct", "") != strconv.Itoa(pct) {
+			if err := store.PutSetting(tx, "disk_pct", strconv.Itoa(pct)); err != nil {
+				return err
+			}
 		}
 		now := store.NowMS()
 		if pct < 90 {
@@ -95,7 +99,7 @@ func (s *Server) refreshDisk() error {
 			}
 		}
 		if pct >= 90 {
-			return raiseAlert(tx, "monitor", "disk-90", "диск 90% — трафик не пишется", now)
+			return raiseAlert(tx, "monitor", "disk-90", "диск 90% — мало места", now)
 		}
 		if pct >= 80 {
 			return raiseAlert(tx, "monitor", "disk-80", "диск 80% — мало места", now)
@@ -137,9 +141,8 @@ func (s *Server) dailySnapshot() error {
 	if last == day {
 		return s.keepOnlySnapshot("")
 	}
-	if err := s.st.ExecDirect("VACUUM"); err != nil {
-		log.Printf("vacuum: %v", err)
-	}
+	// Снимок VACUUM INTO и так компактный. Полный VACUUM основной базы
+	// переписывал бы её целиком каждый день.
 	dest := filepath.Join(s.snapDir(), "netmon-"+day+".sqlite")
 	if err := s.st.VacuumInto(dest); err != nil {
 		return err
@@ -180,59 +183,6 @@ func (s *Server) keepOnlySnapshot(keep string) error {
 	return nil
 }
 
-func keepSpan(db *sql.DB, kind string, defN int, defU string) int64 {
-	n := defN
-	u := defU
-	if v, err := store.SettingDB(db, kind+"_n"); err == nil {
-		if x, e := strconv.Atoi(v); e == nil && x > 0 {
-			n = x
-		}
-	}
-	if v, err := store.SettingDB(db, kind+"_u"); err == nil && (v == "d" || v == "mo") {
-		u = v
-	}
-	day := int64(86400000)
-	if u == "mo" {
-		return int64(n) * 30 * day
-	}
-	return int64(n) * day
-}
-
-func (s *Server) retainNow(now int64) error {
-	sampleCut := now - keepSpan(s.st.DB, "samples", 30, "d")
-	flowCut := now - keepSpan(s.st.DB, "flows", 90, "d")
-	hourCut := now - keepSpan(s.st.DB, "hours", 12, "mo")
-	healthCut := now - 14*int64(86400000)
-	return s.st.Update(func(tx *sql.Tx) error {
-		if err := deleteOld(tx, `DELETE FROM flow_samples WHERE rowid IN (SELECT rowid FROM flow_samples WHERE t0_ms<? LIMIT 500)`, sampleCut); err != nil {
-			return err
-		}
-		if err := deleteOld(tx, `DELETE FROM firewall_events WHERE rowid IN (SELECT rowid FROM firewall_events WHERE observed_at_ms<? LIMIT 500)`, flowCut); err != nil {
-			return err
-		}
-		if err := deleteOld(tx, `DELETE FROM flows WHERE rowid IN (
-			SELECT rowid FROM flows WHERE last_seen_at_ms<? AND ended_at_ms IS NOT NULL
-			AND flow_uid NOT IN (SELECT flow_uid FROM flow_samples) LIMIT 500)`, flowCut); err != nil {
-			return err
-		}
-		if err := deleteOld(tx, `DELETE FROM traffic_1m WHERE bucket_start_ms<?`, sampleCut); err != nil {
-			return err
-		}
-		if err := deleteOld(tx, `DELETE FROM traffic_1h WHERE bucket_start_ms<?`, hourCut); err != nil {
-			return err
-		}
-		if _, err := deleteConfirmedReceipts(tx); err != nil {
-			return err
-		}
-		if err := deleteOld(tx, `DELETE FROM collector_health WHERE rowid IN (SELECT rowid FROM collector_health WHERE kind!='alive' AND observed_at_ms<? LIMIT 500)`, healthCut); err != nil {
-			return err
-		}
-		_, err := tx.Exec(`DELETE FROM collector_health WHERE kind='alive' AND rowid NOT IN (
-			SELECT MAX(rowid) FROM collector_health WHERE kind='alive' GROUP BY agent_id)`)
-		return err
-	})
-}
-
 func dbCapBytes(db *sql.DB) int64 {
 	n, err := store.MonitorCapBytes(db)
 	if err != nil {
@@ -246,11 +196,12 @@ func (s *Server) dbFileBytes() int64 {
 }
 
 func (s *Server) enforceDbCap() error {
-	// The shared writer also runs this rotation on every incoming transaction.
-	if err := s.st.Update(func(tx *sql.Tx) error { return nil }); err != nil {
-		return err
-	}
-	return s.st.ExecDirect("PRAGMA wal_checkpoint(TRUNCATE)")
+	// Та же ротация, что и на каждой записи. Здесь она догоняет потолок,
+	// если между минутными проходами пакетов не было.
+	// Журнал не сливаем: безусловный TRUNCATE раз в минуту снова писал
+	// горячие страницы в основной файл. Сброс остаётся в monitorWriteLimit,
+	// когда файл вместе с журналом больше заданного размера.
+	return s.st.Update(func(tx *sql.Tx) error { return nil })
 }
 
 func deleteLimited(tx *sql.Tx, q string, args ...any) (int64, error) {
@@ -259,26 +210,6 @@ func deleteLimited(tx *sql.Tx, q string, args ...any) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
-}
-
-func deleteOld(tx *sql.Tx, q string, cut int64) error {
-	for {
-		res, err := tx.Exec(q, cut)
-		if err != nil {
-			if !strings.Contains(q, "LIMIT") {
-				_, err = tx.Exec(strings.Replace(q, " LIMIT 500", "", 1), cut)
-				return err
-			}
-			return err
-		}
-		n, err := res.RowsAffected()
-		if err != nil || n == 0 {
-			return err
-		}
-		if !strings.Contains(q, "LIMIT") {
-			return nil
-		}
-	}
 }
 
 func fileSize(path string) int64 {

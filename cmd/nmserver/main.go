@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"netmonitor/internal/server"
 )
@@ -100,7 +104,18 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := s.Serve(); err != nil {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sig
+			_ = s.Close()
+		}()
+		err = s.Serve()
+		signal.Stop(sig)
+		if cerr := s.Close(); cerr != nil {
+			err = cerr
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	default:

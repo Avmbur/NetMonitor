@@ -18,7 +18,22 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const dsnOpts = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(FULL)&_pragma=wal_autocheckpoint(128)&_pragma=journal_size_limit(16777216)&_txlock=immediate"
+// Журнал агента сливается каждые 128 страниц. Монитор реже: см. monitorWALPages.
+// journal_size_limit 16 МБ — потолок файла журнала после сброса, не порог слива.
+const dsnBase = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(FULL)&_pragma=journal_size_limit(16777216)&_txlock=immediate"
+
+const agentWALPages = 128
+
+// Около 8 МБ при странице 4 КБ. Ниже предела журнала 16 МБ и запаса 32 МБ в monitorWriteLimit.
+const monitorWALPages = 2000
+
+func openDSN(kind string) string {
+	pages := agentWALPages
+	if kind == "monitor" {
+		pages = monitorWALPages
+	}
+	return dsnBase + fmt.Sprintf("&_pragma=wal_autocheckpoint(%d)", pages)
+}
 
 var ErrClosed = errors.New("store is closed")
 
@@ -98,7 +113,7 @@ func open(path, kind string, migrate func(*sql.DB) error) (*Store, error) {
 	if runtime.GOOS == "windows" && !strings.HasPrefix(u.Path, "/") {
 		u.Path = "/" + u.Path
 	}
-	db, err := sql.Open("sqlite", u.String()+dsnOpts)
+	db, err := sql.Open("sqlite", u.String()+openDSN(kind))
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +235,7 @@ func (s *owner) writer() {
 		}
 		if err != nil {
 			err = errors.Join(err, tx.Rollback())
+			finishTransaction(tx, false)
 			if s.kind == "monitor" {
 				_ = s.monitorWriteLimit()
 			}
@@ -233,6 +249,7 @@ func (s *owner) writer() {
 			// done, so Rollback on it cannot release that transaction.
 			_, _ = s.conn.ExecContext(context.Background(), "ROLLBACK")
 		}
+		finishTransaction(tx, err == nil)
 		if s.kind == "monitor" && err == nil {
 			_ = s.monitorWriteLimit()
 		}

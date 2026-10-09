@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -40,17 +39,19 @@ func TestHistoryRequestCannotDelayUrgentAndHeartbeat(t *testing.T) {
 		json.NewEncoder(w).Encode(ack)
 	}))
 	defer srv.Close()
-	a := &Agent{st: st, client: srv.Client(), cfg: Config{Monitor: srv.URL}}
-	if e = st.Update(func(tx *sql.Tx) error {
-		if e := enqueueTx(tx, "sample", 0, map[string]string{"x": "old"}); e != nil {
-			return e
+	a := &Agent{st: st, client: srv.Client(), cfg: Config{Monitor: srv.URL}, session: "test-session"}
+	for _, ev := range []struct {
+		kind string
+		pri  int
+		p    any
+	}{
+		{"sample", 0, map[string]string{"x": "old"}},
+		{"question", 7, protocol.QuestionPayload{RemoteIP: "1.1.1.1"}},
+		{"health", 10, protocol.HealthPayload{Kind: "alive"}},
+	} {
+		if err := a.Enqueue(ev.kind, ev.pri, ev.p); err != nil {
+			t.Fatal(err)
 		}
-		if e := enqueueTx(tx, "question", 7, protocol.QuestionPayload{RemoteIP: "1.1.1.1"}); e != nil {
-			return e
-		}
-		return enqueueTx(tx, "health", 10, protocol.HealthPayload{Kind: "alive"})
-	}); e != nil {
-		t.Fatal(e)
 	}
 	done := make(chan error, 1)
 	go func() { done <- a.flushLane("history") }()
@@ -79,79 +80,19 @@ func TestHistoryRequestCannotDelayUrgentAndHeartbeat(t *testing.T) {
 	}
 }
 
-func TestQueueConfirmationWaitsForLostAckAndAllLanes(t *testing.T) {
-	st, err := store.OpenAgent(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+func seqsOf(events []protocol.Event) []int64 {
+	out := make([]int64, len(events))
+	for i, event := range events {
+		out[i] = event.Seq
 	}
-	defer st.Close()
-	var batches []protocol.Batch
-	var mu sync.Mutex
-	fail := true
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var b protocol.Batch
-		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-			t.Error(err)
-			return
-		}
-		mu.Lock()
-		batches = append(batches, b)
-		failed := fail
-		mu.Unlock()
-		if failed {
-			w.WriteHeader(500)
-			return
-		}
-		ack := protocol.Ack{}
-		for _, event := range b.Events {
-			ack.Ack = append(ack.Ack, event.EventID)
-		}
-		json.NewEncoder(w).Encode(ack)
-	}))
-	defer srv.Close()
-	a := &Agent{st: st, client: srv.Client(), cfg: Config{Monitor: srv.URL}}
-	if err := a.Enqueue("sample", 0, map[string]string{"old": "history"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Enqueue("health", 10, protocol.HealthPayload{Kind: "alive"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.flushLane("heartbeat"); err == nil {
-		t.Fatal("expected lost ACK")
-	}
-	mu.Lock()
-	fail = false
-	mu.Unlock()
-	if err := a.flushLane("heartbeat"); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	firstBatches := append([]protocol.Batch(nil), batches...)
-	mu.Unlock()
-	if len(firstBatches) != 2 {
-		t.Fatal(len(firstBatches))
-	}
-	for _, b := range firstBatches {
-		if b.PendingFrom == nil || *b.PendingFrom != 1 {
-			t.Fatalf("history was skipped: %+v", b)
-		}
-		if len(b.Events) != 1 || b.Events[0].Seq != 2 {
-			t.Fatalf("unexpected heartbeat: %+v", b)
+	return out
+}
+
+func hasSeq(seqs []int64, want int64) bool {
+	for _, seq := range seqs {
+		if seq == want {
+			return true
 		}
 	}
-	if err := a.flushLane("history"); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Enqueue("health", 10, protocol.HealthPayload{Kind: "alive"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.flushLane("heartbeat"); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	last := batches[len(batches)-1]
-	mu.Unlock()
-	if last.PendingFrom == nil || *last.PendingFrom != 3 {
-		t.Fatalf("completed queue not confirmed: %+v", last)
-	}
+	return false
 }

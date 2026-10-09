@@ -12,6 +12,7 @@ import (
 
 func TestAgentLifecycleAndEmptyPark(t *testing.T) {
 	s, cert := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	s.st.DB.Exec("UPDATE agents SET trust_state='pending'")
 	before := s.uiState("", "settings")
 	if before.err != nil || before.HasTrusted || len(before.Servers) != 0 || len(before.Agents) != 1 {
@@ -48,6 +49,7 @@ func TestAgentLifecycleAndEmptyPark(t *testing.T) {
 
 func TestDeleteAgentRemovesRow(t *testing.T) {
 	s, cert := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	s.st.DB.Exec(`INSERT INTO commands(command_id,agent_id,kind,payload,created_at_ms) VALUES('c1','a','ban','{}',1)`)
 	s.st.DB.Exec(`INSERT OR REPLACE INTO settings(k,v) VALUES('fw_status:a','{}'),('inventory:h','{}'),('host_control:h','{}'),('monitor_host_id','h')`)
 	if err := s.changeAgent("a", "delete", "", ""); err != nil {
@@ -85,12 +87,14 @@ func TestDeleteAgentRemovesRow(t *testing.T) {
 
 func TestRemoveAgentQueuesUntilAck(t *testing.T) {
 	s, cert := batchFixture(t)
+
 	if err := s.changeAgent("a", "remove", "", ""); !errors.Is(err, errAgentSilent) {
 		t.Fatal(err)
 	}
 	if _, err := s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=?`, store.NowMS()); err != nil {
 		t.Fatal(err)
 	}
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	if _, err := s.st.DB.Exec(`UPDATE agents SET trust_state='pending'`); err != nil {
 		t.Fatal(err)
 	}
@@ -161,14 +165,16 @@ func TestRemoveAgentQueuesUntilAck(t *testing.T) {
 
 }
 
-func TestResumeHistoryOnTrust(t *testing.T) {
+func TestResumeServiceStateOnTrust(t *testing.T) {
 	s, _ := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	now := store.NowMS()
 	s.st.DB.Exec(`UPDATE hosts SET hostname='box', last_seen_ms=? WHERE host_id='h'`, now)
 	s.st.DB.Exec(`INSERT OR REPLACE INTO settings(k,v) VALUES('host_control:h','{"mode":"learn"}')`)
 	s.st.DB.Exec(`INSERT INTO policy_rules(rule_id,version,sort_order,payload) VALUES('r-keep',1,1,?)`, `{"id":"r-keep","name":"ssh","action":"allow","hosts":["h"]}`)
-	s.st.DB.Exec(`INSERT INTO flows(flow_uid,host_id,agent_id,boot_id,first_seen_at_ms,last_seen_at_ms,ip_version,protocol,orig_src_ip,orig_src_ip_bin,orig_dst_ip,orig_dst_ip_bin,direction,local_ip,local_ip_bin,remote_ip,remote_ip_bin,remote_scope,origin,received_at_ms)
-		VALUES('oldflow','h','a','b',?,?,4,'tcp','1.1.1.1',zeroblob(16),'10.0.0.1',zeroblob(16),'out','10.0.0.1',zeroblob(16),'1.1.1.1',zeroblob(16),'internet','host',?)`, now, now, now)
+	if _, err := s.st.DB.Exec(`INSERT INTO ssh_brute(host_id,remote_ip,attempts,first_at_ms,last_at_ms) VALUES('h','1.1.1.1',5,?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.changeAgent("a", "delete", "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -197,14 +203,8 @@ func TestResumeHistoryOnTrust(t *testing.T) {
 	if n != 0 {
 		t.Fatal("new host kept")
 	}
-	s.st.DB.QueryRow(`SELECT COUNT(*) FROM flows WHERE host_id='h' AND flow_uid='oldflow'`).Scan(&n)
-	if n != 1 {
-		t.Fatal("history lost")
-	}
-	var owner string
-	s.st.DB.QueryRow(`SELECT agent_id FROM flows WHERE flow_uid='oldflow'`).Scan(&owner)
-	if owner != "a2" {
-		t.Fatal("flow owner", owner)
+	if err := s.st.DB.QueryRow(`SELECT attempts FROM ssh_brute WHERE host_id='h' AND remote_ip='1.1.1.1'`).Scan(&n); err != nil || n != 5 {
+		t.Fatal("SSH evidence lost", n, err)
 	}
 	var ctrl, hosts string
 	s.st.DB.QueryRow(`SELECT v FROM settings WHERE k='host_control:h'`).Scan(&ctrl)
@@ -222,6 +222,7 @@ func TestResumeHistoryOnTrust(t *testing.T) {
 
 func TestResumeHistoryByIP(t *testing.T) {
 	s, _ := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	now := store.NowMS()
 	s.st.DB.Exec(`UPDATE hosts SET hostname='oldbox', last_seen_ms=? WHERE host_id='h'`, now)
 	s.st.DB.Exec(`UPDATE agents SET last_src_ip='10.20.30.40' WHERE agent_id='a'`)
@@ -251,6 +252,7 @@ func TestResumeHistoryByIP(t *testing.T) {
 }
 func TestAgentChangeRollsBackOnAuditFailure(t *testing.T) {
 	s, _ := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	s.st.DB.Exec("UPDATE agents SET trust_state='pending'")
 	s.st.DB.Exec("CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'full'); END")
 	if err := s.changeAgent("a", "trust", "name", ""); err == nil {
@@ -263,9 +265,10 @@ func TestAgentChangeRollsBackOnAuditFailure(t *testing.T) {
 	}
 }
 func TestUIReadFailureIsNotEmptySuccess(t *testing.T) {
-	for _, table := range []string{"never_block", "ip_groups", "policy_rules", "learn_questions", "audit_log", "flows", "settings"} {
+	for _, table := range []string{"never_block", "ip_groups", "policy_rules", "learn_questions", "audit_log", "hosts", "settings"} {
 		t.Run(table, func(t *testing.T) {
 			s, _ := batchFixture(t)
+			s.hostSeen = map[string]int64{"h": store.NowMS()}
 			if _, err := s.st.DB.Exec("ALTER TABLE " + table + " RENAME TO broken_" + table); err != nil {
 				t.Fatal(err)
 			}
@@ -279,6 +282,7 @@ func TestUIReadFailureIsNotEmptySuccess(t *testing.T) {
 }
 func TestOpenPollSeesRevocation(t *testing.T) {
 	s, cert := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	done := make(chan int, 1)
 	go func() { done <- postPoll(t, s, cert, protocol.PollReq{Rev: 0}) }()
 	time.Sleep(100 * time.Millisecond)

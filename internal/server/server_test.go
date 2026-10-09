@@ -79,6 +79,7 @@ func TestInitAndBatchIdempotent(t *testing.T) {
 	if err := a.Flush(); err != nil {
 		t.Fatal(err)
 	}
+	// А2: поток уже подтверждён и лежит в отложенной записи, пока монитор её не сбросит.
 
 	st, err := store.OpenMonitor(srvDir)
 	if err != nil {
@@ -86,18 +87,24 @@ func TestInitAndBatchIdempotent(t *testing.T) {
 	}
 	defer st.Close()
 	var n int
+	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM open_flows`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("open_flows=%d want 0", n)
+	}
 	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM flows`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("flows=%d want 1", n)
+	if n != 0 {
+		t.Fatalf("flows=%d want 0", n)
 	}
 	var ingestN int
 	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM ingest_events`).Scan(&ingestN); err != nil {
 		t.Fatal(err)
 	}
-	if ingestN != 1 {
-		t.Fatalf("ingest=%d want 1", ingestN)
+	if ingestN != 0 {
+		t.Fatalf("ingest=%d want 0", ingestN)
 	}
 	var trust string
 	if err := st.DB.QueryRow(`SELECT trust_state FROM agents`).Scan(&trust); err != nil {
@@ -110,8 +117,8 @@ func TestInitAndBatchIdempotent(t *testing.T) {
 	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM v_contacts_out`).Scan(&contacts); err != nil {
 		t.Fatal(err)
 	}
-	if contacts != 1 {
-		t.Fatalf("v_contacts_out=%d", contacts)
+	if contacts != 0 {
+		t.Fatalf("v_contacts_out=%d want 0", contacts)
 	}
 	if _, err := agent.Open(agent.Config{DataDir: filepath.Join(dir, "ag2"), Monitor: mon, Token: tok, Pin: testPin(t, srvDir)}); err == nil {
 		t.Fatal("повтор токена должен быть отказ")

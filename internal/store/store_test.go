@@ -293,8 +293,22 @@ func TestCopiedDatabaseMigration(t *testing.T) {
 		rows.Close()
 		values := make(counts)
 		for _, name := range names {
+			query := "SELECT COUNT(*) FROM " + name
+			if kind == "monitor" {
+				switch name {
+				case "flow_samples", "flows", "open_flows", "flow_owner", "traffic_1m", "traffic_1h", "firewall_events", "collector_health", "ssh_failures", "remote_seen":
+					// The v16 migration deliberately discards telemetry.
+					continue
+				case "ingest_events":
+					query += " WHERE kind IN ('question','queue_drop')"
+				case "settings":
+					// Retired telemetry settings disappear; db_max_mb is added
+					// when converting an older size limit.
+					query += " WHERE k NOT IN ('db_max_mb','samples_n','samples_u','flows_n','flows_u','hours_n','hours_u','cf') AND substr(k,1,3) NOT IN ('am:','dp:','sh:','ln:','as:')"
+				}
+			}
 			var n int64
-			if err := db.QueryRow("SELECT COUNT(*) FROM " + name).Scan(&n); err != nil {
+			if err := db.QueryRow(query).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			values[name] = n
@@ -324,5 +338,5 @@ func TestCopiedDatabaseMigration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	t.Logf("%s: %d tables retain their row counts; repeated migration and integrity_check OK", kind, len(before))
+	t.Logf("%s: %d service tables retain their row counts; repeated migration and integrity_check OK", kind, len(before))
 }

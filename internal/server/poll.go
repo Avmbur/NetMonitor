@@ -152,6 +152,11 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]bool{"ok": true})
 		return
 	}
+	changed, err := s.registerStream(ag.ID, in.Instance)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(400 * time.Millisecond)
@@ -162,15 +167,15 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if res.PolicyRev != in.Rev || len(res.Commands) > 0 || !res.Authorized {
-			writeJSON(w, res)
+		if changed || res.PolicyRev != in.Rev || len(res.Commands) > 0 || !res.Authorized {
+			s.writePoll(w, ag.ID, res)
 			return
 		}
 		select {
 		case <-r.Context().Done():
 			return
 		case <-deadline.C:
-			writeJSON(w, res)
+			s.writePoll(w, ag.ID, res)
 			return
 		case <-tick.C:
 		}

@@ -26,7 +26,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.5"
+var Version = "1.0.6"
 
 type Config struct {
 	ArtifactDir string
@@ -44,6 +44,35 @@ type Server struct {
 	mu        sync.Mutex
 	startedMS int64
 	sess      *sessStore
+	// batchWait — сколько обычная телеметрия ждёт соседей, чтобы сесть в один коммит.
+	// Ноль оставляет прежнее поведение: коммит сразу. Срочное и управление сюда не входят.
+	batchWait time.Duration
+	// agentStateMu spans batch commit and publication. Removal/rebinding waits
+	// for both before changing the owner. Lock order: agentStateMu -> flushMu -> writer.
+	agentStateMu sync.RWMutex
+	flushMu      sync.Mutex
+	// drops — ещё не сброшенные hits DROP и оперативная лента событий.
+	drops dropBook
+	// ssh — точные попытки SSH: скользящие 10 минут и отчёт.
+	ssh       sshBook
+	closeOnce sync.Once
+	closeErr  error
+	gate      *batchGate
+	live      liveTable
+	// serviceDisk — на диске только служебное. Потоки, пробы, сводки и квитанции
+	// телеметрии туда не пишутся. Включается в Listen.
+	session      string
+	streams      map[string]*serviceStream // protected by agentStateMu; cursors by the batch gate
+	pulseMu      sync.Mutex
+	hostSeen     map[string]int64
+	hostInv      map[string]protocol.HealthPayload
+	collectFault map[string]string
+	qMu          sync.Mutex
+	qRep         map[string]int
+	qSeen        map[string]int64
+	qFlush       int64
+	nameMu       sync.Mutex
+	liveNames    map[string]serviceName
 }
 
 func Init(cfg Config, password string) error {
@@ -94,25 +123,7 @@ func Init(cfg Config, password string) error {
 		if err := seedPolicy(tx); err != nil {
 			return err
 		}
-		if err := store.PutSetting(tx, "samples_n", "30"); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "samples_u", "d"); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "flows_n", "90"); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "flows_u", "d"); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "hours_n", "12"); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "hours_u", "mo"); err != nil {
-			return err
-		}
-		if err := store.PutSetting(tx, "db_max_gb", "2"); err != nil {
+		if err := store.PutSetting(tx, "db_max_mb", "2048"); err != nil {
 			return err
 		}
 		return store.PutSetting(tx, "adm_password", hash)
@@ -231,7 +242,7 @@ func Listen(cfg Config) (*Server, error) {
 		st.Close()
 		return nil, fmt.Errorf("порт %s занят или недоступен: %w", addr, err)
 	}
-	s := &Server{cfg: cfg, st: st, bundle: bundle, ln: ln, startedMS: store.NowMS()}
+	s := &Server{cfg: cfg, st: st, bundle: bundle, ln: ln, startedMS: store.NowMS(), batchWait: telemetryBatchWait, session: idgen.NewV7()}
 	if err := s.ensureMonitorServiceRules(); err != nil {
 		log.Printf("monitor service rules: %v", err)
 	}
@@ -263,6 +274,9 @@ func Listen(cfg Config) (*Server, error) {
 		WriteTimeout: 90 * time.Second,
 		IdleTimeout:  120 * time.Second,
 		ErrorLog:     log.New(io.Discard, "", 0),
+	}
+	if err := s.ensureLive(); err != nil {
+		log.Printf("живое состояние: %v", err)
 	}
 	return s, nil
 }
@@ -328,14 +342,41 @@ func bumpTrusted(tx *sql.Tx) error {
 }
 
 func (s *Server) Close() error {
-	_ = s.http.Close()
+	s.closeOnce.Do(func() { s.closeErr = s.finishClose() })
+	return s.closeErr
+}
+
+func (s *Server) finishClose() error {
+	if s.http != nil {
+		_ = s.http.Close()
+	}
 	s.mu.Lock()
 	ln := s.ln
+	gate := s.gate
 	s.mu.Unlock()
 	if ln != nil {
 		_ = ln.Close()
 	}
-	return s.st.Close()
+	// Коммит приёма уже мог пройти, а публикация в очередь сброса — ещё нет.
+	// Сначала дождаться этой публикации, и только потом сбрасывать очередь.
+	if gate != nil {
+		gate.quiesce()
+	}
+	var ferr error
+	if s.st != nil {
+		ferr = s.st.Update(func(tx *sql.Tx) error { return s.flushQuestionRepeats(tx, store.NowMS()) })
+		if ferr == nil {
+			ferr = s.flushSSHBrute(store.NowMS())
+		}
+	}
+	var cerr error
+	if s.st != nil {
+		cerr = s.st.Close()
+	}
+	if ferr != nil {
+		return ferr
+	}
+	return cerr
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
@@ -430,6 +471,18 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "json", http.StatusBadRequest)
 		return
 	}
+	if f := batch.QuestionPendingFrom; f != nil {
+		if *f < 1 {
+			http.Error(w, "invalid question_pending_from", 400)
+			return
+		}
+		for _, ev := range batch.Events {
+			if !telemetryKind(ev.Kind) && ev.Seq < *f {
+				http.Error(w, "service event below question_pending_from", 400)
+				return
+			}
+		}
+	}
 	if batch.PendingFrom != nil {
 		if *batch.PendingFrom < 1 {
 			http.Error(w, "invalid pending_from", 400)
@@ -442,63 +495,79 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	ag.DeliveryLane = batch.Lane
+	if batch.AssignedThrough != nil {
+		if *batch.AssignedThrough < 0 {
+			http.Error(w, "invalid assigned_through", 400)
+			return
+		}
+		for _, ev := range batch.Events {
+			if ev.Seq > *batch.AssignedThrough {
+				http.Error(w, "event above assigned_through", 400)
+				return
+			}
+		}
+	}
 	if batch.Lane != "" && batch.Lane != "urgent" && batch.Lane != "history" && batch.Lane != "heartbeat" {
 		http.Error(w, "invalid delivery lane", 400)
 		return
 	}
+	if batch.Session != s.session {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, protocol.Ack{Session: s.session, Error: "session"})
+		return
+	}
+	ag.DeliveryLane = batch.Lane
 	now := store.NowMS()
 	src, _, _ := net.SplitHostPort(r.RemoteAddr)
-	var res ingest.Result
-	err = s.st.Update(func(tx *sql.Tx) error {
-		if err := tx.QueryRow(`SELECT trust_state FROM agents WHERE agent_id=?`, ag.ID).Scan(&ag.Trust); err != nil {
-			return err
-		}
-		if ag.Trust == "revoked" {
-			return fmt.Errorf("agent revoked")
-		}
-		if batch.PendingFrom != nil {
-			if err := ingest.ConfirmQueue(tx, ag.ID, *batch.PendingFrom); err != nil {
-				return err
-			}
-		}
-		res = ingest.ApplyBatchWithHooks(tx, ag, batch.Events, now, func(ev protocol.Event) error {
-			if ag.Trust == "trusted" && ev.Kind == "dns" {
-				return refreshDNS(tx, ev)
-			}
-			return nil
-		}, func(ev protocol.Event) error {
-			if ag.Trust != "trusted" || ev.Kind == "dns" {
-				return nil
-			}
-			return autoban(tx, ag, ev, now)
-		})
-		if res.Fatal != nil {
-			return res.Fatal
-		}
-		if err := closeCoveredQuestions(tx, ag.HostID, now); err != nil {
-			return err
-		}
-		var mon string
-		if err := tx.QueryRow(`SELECT v FROM settings WHERE k='monitor_host_id'`).Scan(&mon); err == nil && mon != "" && mon == ag.HostID {
-			if err := s.syncMonitorServiceRules(tx, mon); err != nil {
-				return err
-			}
-		}
-		_, err := tx.Exec(`UPDATE agents SET last_src_ip=? WHERE agent_id=?`, src, ag.ID)
-		return err
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	job := &batchJob{
+		ag:        ag,
+		batch:     batch,
+		now:       now,
+		src:       src,
+		ctx:       r.Context(),
+		immediate: batchImmediate(batch),
+		done:      make(chan struct{}),
+	}
+	s.enqueueBatch(job)
+	select {
+	case <-job.done:
+	case <-r.Context().Done():
+		return
+	}
+	if job.err != nil {
+		http.Error(w, job.err.Error(), http.StatusInternalServerError)
 		return
 	}
 	code := http.StatusOK
-	if res.Err != "" {
+	if job.res.Err != "" {
 		code = http.StatusConflict
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(protocol.Ack{Ack: res.Ack, Error: res.Err})
+	ack := protocol.Ack{Ack: job.res.Ack, Error: job.res.Err}
+	{
+		ack.Session = s.session
+	}
+	_ = json.NewEncoder(w).Encode(ack)
+}
+
+func (s *Server) applyAgentBatch(tx *sql.Tx, job *batchJob) (ingest.Result, error) {
+	ag := job.ag
+	var host string
+	if err := tx.QueryRow(`SELECT trust_state,host_id FROM agents WHERE agent_id=?`, ag.ID).Scan(&ag.Trust, &host); err != nil {
+		return ingest.Result{}, err
+	}
+	if host != ag.HostID {
+		return ingest.Result{}, fmt.Errorf("agent host changed")
+	}
+	if ag.Trust == "revoked" {
+		return ingest.Result{}, fmt.Errorf("agent revoked")
+	}
+	{
+		return s.applyServiceBatch(tx, job)
+	}
+
 }
 
 func defaults(cfg Config) Config {
@@ -538,6 +607,17 @@ func shellQuote(s string) string {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// Session — номер сеанса боевого монитора. Пустая строка у тестового сервера без Listen.
+func (s *Server) Session() string { return s.session }
+
+func (s *Server) writePoll(w http.ResponseWriter, agentID string, res protocol.PollRes) {
+
+	{
+		res.Session = s.session
+	}
+	writeJSON(w, res)
 }
 
 func listenIPs(host string) []net.IP {

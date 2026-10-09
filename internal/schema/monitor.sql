@@ -78,6 +78,53 @@ CREATE INDEX flows_remote ON flows(host_id, remote_ip_bin, first_seen_at_ms);
 CREATE INDEX flows_lport ON flows(host_id, direction, local_port, first_seen_at_ms);
 CREATE INDEX flows_rport ON flows(host_id, direction, remote_port, first_seen_at_ms);
 CREATE INDEX flows_noreply ON flows(host_id, first_seen_at_ms) WHERE reply_seen = 0;
+CREATE INDEX flows_open ON flows(last_seen_at_ms, flow_uid) WHERE ended_at_ms IS NULL;
+CREATE INDEX flows_open_host ON flows(host_id, last_seen_at_ms, flow_uid) WHERE ended_at_ms IS NULL;
+
+-- Снимок ещё открытых соединений. Закрытие удаляет строку отсюда, а не дописывает историю flows.
+CREATE TABLE open_flows(
+  flow_uid TEXT PRIMARY KEY,
+  state_seq INTEGER NOT NULL DEFAULT 0,
+  host_id TEXT NOT NULL REFERENCES hosts(host_id),
+  agent_id TEXT NOT NULL,
+  boot_id TEXT NOT NULL,
+  ct_id INTEGER,
+  zone TEXT, ns TEXT,
+  started_at_ms INTEGER,
+  first_seen_at_ms INTEGER NOT NULL,
+  last_seen_at_ms INTEGER NOT NULL,
+  ip_version INTEGER NOT NULL,
+  protocol TEXT NOT NULL,
+  orig_src_ip TEXT NOT NULL, orig_src_ip_bin BLOB NOT NULL, orig_src_port INTEGER,
+  orig_dst_ip TEXT NOT NULL, orig_dst_ip_bin BLOB NOT NULL, orig_dst_port INTEGER,
+  reply_src_ip TEXT, reply_dst_ip TEXT,
+  direction TEXT NOT NULL,
+  local_ip TEXT NOT NULL, local_ip_bin BLOB NOT NULL, local_port INTEGER,
+  remote_ip TEXT NOT NULL, remote_ip_bin BLOB NOT NULL, remote_port INTEGER,
+  remote_scope TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'host',
+  icmp_type INTEGER, icmp_code INTEGER,
+  state TEXT,
+  reply_seen INTEGER NOT NULL DEFAULT 0,
+  orig_bytes INTEGER, reply_bytes INTEGER,
+  orig_packets INTEGER, reply_packets INTEGER,
+  proc_path TEXT, proc_uid INTEGER, proc_cgroup TEXT, proc_comm TEXT,
+  container TEXT,
+  dns_name TEXT,
+  incomplete INTEGER NOT NULL DEFAULT 0,
+  received_at_ms INTEGER NOT NULL);
+CREATE INDEX open_flows_local ON open_flows(host_id, local_ip);
+CREATE INDEX open_flows_seen ON open_flows(last_seen_at_ms, flow_uid);
+
+-- Владелец закрытого соединения: чтобы проба после закрытия не зависала и не прилипла к чужому.
+-- Это не история: нет адресов, байтов и процесса. Срок — как у закрытых flows.
+CREATE TABLE flow_owner(
+  flow_uid TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  state_seq INTEGER NOT NULL,
+  closed_at_ms INTEGER NOT NULL);
+CREATE INDEX flow_owner_closed ON flow_owner(closed_at_ms);
 
 CREATE TABLE flow_samples(
   event_id TEXT PRIMARY KEY,
@@ -206,6 +253,14 @@ CREATE TABLE never_block(
   reason TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL);
 
+CREATE TABLE ssh_brute(
+  remote_ip TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  first_at_ms INTEGER NOT NULL,
+  last_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(remote_ip, host_id));
+
 CREATE TABLE blocks(
   block_id TEXT PRIMARY KEY,
   host_id TEXT,
@@ -225,7 +280,9 @@ CREATE TABLE blocks(
   expires_at_ms INTEGER,
   escalate_step INTEGER NOT NULL DEFAULT 0,
   applied_at_ms INTEGER, removed_at_ms INTEGER,
-  last_error TEXT);
+  last_error TEXT,
+  scan_ports TEXT,
+  scan_seen_ms INTEGER);
 CREATE INDEX blocks_state ON blocks(host_id, state, expires_at_ms);
 CREATE INDEX blocks_ip ON blocks(remote_ip_bin);
 

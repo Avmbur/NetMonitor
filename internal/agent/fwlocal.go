@@ -125,16 +125,26 @@ func (a *Agent) saveLocal(rev int64, p fw.Policy, c *localControl) error {
 			return err
 		}
 	}
-	return a.st.Update(func(tx *sql.Tx) error {
-		_, err := tx.Exec("INSERT INTO local_policy(object_key,kind,payload,desired_rev,applied_at_ms) VALUES('desired','fw',?,?,?) ON CONFLICT(object_key) DO UPDATE SET payload=excluded.payload,desired_rev=excluded.desired_rev,applied_at_ms=excluded.applied_at_ms", string(raw), rev, store.NowMS())
+	policyRaw := string(raw)
+	controlRaw := string(control)
+	if a.savedPolicy == policyRaw && a.savedControl == controlRaw {
+		return nil
+	}
+	err = a.st.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO local_policy(object_key,kind,payload,desired_rev,applied_at_ms) VALUES('desired','fw',?,?,?) ON CONFLICT(object_key) DO UPDATE SET payload=excluded.payload,desired_rev=excluded.desired_rev,applied_at_ms=excluded.applied_at_ms", policyRaw, rev, store.NowMS())
 		if err != nil {
 			return err
 		}
 		if c != nil {
-			_, err = tx.Exec("INSERT INTO meta(k,v) VALUES('fw_control',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", string(control))
+			_, err = tx.Exec("INSERT INTO meta(k,v) VALUES('fw_control',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", controlRaw)
 		}
 		return err
 	})
+	if err == nil {
+		a.savedPolicy = policyRaw
+		a.savedControl = controlRaw
+	}
+	return err
 }
 func (a *Agent) savePolicyLocked(rev int64, p fw.Policy) error { return a.saveLocal(rev, p, nil) }
 
@@ -414,10 +424,15 @@ func retryLinkWatch(stop <-chan struct{}, delay time.Duration, watch func() erro
 	}
 }
 
-func (a *Agent) watchdog() {
+func (a *Agent) watchdog(stop <-chan struct{}) {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
 		if err := a.reconcileOnce(); err != nil {
 			log.Printf("firewall restore: %v", err)
 		}

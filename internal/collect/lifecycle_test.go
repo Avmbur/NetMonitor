@@ -1,12 +1,10 @@
 package collect
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/netip"
 	"netmonitor/internal/protocol"
-	"netmonitor/internal/store"
 	"testing"
 	"time"
 )
@@ -20,37 +18,38 @@ func fixture() (Entry, DumpOpts) {
 	o := DumpOpts{HostID: "host", BootID: "boot", Namespace: "net:[123]", Local: []netip.Addr{src}, NowMS: 10000, MonoMS: 1000}
 	return e, o
 }
-func events(t *testing.T, st *store.Store, kind string) []json.RawMessage {
+func events(t *testing.T, st *Mem, kind string) []json.RawMessage {
 	t.Helper()
-	rows, e := st.DB.Query("SELECT payload FROM outbox WHERE kind=? ORDER BY seq", kind)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer rows.Close()
 	var out []json.RawMessage
-	for rows.Next() {
-		var s string
-		if e = rows.Scan(&s); e != nil {
-			t.Fatal(e)
+	for _, e := range st.ev {
+		if e.Kind == kind {
+			b, err := json.Marshal(e.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, b)
 		}
-		out = append(out, json.RawMessage(s))
-	}
-	if e = rows.Err(); e != nil {
-		t.Fatal(e)
 	}
 	return out
 }
-func TestLifecycleReuseAndRestart(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.OpenAgent(dir)
-	if err != nil {
-		t.Fatal(err)
+func eventPayload(t *testing.T, st *Mem, kind string, last bool) string {
+	t.Helper()
+	es := events(t, st, kind)
+	if len(es) == 0 {
+		t.Fatalf("missing %s", kind)
 	}
+	if last {
+		return string(es[len(es)-1])
+	}
+	return string(es[0])
+}
+func TestLifecycleReuseAndRestart(t *testing.T) {
+	st := NewMem()
 	e, o := fixture()
 	o.Process = func(Entry) Process { u := 1000; return Process{"curl", "/usr/bin/curl", "/user.slice", &u} }
 	apply := func(kind string) {
 		t.Helper()
-		if err := st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, e, kind, o) }); err != nil {
+		if err := st.ApplyEvent(e, kind, o); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -62,12 +61,7 @@ func TestLifecycleReuseAndRestart(t *testing.T) {
 	if f.ProcComm != "curl" || f.Incomplete != 0 {
 		t.Fatalf("%+v", f)
 	}
-	st.Close()
-	st, err = store.OpenAgent(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st = NewMem()
 	o.NowMS += 1000
 	o.MonoMS += 1000
 	e.OrigBytes += 40
@@ -108,39 +102,35 @@ func TestLifecycleReuseAndRestart(t *testing.T) {
 	}
 	// Old DESTROY cannot close the replacement.
 	old, _ := fixture()
-	if err = st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, old, "destroy", o) }); err != nil {
+	if err := st.ApplyEvent(old, "destroy", o); err != nil {
 		t.Fatal(err)
 	}
-	var raw string
-	st.DB.QueryRow("SELECT payload FROM checkpoints").Scan(&raw)
-	var cp checkpoint
-	json.Unmarshal([]byte(raw), &cp)
+	cp, ok, _ := st.loadCheckpoint(entryKey(e, o))
+	if !ok {
+		t.Fatal("missing checkpoint")
+	}
 	if cp.Flow.EndedAtMS != nil {
 		t.Fatal("late destroy closed replacement")
 	}
 }
 func TestDumpDoesNotCloseNewerEventAndMarksMissing(t *testing.T) {
-	st, e := store.OpenAgent(t.TempDir())
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer st.Close()
+	st := NewMem()
 	flow, o := fixture()
-	must := func(fn func(*sql.Tx) error) {
+	must := func(e error) {
 		t.Helper()
-		if e := st.Update(fn); e != nil {
+		if e != nil {
 			t.Fatal(e)
 		}
 	}
-	must(func(tx *sql.Tx) error { return ApplyEvent(tx, flow, "new", o) })
+	must(st.ApplyEvent(flow, "new", o))
 	o.NowMS += 1000
 	o.MonoMS += 1000
 	flow.CountersKnown = false
-	must(func(tx *sql.Tx) error { return ApplyEvent(tx, flow, "update", o) })
+	must(st.ApplyEvent(flow, "update", o))
 	o.NowMS += 1000
 	o.MonoMS += 1000
 	o.SnapshotMono = 1500
-	must(func(tx *sql.Tx) error { return ApplyDump(tx, nil, o) })
+	must(st.ApplyDump(nil, o))
 	for _, raw := range events(t, st, "flow") {
 		var f protocol.FlowPayload
 		json.Unmarshal(raw, &f)
@@ -149,7 +139,7 @@ func TestDumpDoesNotCloseNewerEventAndMarksMissing(t *testing.T) {
 		}
 	}
 	o.SnapshotMono = 3000
-	must(func(tx *sql.Tx) error { return ApplyDump(tx, nil, o) })
+	must(st.ApplyDump(nil, o))
 	fs := events(t, st, "flow")
 	var f protocol.FlowPayload
 	json.Unmarshal(fs[len(fs)-1], &f)
@@ -157,17 +147,51 @@ func TestDumpDoesNotCloseNewerEventAndMarksMissing(t *testing.T) {
 		t.Fatalf("%+v", f)
 	}
 }
-func TestClockJumpAndCounterReset(t *testing.T) {
-	st, e := store.OpenAgent(t.TempDir())
-	if e != nil {
-		t.Fatal(e)
+func TestQuietDumpKeepsObservationInterval(t *testing.T) {
+	st := NewMem()
+	e, o := fixture()
+	e.State = "ESTABLISHED"
+	e.Unreplied = false
+	e.Assured = true
+	e.OrigBytes = 1000
+	e.ReplyBytes = 10
+	e.OrigPackets = 8
+	e.ReplyPackets = 2
+	apply := func() {
+		t.Helper()
+		if err := st.ApplyDump([]Entry{e}, o); err != nil {
+			t.Fatal(err)
+		}
 	}
-	defer st.Close()
+	apply()
+	apply()
+	o.NowMS += 15000
+	o.MonoMS += 15000
+	apply()
+	e.OrigBytes += 500
+	o.NowMS += 15000
+	o.MonoMS += 15000
+	apply()
+	raws := events(t, st, "sample")
+	if len(raws) != 1 {
+		t.Fatalf("samples %d", len(raws))
+	}
+	var p protocol.SamplePayload
+	if err := json.Unmarshal(raws[0], &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.T1MS-p.T0MS != 15000 || p.OrigBytesDelta != 500 {
+		t.Fatalf("interval %+v", p)
+	}
+}
+
+func TestClockJumpAndCounterReset(t *testing.T) {
+	st := NewMem()
 	f, o := fixture()
 	o.NowMS = 1_000_000
 	apply := func() {
 		t.Helper()
-		if e := st.Update(func(tx *sql.Tx) error { return ApplyDump(tx, []Entry{f}, o) }); e != nil {
+		if e := st.ApplyDump([]Entry{f}, o); e != nil {
 			t.Fatal(e)
 		}
 	}
@@ -195,11 +219,7 @@ func TestClockJumpAndCounterReset(t *testing.T) {
 	}
 }
 func TestICMPUnknownCountersAndNoPorts(t *testing.T) {
-	st, e := store.OpenAgent(t.TempDir())
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer st.Close()
+	st := NewMem()
 	f, o := fixture()
 	typ, code := 8, 0
 	f.Protocol = "icmp"
@@ -208,7 +228,7 @@ func TestICMPUnknownCountersAndNoPorts(t *testing.T) {
 	f.OrigSport = nil
 	f.OrigDport = nil
 	f.CountersKnown = false
-	if e = st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, f, "new", o) }); e != nil {
+	if e := st.ApplyEvent(f, "new", o); e != nil {
 		t.Fatal(e)
 	}
 	var p protocol.FlowPayload
@@ -238,14 +258,10 @@ func TestFirewallAggregation(t *testing.T) {
 }
 
 func TestShortFlowCountsTrafficBeforeFirstDump(t *testing.T) {
-	st, err := store.OpenAgent(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := NewMem()
 	e, o := fixture()
 	e.CountersKnown = false
-	if err = st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, e, "new", o) }); err != nil {
+	if err := st.ApplyEvent(e, "new", o); err != nil {
 		t.Fatal(err)
 	}
 	// The entire flow fits in one millisecond and NEW contained no counters.
@@ -254,7 +270,7 @@ func TestShortFlowCountsTrafficBeforeFirstDump(t *testing.T) {
 	e.ReplyBytes = 80
 	e.OrigPackets = 2
 	e.ReplyPackets = 1
-	if err = st.Update(func(tx *sql.Tx) error { return ApplyEvent(tx, e, "destroy", o) }); err != nil {
+	if err := st.ApplyEvent(e, "destroy", o); err != nil {
 		t.Fatal(err)
 	}
 	ss := events(t, st, "sample")

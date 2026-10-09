@@ -34,7 +34,7 @@ func batchFixture(t *testing.T) (*Server, *x509.Certificate) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return &Server{st: st, cfg: Config{DataDir: dir}, startedMS: store.NowMS()}, cert
+	return &Server{st: st, cfg: Config{DataDir: dir}, startedMS: store.NowMS(), session: "test-session", streams: map[string]*serviceStream{"a": {instance: "test-process", lanes: map[string]int64{}}}}, cert
 }
 
 func scanEvent(id string, seq int64) protocol.Event {
@@ -44,7 +44,14 @@ func scanEvent(id string, seq int64) protocol.Event {
 
 func sendBatch(t *testing.T, s *Server, cert *x509.Certificate, events ...protocol.Event) (int, protocol.Ack) {
 	t.Helper()
-	raw, err := json.Marshal(protocol.Batch{Events: events})
+	instance := ""
+	{
+		instance = "test-process"
+		if _, err := s.registerStream(testAgentID(t, s, cert), instance); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := json.Marshal(protocol.Batch{Session: s.session, Instance: instance, Events: events})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +98,7 @@ func TestBatchPartialAckAndReplayAfterReopen(t *testing.T) {
 		t.Fatalf("replay: %d %+v", code, ack)
 	}
 	// audit_log: строка автобана и строка тревоги. Повтор события новых не добавляет.
-	for table, want := range map[string]int{"blocks": 1, "commands": 1, "audit_log": 2, "ingest_events": 1} {
+	for table, want := range map[string]int{"blocks": 1, "commands": 1, "audit_log": 2, "ingest_events": 0} {
 		var n int
 		if err := st.DB.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
 			t.Fatal(err)
@@ -114,7 +121,7 @@ func TestBatchEffectFailureAndCommitFailureNeverAck(t *testing.T) {
 				if _, err := tx.Exec(`CREATE TABLE deferred_failure(id TEXT REFERENCES hosts(host_id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
 					return err
 				}
-				_, err := tx.Exec(`CREATE TRIGGER fail_commit AFTER INSERT ON ingest_events BEGIN INSERT INTO deferred_failure VALUES('missing'); END`)
+				_, err := tx.Exec(`CREATE TRIGGER fail_commit AFTER INSERT ON blocks BEGIN INSERT INTO deferred_failure VALUES('missing'); END`)
 				return err
 			}); err != nil {
 				t.Fatal(err)
@@ -157,4 +164,13 @@ func TestPendingCannotAutoban(t *testing.T) {
 	if n != 0 {
 		t.Fatal("pending agent triggered autoban")
 	}
+}
+
+func testAgentID(t *testing.T, s *Server, cert *x509.Certificate) string {
+	t.Helper()
+	var id string
+	if err := s.st.DB.QueryRow("SELECT agent_id FROM agents WHERE cert_fingerprint=?", tlsutil.Fingerprint(cert.Raw)).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }

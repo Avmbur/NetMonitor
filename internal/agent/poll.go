@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"reflect"
+	"slices"
 	"time"
 
 	"netmonitor/internal/collect"
@@ -21,15 +22,24 @@ import (
 	"netmonitor/internal/svcnet"
 )
 
-func (a *Agent) pollLoop() {
+func (a *Agent) pollLoop(stop <-chan struct{}) {
 	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		delay := 200 * time.Millisecond
 		if err := a.pollOnce(); err != nil {
 			log.Printf("poll: %v", err)
 			// An application or ACK failure is not evidence of a lost monitor.
-			time.Sleep(2 * time.Second)
-			continue
+			delay = 2 * time.Second
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
 	}
 }
 
@@ -51,7 +61,11 @@ func (a *Agent) pollOnce() error {
 		}
 		unlock()
 	}
-	pr, err := a.exchangePoll(protocol.PollReq{Rev: rev, ConsumedOnce: consumed})
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	instance := a.instance
+	a.spoolMu.Unlock()
+	pr, err := a.exchangePoll(protocol.PollReq{Rev: rev, ConsumedOnce: consumed, Instance: instance})
 	if err != nil {
 		var networkError net.Error
 		if errors.As(err, &networkError) {
@@ -61,7 +75,14 @@ func (a *Agent) pollOnce() error {
 		}
 		return err
 	}
-	return a.applyPoll(pr)
+	if err := a.applyPoll(pr); err != nil {
+		return err
+	}
+	a.adoptSession(pr.Session)
+	if a.takeDump() {
+		a.dumpAll()
+	}
+	return nil
 }
 
 func (a *Agent) exchangePoll(in protocol.PollReq) (protocol.PollRes, error) {
@@ -192,8 +213,13 @@ func (a *Agent) adoptViewLocked(pr protocol.PollRes) {
 	}
 }
 func (a *Agent) applyPoll(pr protocol.PollRes) error {
+	a.beginNamePoll()
+	defer a.endNamePoll()
 	rules, reports := a.attachResolved(pr.Rules)
 	pr.Rules = rules
+	groups, groupReports := a.attachResolved(pr.Groups)
+	pr.Groups = groups
+	reports = append(reports, groupReports...)
 	for _, rec := range reports {
 		if err := a.Enqueue("dns", 6, rec); err != nil {
 			logAgentError("имя DNS", err)
@@ -313,6 +339,7 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 	}
 	var ack []string
 	uninstall := ""
+	stopID := ""
 	updateID, updatePayload := "", ""
 	for _, c := range pr.Commands {
 		status.CommandIDs = append(status.CommandIDs, c.ID)
@@ -320,6 +347,11 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 		switch c.Kind {
 		case "uninstall":
 			uninstall = c.ID
+		case "stop":
+			stopID = c.ID
+			if err == nil {
+				ack = append(ack, c.ID)
+			}
 		case "update":
 			updateID, updatePayload = c.ID, c.Payload
 		case svcnet.AdmitKind:
@@ -349,6 +381,17 @@ func (a *Agent) applyPoll(pr protocol.PollRes) error {
 		if removeErr := start(uninstall); removeErr != nil {
 			_ = sendUninstallResult(a.client, a.monitorURL(), protocol.UninstallResult{CommandID: uninstall, Phase: "failed", Error: removeErr.Error()})
 			return fmt.Errorf("schedule removal: %w", removeErr)
+		}
+	}
+	// Останавливаемся, только когда монитор принял подтверждение. Иначе команда
+	// осталась бы неподтверждённой, и агент гасил бы себя после каждого запуска.
+	if stopID != "" && slices.Contains(ack, stopID) && reportErr == nil {
+		start := a.startStop
+		if start == nil {
+			start = a.scheduleStop
+		}
+		if stopErr := start(stopID); stopErr != nil {
+			return fmt.Errorf("schedule stop: %w", stopErr)
 		}
 	}
 	if updateID != "" {

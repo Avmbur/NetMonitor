@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"netmonitor/internal/agent"
 )
@@ -41,7 +44,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer a.Close()
+	defer func() {
+		if err := a.Close(); err != nil {
+			log.Printf("agent close: %v", err)
+			os.Exit(1)
+		}
+	}()
 	if *enrollOnly {
 		if a.AlreadyKnown() {
 			fmt.Println("kept")
@@ -50,8 +58,19 @@ func main() {
 		fmt.Println("агент ожидает подтверждения")
 		return
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		a.Stop()
+	}()
 	fmt.Fprintf(os.Stderr, "nmagent %s agent_id=%s\n", agent.Version, a.ID())
 	if err := a.Run(); err != nil {
-		log.Fatal(err)
+		// log.Fatal bypasses deferred Close and would lose the in-memory spool.
+		log.Printf("agent run: %v", err)
+		if closeErr := a.Close(); closeErr != nil {
+			log.Printf("agent close: %v", closeErr)
+		}
+		os.Exit(1)
 	}
 }

@@ -19,15 +19,10 @@ type historyTable struct {
 // Only completed history is disposable. Live policy, queue receipts and
 // records needed by active detection are never candidates.
 var historyTables = []historyTable{
-	{"flow_samples", "t0_ms", "1", []string{"rowid"}},
-	{"firewall_events", "observed_at_ms", "1", []string{"rowid"}},
-	{"traffic_1m", "bucket_start_ms", "1", []string{"host_id", "bucket_start_ms", "direction", "remote_scope"}},
-	{"flows", "last_seen_at_ms", "ended_at_ms IS NOT NULL AND NOT EXISTS (SELECT 1 FROM flow_samples WHERE flow_samples.flow_uid=h.flow_uid)", []string{"rowid"}},
-	{"collector_health", "observed_at_ms", "kind!='alive'", []string{"rowid"}},
 	{"audit_log", "at_ms", "1", []string{"rowid"}},
 	{"learn_questions", "last_seen_ms", "status!='open'", []string{"rowid"}},
-	{"traffic_1h", "bucket_start_ms", "1", []string{"host_id", "bucket_start_ms", "direction", "remote_scope"}},
-	{"ssh_failures", "observed_at_ms", "observed_at_ms<:ssh_cut", []string{"rowid"}},
+	{"ssh_brute", "last_at_ms", "1", []string{"remote_ip", "host_id"}},
+	{"blocks", "created_at_ms", "state IN ('expired','removed') AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.block_id=h.block_id AND c.acked_at_ms IS NULL)", []string{"block_id"}},
 }
 
 func historyKey(h historyTable, prefix string) string {
@@ -36,6 +31,14 @@ func historyKey(h historyTable, prefix string) string {
 		keys[i] = prefix + k
 	}
 	return "json_array(" + strings.Join(keys, ",") + ")"
+}
+
+func prefixed(keys []string, prefix string) string {
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = prefix + k
+	}
+	return strings.Join(out, ",")
 }
 
 func (s *owner) prepareRotation() error {
@@ -84,22 +87,72 @@ func oldestHistorySQL() string {
 		key := historyKey(h, "h.")
 		parts[i] = fmt.Sprintf("SELECT * FROM (SELECT %d AS source,%s AS key,h.%s AS stamp FROM %s h WHERE (%s) AND NOT EXISTS (SELECT 1 FROM temp.rotation_touched t WHERE t.source=%d AND t.key=%s) ORDER BY h.%s LIMIT 1)", i, key, h.stamp, h.name, h.eligible, i, key, h.stamp)
 	}
-	return "SELECT source,key FROM (" + strings.Join(parts, " UNION ALL ") + ") ORDER BY stamp,source LIMIT 1"
+	return "SELECT source,key,stamp FROM (" + strings.Join(parts, " UNION ALL ") + ") ORDER BY stamp,source LIMIT 2"
 }
 
 var oldestHistory = oldestHistorySQL()
 
-func deleteOldestHistory(ctx context.Context, tx *sql.Tx, now int64) error {
-	var source int
-	var key string
-	err := tx.QueryRowContext(ctx, oldestHistory, sql.Named("ssh_cut", now-86400000)).Scan(&source, &key)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrDatabaseFull
-	}
+// Срезка пачкой: строки самой старой таблицы, которые старше любой строки
+// других таблиц. Порядок «старое первым» тот же, что при удалении по одной,
+// но поиск по всем таблицам идёт раз на пачку, а не на строку.
+// Пачка растёт с одной строки до 500: небольшое превышение лимита не должно
+// сразу удалять шестнадцать крупных записей. Между пачками проверяем свободное место.
+const (
+	rotationBatchFirst = 1
+	rotationBatch      = 500
+)
+
+func deleteOldestHistory(ctx context.Context, tx *sql.Tx, now int64, batch int) error {
+	rows, err := tx.QueryContext(ctx, oldestHistory)
 	if err != nil {
 		return err
 	}
+	var source int
+	var key string
+	var stamp, nextStamp sql.NullInt64
+	found, second := false, false
+	for rows.Next() {
+		var s int
+		var k string
+		var st sql.NullInt64
+		if err := rows.Scan(&s, &k, &st); err != nil {
+			rows.Close()
+			return err
+		}
+		if !found {
+			source, key, stamp, found = s, k, st, true
+		} else {
+			nextStamp, second = st, true
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrDatabaseFull
+	}
 	h := historyTables[source]
+	if h.name != "blocks" && batch > 1 && stamp.Valid && (!second || nextStamp.Valid && nextStamp.Int64 > stamp.Int64) {
+		cols := strings.Join(h.keys, ",")
+		bound := ""
+		var args []any
+		if second {
+			// Равные метки разных таблиц не трогаем пачкой: их рассудит удаление по одной.
+			bound = " AND h." + h.stamp + "<:next_stamp"
+			args = append(args, sql.Named("next_stamp", nextStamp.Int64))
+		}
+		q := fmt.Sprintf("DELETE FROM %s WHERE (%s) IN (SELECT %s FROM %s h WHERE (%s)%s AND NOT EXISTS (SELECT 1 FROM temp.rotation_touched t WHERE t.source=%d AND t.key=%s) ORDER BY h.%s LIMIT %d)",
+			h.name, cols, prefixed(h.keys, "h."), h.name, h.eligible, bound, source, historyKey(h, "h."), h.stamp, batch)
+		res, err := tx.ExecContext(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n > 0 {
+			return err
+		}
+	}
 	var args []any
 	decoder := json.NewDecoder(strings.NewReader(key))
 	decoder.UseNumber()
@@ -117,27 +170,55 @@ func deleteOldestHistory(ctx context.Context, tx *sql.Tx, now int64) error {
 			args[i] = v
 		}
 	}
+	if h.name == "blocks" {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM commands WHERE block_id=? AND acked_at_ms IS NOT NULL", args[0]); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM block_pause WHERE block_id=?", args[0]); err != nil {
+			return err
+		}
+	}
 	_, err = tx.ExecContext(ctx, "DELETE FROM "+h.name+" WHERE "+strings.Join(where, " AND "), args...)
 	return err
 }
 
-// Called once, after the caller has written but before COMMIT. Deletions and
-// the incoming data either commit together or roll back together.
+// Доля лимита, которую оставляем занятой после срезки. Остальное — свободные
+// страницы внутри файла: следующие записи занимают их и хвост не переносят.
+const capHeadroomPercent = 95
+
+// Перед COMMIT. Лимит файла — заданный размер без запаса под журнал (walReserve).
+// Пока страниц не больше лимита, файл не трогает.
+// Выше лимита срезает законченную историю, пока занято не больше 95%,
+// и одним incremental_vacuum возвращает хвост к лимиту. Уменьшение лимита
+// в настройках идёт тем же путём. Удаление и новая запись коммитятся вместе.
 func rotateHistory(ctx context.Context, tx *sql.Tx) error {
 	max, err := MonitorCapBytes(tx)
 	if err != nil {
 		return err
 	}
-	var pageSize, pages, free int64
+	var pageSize int64
 	if err := tx.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
 		return err
 	}
-	limit := max / pageSize
+	if pageSize < 1 {
+		pageSize = 4096
+	}
+	limit := (max - walReserve(max)) / pageSize
+	if limit < 1 {
+		limit = 1
+	}
+	target := limit * capHeadroomPercent / 100
+	if target < 1 {
+		target = 1
+	}
 	now := NowMS()
+	batch := rotationBatchFirst
+	var previousUsed, previousDeleted int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		var pages, free int64
 		if err := tx.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
 			return err
 		}
@@ -147,23 +228,75 @@ func rotateHistory(ctx context.Context, tx *sql.Tx) error {
 		if err := tx.QueryRow("PRAGMA freelist_count").Scan(&free); err != nil {
 			return err
 		}
-		if free > 0 {
-			// Consume every result row: incremental_vacuum can yield after each page.
-			rows, err := tx.Query(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages-limit))
+		used := pages - free
+		if used < 0 {
+			used = 0
+		}
+		if used <= target {
+			after, err := incrementalVacuum(tx, pages-limit)
 			if err != nil {
 				return err
 			}
-			for rows.Next() {
-			}
-			err = rows.Err()
-			rows.Close()
-			if err != nil {
-				return err
+			if after >= pages {
+				return ErrDatabaseFull
 			}
 			continue
 		}
-		if err := deleteOldestHistory(ctx, tx, now); err != nil {
+		// Once a batch has freed pages, use its actual yield to avoid doubling
+		// past the remaining target and deleting the whole tail of history.
+		if freed := previousUsed - used; freed > 0 && previousDeleted > 0 {
+			needed := ((used-target)*previousDeleted + freed - 1) / freed
+			if needed < 1 {
+				needed = 1
+			}
+			batch = min(batch, int(needed))
+		}
+		err := deleteOldestHistory(ctx, tx, now, batch)
+		if err == nil {
+			previousUsed = used
+			if err := tx.QueryRow("SELECT changes()").Scan(&previousDeleted); err != nil {
+				return err
+			}
+		}
+		if batch < rotationBatch {
+			batch = min(batch*2, rotationBatch)
+		}
+		if err != nil {
+			if errors.Is(err, ErrDatabaseFull) && free > 0 && used <= limit {
+				after, verr := incrementalVacuum(tx, pages-limit)
+				if verr != nil {
+					return verr
+				}
+				if after <= limit {
+					return nil
+				}
+			}
 			return err
 		}
 	}
+}
+
+func incrementalVacuum(tx *sql.Tx, pages int64) (int64, error) {
+	if pages < 1 {
+		var left int64
+		err := tx.QueryRow("PRAGMA page_count").Scan(&left)
+		return left, err
+	}
+	// incremental_vacuum отдаёт строку на каждую страницу.
+	rows, err := tx.Query(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages))
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	var left int64
+	if err := tx.QueryRow("PRAGMA page_count").Scan(&left); err != nil {
+		return 0, err
+	}
+	return left, nil
 }

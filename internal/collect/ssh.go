@@ -9,24 +9,16 @@ type SSHFail struct {
 	AtMS int64
 }
 
-var sshFailKind = regexp.MustCompile(`(?i)failed password|invalid user|failed publickey|authentication failure|connection closed by authenticating user|disconnected from authenticating user`)
-var sshFrom = regexp.MustCompile(`(?i)(?:from |rhost=)([0-9a-fA-F:.]+)`)
-var sshAuthIP = regexp.MustCompile(`(?i)authenticating user \S+ ([0-9a-fA-F:.]+) port`)
-var sshUser = regexp.MustCompile(`(?i)(?:for(?: invalid user)? |user )([^\s]+)`)
+// OpenSSH emits one terminal authentication result in addition to diagnostic
+// messages about invalid users, PAM and disconnects. Counting the diagnostics
+// too turns one wrong password into multiple attempts. The "none" method is
+// only an authentication-method probe and is not a credential attempt.
+var sshFailure = regexp.MustCompile(`(?i)^Failed (?:password|publickey|keyboard-interactive(?:/pam)?|hostbased|gssapi-with-mic) for (?:invalid user )?(\S+) from ([0-9a-fA-F:.]+) port [0-9]+\b`)
 
 func parseSSHMessage(msg string) (ip, user string, ok bool) {
-	if !sshFailKind.MatchString(msg) {
-		return "", "", false
-	}
-	m := sshFrom.FindStringSubmatch(msg)
-	if m == nil {
-		m = sshAuthIP.FindStringSubmatch(msg)
-	}
+	m := sshFailure.FindStringSubmatch(msg)
 	if m == nil {
 		return "", "", false
 	}
-	if um := sshUser.FindStringSubmatch(msg); len(um) > 1 {
-		user = um[1]
-	}
-	return m[1], user, true
+	return m[2], m[1], true
 }

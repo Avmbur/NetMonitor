@@ -13,14 +13,18 @@ type capQuery interface {
 }
 
 func MonitorCapBytes(q capQuery) (int64, error) {
-	var raw, gb string
+	var raw, mb, gb string
 	if err := q.QueryRowContext(context.Background(), `SELECT
   COALESCE((SELECT v FROM settings WHERE k='db_max_bytes'),''),
-  COALESCE((SELECT v FROM settings WHERE k='db_max_gb'),'2')`).Scan(&raw, &gb); err != nil {
+  COALESCE((SELECT v FROM settings WHERE k='db_max_mb'),''),
+  COALESCE((SELECT v FROM settings WHERE k='db_max_gb'),'2')`).Scan(&raw, &mb, &gb); err != nil {
 		return 0, err
 	}
 	if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
 		return n, nil
+	}
+	if n, err := strconv.ParseInt(mb, 10, 64); err == nil && n > 0 {
+		return n << 20, nil
 	}
 	n, err := strconv.ParseInt(gb, 10, 64)
 	if err != nil || n < 1 {
@@ -40,6 +44,17 @@ func sqliteFileBytes(path string) int64 {
 	return s.Size()
 }
 
+// Место под журнал внутри заданного размера: ротация держит файл базы ниже
+// лимита на этот запас, иначе «файл + журнал > лимита» сливало бы журнал
+// на каждой записи у потолка.
+func walReserve(max int64) int64 {
+	reserve := max / 16
+	if reserve > 32<<20 {
+		reserve = 32 << 20
+	}
+	return reserve
+}
+
 // Allow bounded transaction workspace; rotateHistory enforces the configured
 // page limit before COMMIT.
 // A long reader cannot allow successive writes to grow WAL without a bound.
@@ -48,10 +63,7 @@ func (s *owner) monitorWriteLimit() error {
 	if err != nil {
 		return err
 	}
-	reserve := max / 16
-	if reserve > 32<<20 {
-		reserve = 32 << 20
-	}
+	reserve := walReserve(max)
 	var pageSize int64
 	if err := s.conn.QueryRowContext(context.Background(), "PRAGMA page_size").Scan(&pageSize); err != nil {
 		return err

@@ -409,7 +409,7 @@ func monitorRuleSame(a, b policy.Rule) bool {
 	if len(a.Hosts) != len(b.Hosts) || len(a.Match.Networks) != len(b.Match.Networks) || !reflect.DeepEqual(a.Match.Bindings, b.Match.Bindings) || !slices.Equal(a.Match.OnDemand, b.Match.OnDemand) {
 		return false
 	}
-	if (a.Hosts == nil) != (b.Hosts == nil) {
+	if a.Hosts == nil != (b.Hosts == nil) {
 		return false
 	}
 	for i := range a.Hosts {

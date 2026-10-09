@@ -35,6 +35,7 @@ func feed(t *testing.T, s *Server) map[string]uiAlert {
 func TestSilentAgentAlertLifecycle(t *testing.T) {
 	s, _ := batchFixture(t)
 	now := store.NowMS()
+	s.hostSeen = map[string]int64{"h": now - silentAfterMS - 1000}
 	if _, err := s.st.DB.Exec(`UPDATE hosts SET hostname='dev-redis', last_seen_ms=? WHERE host_id='h'`, now-silentAfterMS-1000); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,7 @@ func TestSilentAgentAlertLifecycle(t *testing.T) {
 		t.Fatalf("молчание: %+v", a)
 	}
 	// Минута тишины — ещё не повод.
-	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=? WHERE host_id='h'`, now-60_000)
+	s.hostSeen["h"] = now - 60000
 	if err := s.sweepAlerts(now); err != nil {
 		t.Fatal(err)
 	}
@@ -64,14 +65,43 @@ func TestSilentAgentAlertLifecycle(t *testing.T) {
 		t.Fatalf("журнал: %d", n)
 	}
 	// Видел, пока была красной, — закрылась сама уже зелёной.
-	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=? WHERE host_id='h'`, now-silentAfterMS-1000)
+	s.hostSeen["h"] = now - silentAfterMS - 1000
 	s.sweepAlerts(now + 1)
 	a = feed(t, s)["silent/h"]
 	alertOp(t, s, a.ID, "seen", 200)
-	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=? WHERE host_id='h'`, now)
+	s.hostSeen["h"] = now
 	s.sweepAlerts(now + 2)
 	if a = feed(t, s)["silent/h"]; a.State != "green" {
 		t.Fatalf("видел до закрытия: %+v", a)
+	}
+}
+
+func TestServiceDiskSilenceFollowsPulse(t *testing.T) {
+	s, _ := batchFixture(t)
+
+	now := store.NowMS()
+	if _, err := s.st.DB.Exec(`UPDATE hosts SET hostname='dev-redis', last_seen_ms=? WHERE host_id='h'`, now-silentAfterMS-1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.sweepAlerts(now); err != nil {
+		t.Fatal(err)
+	}
+	if a := feed(t, s)["silent/h"]; a.State == "red" {
+		t.Fatalf("старая метка в базе открыла тревогу: %+v", a)
+	}
+	s.hostSeen = map[string]int64{"h": now}
+	if err := s.sweepAlerts(now); err != nil {
+		t.Fatal(err)
+	}
+	if a := feed(t, s)["silent/h"]; a.State == "red" {
+		t.Fatalf("свежий пульс всё ещё молчание: %+v", a)
+	}
+	s.hostSeen["h"] = now - silentAfterMS - 1000
+	if err := s.sweepAlerts(now); err != nil {
+		t.Fatal(err)
+	}
+	if a := feed(t, s)["silent/h"]; a.State != "red" {
+		t.Fatalf("тихий пульс не открыл тревогу: %+v", a)
 	}
 }
 

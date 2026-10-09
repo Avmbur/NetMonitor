@@ -202,3 +202,132 @@ func TestRepeatedDNSAnswerKeepsPolicyRev(t *testing.T) {
 		t.Fatalf("same batch: code=%d ack=%+v rev=%d", code, ack, rev())
 	}
 }
+
+func TestFreshDNSPairClosesOpenQuestions(t *testing.T) {
+	s, cert := batchFixture(t)
+	groupReq(t, s, `{"name":"ubuntu","policy":"allow","members":"motd.ubuntu.com\n*.ubuntu.com","hosts":["h"]}`, 200)
+	old := netip.MustParseAddr("203.0.113.5")
+	if _, err := s.st.DB.Exec(`INSERT INTO dns_seen(host_id,name,ip_bin,ip,first_seen_ms,last_seen_ms) VALUES(?,?,?,?,?,?)`,
+		"h", "motd.ubuntu.com", netipx.Bin16(old), netipx.Canonical(old), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(id, ip string) {
+		t.Helper()
+		if _, err := s.st.DB.Exec(`INSERT INTO learn_questions(question_id,host_id,dedup_key,opened_at_ms,repeats,last_seen_ms,direction,protocol,remote_ip,remote_port,status)
+			VALUES(?,?,?,1,1,1,'out','tcp',?,443,'open')`, id, "h", id, ip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("q-old", old.String())
+	insert("q-new", "203.0.113.6")
+	insert("q-other", "198.51.100.9")
+	rev := func() int64 {
+		t.Helper()
+		var v int64
+		if err := s.st.DB.QueryRow(`SELECT policy_rev FROM agents WHERE host_id='h'`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	status := func(id string) string {
+		t.Helper()
+		var st string
+		if err := s.st.DB.QueryRow(`SELECT status FROM learn_questions WHERE question_id=?`, id).Scan(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	before := rev()
+	dnsEv := func(id string, seq int64, name, ip string) protocol.Event {
+		raw, _ := json.Marshal(protocol.DNSPayload{Name: name, IP: ip, Kind: "a"})
+		return protocol.Event{EventID: id, Seq: seq, Kind: "dns", ObservedAtMS: store.NowMS(), Payload: raw}
+	}
+	code, ack := sendBatch(t, s, cert,
+		dnsEv("again", 1, "motd.ubuntu.com", old.String()),
+		dnsEv("foreign", 2, "example.org", "203.0.113.8"))
+	if code != 200 || len(ack.Ack) != 2 || rev() != before {
+		t.Fatalf("repeat batch code=%d ack=%+v rev=%d before=%d", code, ack, rev(), before)
+	}
+	if status("q-old") != "open" || status("q-new") != "open" || status("q-other") != "open" {
+		t.Fatalf("repeat closed %s %s %s", status("q-old"), status("q-new"), status("q-other"))
+	}
+	code, ack = sendBatch(t, s, cert,
+		dnsEv("again2", 3, "motd.ubuntu.com", old.String()),
+		dnsEv("foreign2", 4, "example.org", "203.0.113.8"),
+		dnsEv("fresh", 5, "motd.ubuntu.com", "203.0.113.6"))
+	if code != 200 || len(ack.Ack) != 3 || rev() != before+1 {
+		t.Fatalf("fresh batch code=%d ack=%+v rev=%d", code, ack, rev())
+	}
+	if status("q-old") != "answered" || status("q-new") != "answered" || status("q-other") != "open" {
+		t.Fatalf("fresh %s %s %s", status("q-old"), status("q-new"), status("q-other"))
+	}
+}
+
+// Пара в dns_seen общая: второй сервер её уже не пришлёт, его вопрос закрывает первый.
+func TestFreshDNSPairClosesOtherHostQuestions(t *testing.T) {
+	s, cert := batchFixture(t)
+	if _, err := s.st.DB.Exec(`INSERT INTO hosts(host_id) VALUES('h2')`); err != nil {
+		t.Fatal(err)
+	}
+	groupReq(t, s, `{"name":"ubuntu","policy":"allow","members":"motd.ubuntu.com","hosts":["h","h2"]}`, 200)
+	if _, err := s.st.DB.Exec(`INSERT INTO learn_questions(question_id,host_id,dedup_key,opened_at_ms,repeats,last_seen_ms,direction,protocol,remote_ip,remote_port,status)
+		VALUES('q2','h2','q2',1,1,1,'out','tcp','203.0.113.6',443,'open')`); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(protocol.DNSPayload{Name: "motd.ubuntu.com", IP: "203.0.113.6", Kind: "a"})
+	code, ack := sendBatch(t, s, cert, protocol.Event{EventID: "fresh", Seq: 1, Kind: "dns", ObservedAtMS: store.NowMS(), Payload: raw})
+	if code != 200 || len(ack.Ack) != 1 {
+		t.Fatalf("batch %d %+v", code, ack)
+	}
+	var st string
+	if err := s.st.DB.QueryRow(`SELECT status FROM learn_questions WHERE question_id='q2'`).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != "answered" {
+		t.Fatal("question on the other host stayed open:", st)
+	}
+}
+
+func TestRuleNamesResolveTogether(t *testing.T) {
+	s, _ := batchFixture(t)
+	r := policy.Rule{ID: "two", Version: 1, Enabled: true, Action: "allow", Name: "two",
+		Match: policy.Match{Names: []string{"alpha.test", "*.beta.test"}}}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.st.DB.Exec(`INSERT INTO policy_rules(rule_id,version,sort_order,payload) VALUES('two',1,1,?)`, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	add := func(name, ip string) {
+		t.Helper()
+		a := netip.MustParseAddr(ip)
+		if _, err := s.st.DB.Exec(`INSERT INTO dns_seen(host_id,name,ip_bin,ip,first_seen_ms,last_seen_ms) VALUES('h',?,?,?,1,1)`,
+			name, netipx.Bin16(a), netipx.Canonical(a)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("alpha.test", "203.0.113.20")
+	add("www.beta.test", "203.0.113.21")
+	add("beta.test", "203.0.113.22")
+	add("notbeta.test", "203.0.113.23")
+	rs, err := hostRules(s.st.DB, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nets []string
+	for _, rule := range rs {
+		if rule.ID == "two" {
+			nets = rule.Match.Networks
+		}
+	}
+	joined := strings.Join(nets, ",")
+	for _, want := range []string{"203.0.113.20/32", "203.0.113.21/32", "203.0.113.22/32"} {
+		if !strings.Contains(joined, want) {
+			t.Fatal(nets)
+		}
+	}
+	if strings.Contains(joined, "203.0.113.23/32") {
+		t.Fatal(nets)
+	}
+}

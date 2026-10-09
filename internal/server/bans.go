@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,8 @@ type banSpec struct {
 	Reason    string
 	Source    string
 	CreatedBy string
+	ScanPorts string // порты, из-за которых поставлен бан скана; пусто у остальных
+	ScanSeen  int64  // время обнаружения скана, мс
 }
 
 type banRecord struct {
@@ -171,6 +174,31 @@ func readScope(kind, hostID, hostsJSON, exceptJSON string) (hosts, except []stri
 	return hosts, except, nil
 }
 
+func joinScanPorts(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	sorted := append([]int(nil), ports...)
+	sort.Ints(sorted)
+	parts := make([]string, len(sorted))
+	for i, p := range sorted {
+		parts[i] = strconv.Itoa(p)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func splitScanPorts(stored string) []string {
+	raw := strings.Split(stored, ",")
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 const banColumns = `block_id,scope_kind,COALESCE(host_id,''),COALESCE(hosts_json,''),COALESCE(except_json,''),
 	COALESCE(remote_ip,''),COALESCE(protocol,''),COALESCE(port,0),COALESCE(local_port,0),direction,
 	COALESCE(expires_at_ms,0),state,reason,source,created_by,created_at_ms,COALESCE(updated_at_ms,created_at_ms),version,escalate_step,COALESCE(removed_at_ms,0)`
@@ -247,6 +275,13 @@ func writeBan(tx *sql.Tx, b banSpec, now int64) (string, error) {
 	if b.LocalPort > 0 {
 		localPort = b.LocalPort
 	}
+	var scanPorts, scanSeen any
+	if b.ScanPorts != "" {
+		scanPorts = b.ScanPorts
+	}
+	if b.ScanSeen > 0 {
+		scanSeen = b.ScanSeen
+	}
 	direction := b.Direction
 	if direction == "" {
 		direction = "both"
@@ -255,10 +290,10 @@ func writeBan(tx *sql.Tx, b banSpec, now int64) (string, error) {
 		b.ID = idgen.NewV7()
 		if _, err := tx.Exec(
 			`INSERT INTO blocks(block_id, host_id, scope_kind, hosts_json, except_json, remote_ip, remote_ip_bin,
-			  protocol, port, local_port, direction, state, reason, source, created_by, created_at_ms, updated_at_ms, expires_at_ms, escalate_step)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?)`,
+			  protocol, port, local_port, direction, state, reason, source, created_by, created_at_ms, updated_at_ms, expires_at_ms, escalate_step, scan_ports, scan_seen_ms)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?)`,
 			b.ID, hostID, kind, hostsJSON, exceptJSON, ip, bin,
-			protocol, port, localPort, direction, b.Reason, b.Source, b.CreatedBy, now, now, expires, b.Escalate,
+			protocol, port, localPort, direction, b.Reason, b.Source, b.CreatedBy, now, now, expires, b.Escalate, scanPorts, scanSeen,
 		); err != nil {
 			return "", err
 		}
@@ -604,7 +639,7 @@ func removeBan(tx *sql.Tx, id, actor string, now int64) error {
 }
 
 func auditBan(tx *sql.Tx, actor, action string, b banSpec, now int64) error {
-	detail := scopeLabel(b.Hosts, b.Except)
+	detail := scopeLabel(namedHosts(tx, b.Hosts), namedHosts(tx, b.Except))
 	if b.ExpiresAt > 0 {
 		detail += " · до " + time.UnixMilli(b.ExpiresAt).UTC().Format("2006-01-02 15:04:05")
 	} else {

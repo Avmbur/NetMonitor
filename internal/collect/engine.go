@@ -1,16 +1,14 @@
 package collect
 
 import (
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 
 	"netmonitor/internal/idgen"
 	"netmonitor/internal/netipx"
-	"netmonitor/internal/outbox"
 	"netmonitor/internal/protocol"
 )
 
@@ -27,8 +25,11 @@ type DumpOpts struct {
 	ObserveDocker             bool
 	// Snapshot began before its netlink request. Newer events cannot be closed by it.
 	SnapshotMono int64
-	Process      func(Entry) Process
-	Container    func(string) string
+	// Resend — дамп для нового сеанса монитора: каждое соединение уходит заново,
+	// даже без перемен. Иначе после рестарта монитора тихие сессии не видны.
+	Resend    bool
+	Process   func(Entry) Process
+	Container func(string) string
 }
 type checkpoint struct {
 	Flow           protocol.FlowPayload
@@ -45,34 +46,7 @@ func entryKey(e Entry, opt DumpOpts) string {
 	e.Namespace = ns
 	return opt.BootID + "/" + ns + "/" + e.TupleKey()
 }
-func loadCheckpoint(tx *sql.Tx, key string) (checkpoint, bool, error) {
-	var c checkpoint
-	var raw string
-	err := tx.QueryRow("SELECT payload FROM checkpoints WHERE flow_key=?", key).Scan(&raw)
-	if err == sql.ErrNoRows {
-		return c, false, nil
-	}
-	if err != nil {
-		return c, false, err
-	}
-	err = json.Unmarshal([]byte(raw), &c)
-	return c, true, err
-}
-func saveCheckpoint(tx *sql.Tx, key string, c checkpoint) error {
-	b, e := json.Marshal(c)
-	if e != nil {
-		return e
-	}
-	_, e = tx.Exec("INSERT INTO checkpoints(flow_key,payload) VALUES(?,?) ON CONFLICT(flow_key) DO UPDATE SET payload=excluded.payload", key, string(b))
-	return e
-}
-func ApplyEvent(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
-	if Skip(e, opt.Monitor, opt.MonitorPort) {
-		return nil
-	}
-	return observe(tx, e, kind, opt)
-}
-func ApplyDump(tx *sql.Tx, entries []Entry, opt DumpOpts) error {
+func applyDump(st *Mem, entries []Entry, opt DumpOpts) error {
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		if Skip(e, opt.Monitor, opt.MonitorPort) {
@@ -80,32 +54,18 @@ func ApplyDump(tx *sql.Tx, entries []Entry, opt DumpOpts) error {
 		}
 		key := entryKey(e, opt)
 		seen[key] = true
-		if err := observe(tx, e, "dump", opt); err != nil {
+		if err := observe(st, e, "dump", opt); err != nil {
 			return err
 		}
 	}
-	rows, err := tx.Query("SELECT flow_key,payload FROM checkpoints")
+	have, err := st.checkpoints()
 	if err != nil {
 		return err
 	}
-	type missing struct {
-		key string
-		c   checkpoint
-	}
-	var gone []missing
-	for rows.Next() {
-		var key, raw string
-		if err = rows.Scan(&key, &raw); err != nil {
-			rows.Close()
-			return err
-		}
+	var gone []string
+	for key, c := range have {
 		if seen[key] {
 			continue
-		}
-		var c checkpoint
-		if err = json.Unmarshal([]byte(raw), &c); err != nil {
-			rows.Close()
-			return err
 		}
 		// A checkpoint from another boot is historical, not evidence of an application close.
 		if c.Flow.EndedAtMS != nil || c.Flow.BootID != opt.BootID {
@@ -114,20 +74,15 @@ func ApplyDump(tx *sql.Tx, entries []Entry, opt DumpOpts) error {
 		if opt.SnapshotMono > 0 && c.SeenMono > opt.SnapshotMono {
 			continue
 		}
-		gone = append(gone, missing{key, c})
+		gone = append(gone, key)
 	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	for _, g := range gone {
-		if err = closeCheckpoint(tx, g.key, g.c, opt, "unknown"); err != nil {
+	sort.Strings(gone)
+	for _, key := range gone {
+		if err = closeCheckpoint(st, key, have[key], opt, "unknown"); err != nil {
 			return err
 		}
 	}
-	_, err = tx.Exec("DELETE FROM checkpoints WHERE (json_extract(payload,'$.Flow.ended_at_ms') IS NOT NULL AND json_extract(payload,'$.SeenMono')<?) OR json_extract(payload,'$.Flow.boot_id')<>?", opt.MonoMS-600000, opt.BootID)
-	return err
+	return st.deleteStaleCheckpoints(opt.MonoMS-600000, opt.BootID)
 }
 func sameInstance(c checkpoint, e Entry) bool {
 	if c.Entry.CTID != nil && e.CTID != nil && *c.Entry.CTID != *e.CTID {
@@ -138,10 +93,10 @@ func sameInstance(c checkpoint, e Entry) bool {
 	}
 	return true
 }
-func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
+func observe(st *Mem, e Entry, kind string, opt DumpOpts) error {
 	e.Namespace = opt.Namespace
 	key := entryKey(e, opt)
-	prev, exists, err := loadCheckpoint(tx, key)
+	prev, exists, err := st.loadCheckpoint(key)
 	if err != nil {
 		return err
 	}
@@ -156,7 +111,7 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 		if kind == "destroy" {
 			return nil
 		}
-		if err = closeCheckpoint(tx, key, prev, opt, "unknown"); err != nil {
+		if err = closeCheckpoint(st, key, prev, opt, "unknown"); err != nil {
 			return err
 		}
 		exists = false
@@ -244,9 +199,9 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 	metadataChanged := exists && (fp.Container != prev.Flow.Container || fp.Origin != prev.Flow.Origin ||
 		fp.Direction != prev.Flow.Direction || fp.LocalIP != prev.Flow.LocalIP || fp.RemoteIP != prev.Flow.RemoteIP ||
 		fp.ProcComm != prev.Flow.ProcComm || fp.ProcPath != prev.Flow.ProcPath || fp.ProcCgroup != prev.Flow.ProcCgroup)
-	sendFlow := !exists || kind != "dump" || pri == 5 || procNew || metadataChanged
+	sendFlow := !exists || kind != "dump" || pri == 5 || procNew || metadataChanged || opt.Resend
 	if sendFlow {
-		if err = enqueue(tx, "flow", pri, fp, opt.NowMS); err != nil {
+		if err = st.enqueue("flow", pri, fp, opt.NowMS); err != nil {
 			return err
 		}
 	}
@@ -262,7 +217,7 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 		}
 		wallDelta := opt.NowMS - prev.WallMS
 		if abs(wallDelta-dt) > 2000 {
-			if err = enqueue(tx, "health", 10, protocol.HealthPayload{Kind: "clock_jump", Note: fmt.Sprintf("wall=%d monotonic=%d", wallDelta, dt)}, opt.NowMS); err != nil {
+			if err = st.enqueue("health", 10, protocol.HealthPayload{Kind: "clock_jump", Note: fmt.Sprintf("wall=%d monotonic=%d", wallDelta, dt)}, opt.NowMS); err != nil {
 				return err
 			}
 		}
@@ -278,7 +233,7 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 			sp.Incomplete = 1
 		}
 		if ds[0]+ds[1]+ds[2]+ds[3] > 0 || quality != "ok" {
-			if err = enqueue(tx, "sample", 0, sp, opt.NowMS); err != nil {
+			if err = st.enqueue("sample", 0, sp, opt.NowMS); err != nil {
 				return err
 			}
 		}
@@ -304,9 +259,9 @@ func observe(tx *sql.Tx, e Entry, kind string, opt DumpOpts) error {
 		e.OrigPackets = 0
 		e.ReplyPackets = 0
 	}
-	return saveCheckpoint(tx, key, checkpoint{Flow: fp, Entry: e, MonoMS: mono, WallMS: wall, SeenMono: opt.MonoMS})
+	return st.saveCheckpoint(key, checkpoint{Flow: fp, Entry: e, MonoMS: mono, WallMS: wall, SeenMono: opt.MonoMS})
 }
-func closeCheckpoint(tx *sql.Tx, key string, c checkpoint, opt DumpOpts, reason string) error {
+func closeCheckpoint(st *Mem, key string, c checkpoint, opt DumpOpts, reason string) error {
 	if c.Flow.EndedAtMS != nil {
 		return nil
 	}
@@ -314,11 +269,11 @@ func closeCheckpoint(tx *sql.Tx, key string, c checkpoint, opt DumpOpts, reason 
 	c.Flow.EndedAtMS = &end
 	c.Flow.LastSeenMS = end
 	c.Flow.CloseReason = reason
-	if err := enqueue(tx, "flow", 5, c.Flow, opt.NowMS); err != nil {
+	if err := st.enqueue("flow", 5, c.Flow, opt.NowMS); err != nil {
 		return err
 	}
 	c.SeenMono = opt.MonoMS
-	return saveCheckpoint(tx, key, c)
+	return st.saveCheckpoint(key, c)
 }
 func makeFlow(e Entry, opt DumpOpts) protocol.FlowPayload {
 	dir, lip, rip, lp, rp := ClassifyNets(e, opt.Local, opt.DockerNets)
@@ -449,7 +404,4 @@ func abs(n int64) int64 {
 		return -n
 	}
 	return n
-}
-func enqueue(tx *sql.Tx, kind string, pri int, p any, now int64) error {
-	return outbox.Insert(tx, kind, pri, p, now)
 }

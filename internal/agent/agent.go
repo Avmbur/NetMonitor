@@ -35,7 +35,7 @@ import (
 )
 
 // Version — версия сборки; tools/build_release.py ставит сюда метку релиза.
-var Version = "1.0.5"
+var Version = "1.0.6"
 
 type Config struct {
 	Pin         string
@@ -54,6 +54,7 @@ type firewall interface {
 type Agent struct {
 	startRemoval  func(string) error         // Optional test seam; production uses the durable worker.
 	startUpdate   func(string, string) error // Optional test seam; production replaces the binary.
+	startStop     func(string) error         // Optional test seam; production stops the service.
 	updating      string                     // Команда обновления, уже запущенная этим процессом.
 	managed       bool
 	rules, groups []pol.Rule
@@ -82,16 +83,40 @@ type Agent struct {
 	dockerNets    []netip.Prefix
 	// Имена контейнеров под своим мьютексом: читаются и из транзакции сборщика,
 	// где ждать fwMu нельзя (применение политики держит fwMu и ждёт БД).
-	contMu        sync.Mutex
-	containers    map[string]string
-	containersAt  time.Time
-	containerNets []netip.Prefix
-	nameMu        sync.Mutex
-	resolved      map[string]resolvedName
-	observeDocker bool
-	skipIfaces    map[string]bool
-	mode          string
-	asked         map[string]time.Time
+	contMu          sync.Mutex
+	containers      map[string]string
+	containersAt    time.Time
+	containerNets   []netip.Prefix
+	nameMu          sync.Mutex
+	resolved        map[string]resolvedName
+	namePoll        bool
+	nameRefreshLeft int
+	observeDocker   bool
+	skipIfaces      map[string]bool
+	mode            string
+	asked           map[string]time.Time
+	savedPolicy     string
+	savedControl    string
+	sshCursor       string
+	telemetrySince  int64
+	ctFailures      map[string]uint64
+	instance        string
+	session         string
+	memSeq          int64
+	needDump        bool
+	// book — оперативные checkpoints сборщика. plan — ещё не сброшенные
+	// flow/sample/firewall. Оба живут до плановой записи.
+	book *collect.Mem
+	plan *planQueue
+	stop chan struct{}
+	// Lock order: spoolMu -> store writer -> book/plan. Writer callbacks never take spoolMu.
+	spoolMu     sync.Mutex
+	spoolClosed bool
+	// diskIdle — по полосе доставки: последний сбор ничего не нашёл на диске.
+	// Пока флаг стоит, пустой опрос не открывает запись. Новое событие его снимает.
+	diskIdle  map[string]bool
+	spoolOnce sync.Once
+	stopOnce  sync.Once
 }
 
 func Open(cfg Config) (*Agent, error) {
@@ -108,10 +133,28 @@ func Open(cfg Config) (*Agent, error) {
 		return nil, err
 	}
 	a.skipIfaces = loadSkipIfaces(cfg.DataDir, st.DB)
+	a.prepareSpool()
+	if err := a.recoverSpool(); err != nil {
+		st.Close()
+		return nil, err
+	}
 	return a, nil
 }
 
-func (a *Agent) Close() error { return a.st.Close() }
+func (a *Agent) Close() error {
+	if a.st == nil {
+		return nil
+	}
+	a.Stop()
+	a.spoolMu.Lock()
+	defer a.spoolMu.Unlock()
+	if a.spoolClosed {
+		return nil
+	}
+	a.spoolClosed = true
+	// No collector or acknowledgement can cross the final snapshot.
+	return a.st.Close()
+}
 
 func (a *Agent) ID() string { return a.id }
 
@@ -349,11 +392,40 @@ func (a *Agent) loadClient() error {
 	return nil
 }
 
+// outItem — одно событие очереди. Пачка дампа копится в памяти и пишется одним коммитом.
+type outItem struct {
+	kind    string
+	pri     int
+	payload any
+}
+
 func (a *Agent) Enqueue(kind string, priority int, payload any) error {
-	return a.st.Update(func(tx *sql.Tx) error { return enqueueTx(tx, kind, priority, payload) })
+	return a.acceptMem([]collect.MemEvent{{Kind: kind, Pri: priority, Payload: payload, Now: store.NowMS()}})
+}
+
+func (a *Agent) emit(batch *[]outItem, kind string, pri int, payload any) error {
+	if batch != nil {
+		*batch = append(*batch, outItem{kind: kind, pri: pri, payload: payload})
+		return nil
+	}
+	return a.Enqueue(kind, pri, payload)
+}
+
+func (a *Agent) enqueueAll(items []outItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	// Тот же путь, что у Enqueue: при известном сеансе скан идёт в память,
+	// вопрос — в базу, одним коммитом на пачку.
+	now := store.NowMS()
+	ev := make([]collect.MemEvent, 0, len(items))
+	for _, it := range items {
+		ev = append(ev, collect.MemEvent{Kind: it.kind, Pri: it.pri, Payload: it.payload, Now: now})
+	}
+	return a.acceptMem(ev)
 }
 func enqueueTx(tx *sql.Tx, kind string, priority int, payload any) error {
-	return outbox.Insert(tx, kind, priority, payload, store.NowMS())
+	return outbox.InsertUntrimmed(tx, kind, priority, payload, store.NowMS())
 }
 func logAgentError(operation string, err error) {
 	if err != nil {
@@ -368,59 +440,63 @@ func (a *Agent) flushLane(lane string) error {
 			return err
 		}
 	}
-	type row struct {
-		id, kind, payload string
-		seq, observed     int64
+	var rows []outboxRow
+	var pendingFrom, assigned, questionFloor int64
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	var err error
+	session := a.session
+	instance := a.instance
+	if session == "" {
+		a.spoolMu.Unlock()
+		pr, e := a.exchangePoll(protocol.PollReq{Rev: -1, Instance: instance})
+		if e != nil {
+			return e
+		}
+		if pr.Session == "" {
+			return fmt.Errorf("monitor does not support volatile telemetry")
+		}
+		a.adoptSession(pr.Session)
+		return a.flushLane(lane)
 	}
-	var rows []row
-	var pendingFrom int64
-	query := "SELECT event_id,seq,kind,payload,created_at_ms FROM outbox"
-	var args []any
-	switch lane {
-	case "urgent", "heartbeat":
-		query += " WHERE lane=? AND created_at_ms>=? ORDER BY seq DESC LIMIT 200"
-		args = []any{lane, store.NowMS() - 30000}
-	case "history":
-		query += " WHERE lane='history' OR created_at_ms<? ORDER BY seq LIMIT 200"
-		args = []any{store.NowMS() - 30000}
-	default:
-		query += " ORDER BY priority DESC,seq LIMIT 200"
-	}
-	err := a.st.Update(func(tx *sql.Tx) error {
-		q, err := tx.Query(query, args...)
+	if session != "" {
+		rows = a.planRowsLocked(lane)
+		err = a.st.DB.QueryRow("SELECT COALESCE((SELECT MIN(seq) FROM outbox),(SELECT CAST(v AS INTEGER)+1 FROM meta WHERE k='next_seq'),1)").Scan(&questionFloor)
 		if err != nil {
+			a.spoolMu.Unlock()
 			return err
 		}
-		defer q.Close()
-		var sentQuestions []string
-		for q.Next() {
-			var r row
-			if err := q.Scan(&r.id, &r.seq, &r.kind, &r.payload, &r.observed); err != nil {
+		// Вопросы и прочее служебное лежат в базе: их забирает срочная полоса.
+		if (lane == "" || lane == sessionDiskLane) && !a.diskIdle[sessionDiskLane] {
+			var disk []outboxRow
+			err = a.st.Update(func(tx *sql.Tx) error {
+				var err error
+				disk, err = sessionDiskRows(tx, 200)
 				return err
+			})
+			if err == nil {
+				if len(disk) == 0 {
+					a.markDiskIdle(sessionDiskLane, true)
+				}
+				rows = append(disk, rows[:min(len(rows), 200-len(disk))]...)
 			}
-			rows = append(rows, r)
-			if r.kind == "question" {
-				sentQuestions = append(sentQuestions, r.id)
-			}
 		}
-		if err := q.Err(); err != nil {
-			return err
-		}
-		if err := q.Close(); err != nil {
-			return err
-		}
-		if err := tx.QueryRow(`SELECT COALESCE(MIN(seq),COALESCE((SELECT CAST(v AS INTEGER) FROM meta WHERE k='next_seq'),0)+1) FROM outbox`).Scan(&pendingFrom); err != nil {
-			return err
-		}
-		return outbox.MarkQuestionsSent(tx, sentQuestions)
-	})
+	}
+	a.spoolMu.Unlock()
 	if err != nil {
 		return err
 	}
 	if len(rows) == 0 {
 		return nil
 	}
-	batch := protocol.Batch{Lane: lane, PendingFrom: &pendingFrom}
+	batch := protocol.Batch{Lane: lane, PendingFrom: &pendingFrom, Session: session, Instance: instance}
+	if session != "" {
+		batch.PendingFrom = nil
+		batch.QuestionPendingFrom = &questionFloor
+	}
+	if assigned > 0 {
+		batch.AssignedThrough = &assigned
+	}
 	for _, r := range rows {
 		batch.Events = append(batch.Events, protocol.Event{
 			EventID:      r.id,
@@ -458,8 +534,24 @@ func (a *Agent) flushLane(lane string) error {
 		return fmt.Errorf("batch %s: %s", res.Status, b)
 	}
 	if ack.Error != "" {
-		log.Printf("flush: ack %d err %s", len(ack.Ack), ack.Error)
+		log.Printf("flush: ack %d held %d err %s", len(ack.Ack), len(ack.Held), ack.Error)
 	}
+	a.spoolMu.Lock()
+	obsolete := session != "" && (a.session != session || a.instance != instance)
+	a.spoolMu.Unlock()
+	if obsolete {
+		return nil
+	}
+	return a.applyDelivery(rows, ack)
+}
+
+type outboxRow struct {
+	id, kind, payload string
+	seq, observed     int64
+	pri               int
+}
+
+func (a *Agent) applyDelivery(rows []outboxRow, ack protocol.Ack) error {
 	sent := map[string]bool{}
 	for _, r := range rows {
 		sent[r.id] = true
@@ -469,31 +561,71 @@ func (a *Agent) flushLane(lane string) error {
 			return fmt.Errorf("ACK contains unsent event")
 		}
 	}
-	return a.st.Update(func(tx *sql.Tx) error {
-		for _, id := range ack.Ack {
-			if _, err := tx.Exec("DELETE FROM local_questions WHERE question_id=?", id); err != nil {
+	drop := append([]string{}, ack.Ack...)
+	if err := a.deleteQueued(drop); err != nil {
+		return err
+	}
+	a.adoptSession(ack.Session)
+	return nil
+}
+
+func (a *Agent) deleteQueued(ids []string) error {
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	defer a.spoolMu.Unlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	if a.session != "" && a.planCoversLocked(ids) {
+		a.plan.drop(ids)
+		return nil
+	}
+	err := a.st.Update(func(tx *sql.Tx) error {
+		for start := 0; start < len(ids); start += 200 {
+			chunk := ids[start:min(start+200, len(ids))]
+			args := make([]any, len(chunk))
+			for i, id := range chunk {
+				args[i] = id
+			}
+			marks := placeholders(len(chunk))
+			if _, err := tx.Exec("DELETE FROM local_questions WHERE question_id IN ("+marks+")", args...); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`DELETE FROM outbox WHERE event_id=?`, id); err != nil {
+			if _, err := tx.Exec("DELETE FROM outbox WHERE event_id IN ("+marks+")", args...); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if a.plan != nil {
+		a.plan.drop(ids)
+	}
+	return nil
+}
+
+func placeholders(n int) string {
+	s := "?"
+	for i := 1; i < n; i++ {
+		s += ",?"
+	}
+	return s
 }
 
 func (a *Agent) Heartbeat() error {
 	logAgentError("conntrack health", a.conntrackHealth())
 	note := runtime.GOOS + " " + Version
 	if free, err := outbox.FreeBytes(a.cfg.DataDir); err == nil {
-		if err = a.st.Update(func(tx *sql.Tx) error { return outbox.Capacity(tx, free, store.NowMS()) }); err != nil {
+		if err = a.queueCapacity(free); err != nil {
 			return err
 		}
 	} else {
 		note += "; disk space unavailable: " + err.Error()
 	}
-	var qbytes int64
-	if err := a.st.DB.QueryRow("SELECT COALESCE((SELECT CAST(v AS INTEGER) FROM meta WHERE k='queue_bytes'),0)").Scan(&qbytes); err != nil {
+	qbytes, err := a.queueBytes()
+	if err != nil {
 		return err
 	}
 	for _, suffix := range []string{"", "-wal"} {
@@ -540,17 +672,29 @@ func (a *Agent) Run() error {
 	}
 	logAgentError("local firewall", a.loadLocalFW())
 	stop := make(chan struct{})
-	defer close(stop)
+	var workers sync.WaitGroup
+	start := func(fn func()) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			fn()
+		}()
+	}
+	defer func() {
+		close(stop)
+		workers.Wait()
+	}()
 	ready := make(chan struct{}, 1)
-	go a.watchCT(stop, ready)
-	go a.watchDNS(stop)
-	go a.watchNFLog(stop)
-	go a.pollLoop()
-	go a.watchdog()
-	go a.watchLinks(stop)
+	start(func() { a.process.Watch(stop) })
+	start(func() { a.watchCT(stop, ready) })
+	start(func() { a.watchDNS(stop) })
+	start(func() { a.watchNFLog(stop) })
+	start(func() { a.pollLoop(stop) })
+	start(func() { a.watchdog(stop) })
+	start(func() { a.watchLinks(stop) })
 	// Three independent requests: slow backlog cannot block heartbeat or a new decision.
 	for _, lane := range []string{"urgent", "heartbeat", "history"} {
-		go a.deliver(stop, lane)
+		start(func() { a.deliver(stop, lane) })
 	}
 	if err := a.Heartbeat(); err != nil {
 		return err
@@ -561,10 +705,13 @@ func (a *Agent) Run() error {
 	defer tDump.Stop()
 	tSSH := time.NewTicker(10 * time.Second)
 	defer tSSH.Stop()
+	halt := a.halt()
 
 	subscribed := false
 	for {
 		select {
+		case <-halt:
+			return nil
 		case <-ready:
 			subscribed = true
 			a.dumpOnce()
@@ -578,10 +725,48 @@ func (a *Agent) Run() error {
 			}
 		case <-tSSH.C:
 			a.sshOnce()
-
 		}
 	}
 }
+
+// shouldPoll — есть что забирать с диска или из памяти. Пустая полоса базу не открывает.
+func (a *Agent) shouldPoll(lane string) bool {
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	idle := lane != "" && lane != sessionDiskLane || a.diskIdle[sessionDiskLane]
+	a.spoolMu.Unlock()
+	if !idle {
+		return true
+	}
+	if a.planSendable(lane) {
+		return true
+	}
+	return false
+}
+
+// markDiskIdle вызывается только с удержанным spoolMu.
+func (a *Agent) markDiskIdle(lane string, idle bool) {
+	if a.diskIdle == nil {
+		a.diskIdle = map[string]bool{}
+	}
+	a.diskIdle[lane] = idle
+}
+
+func (a *Agent) planSendable(lane string) bool {
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	defer a.spoolMu.Unlock()
+	if a.plan == nil {
+		return false
+	}
+	for _, it := range a.plan.copy() {
+		if it.lane == lane {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *Agent) deliver(stop <-chan struct{}, lane string) {
 	delay := 200 * time.Millisecond
 	for {
@@ -589,6 +774,9 @@ func (a *Agent) deliver(stop <-chan struct{}, lane string) {
 		case <-stop:
 			return
 		case <-time.After(delay):
+		}
+		if !a.shouldPoll(lane) {
+			continue
 		}
 		if err := a.flushLane(lane); err != nil {
 			delay = min(5*time.Second, max(time.Second, delay*2))
@@ -669,7 +857,20 @@ func inPrefixes(ip netip.Addr, nets []netip.Prefix) bool {
 	return false
 }
 
-func (a *Agent) dumpOnce() {
+func (a *Agent) dumpOnce() { a.dump(a.takeDump()) }
+
+// dumpAll — снимок для нового сеанса монитора: все текущие соединения заново.
+func (a *Agent) dumpAll() { a.dump(true) }
+
+func (a *Agent) dump(resend bool) {
+	complete := false
+	defer func() {
+		if resend && !complete {
+			a.spoolMu.Lock()
+			a.needDump = true
+			a.spoolMu.Unlock()
+		}
+	}()
 	snapshot := collect.MonotonicMS()
 	entries, err := collect.DumpAll()
 	if err != nil {
@@ -680,18 +881,29 @@ func (a *Agent) dumpOnce() {
 	log.Printf("dump: %d flows", len(entries))
 	opt := a.dumpOpts()
 	opt.SnapshotMono = snapshot
-	if err := a.st.Update(func(tx *sql.Tx) error {
-		return collect.ApplyDump(tx, entries, opt)
-	}); err != nil {
-		log.Printf("dump SQL: %v", err)
+	opt.Resend = resend
+	if err := a.collectMem(func(book *collect.Mem) error { return book.ApplyDump(entries, opt) }); err != nil {
+		log.Printf("dump queue: %v", err)
 		return
 	}
+	complete = true
+	// Сканы и вопросы этого дампа — один коммит, не коммит на строку.
+	// В транзакцию снимка их нельзя класть: решение берёт fwMu, а применение
+	// политики держит fwMu и ждёт писателя.
+	if err := a.queueDumpNotes(entries); err != nil {
+		log.Printf("dump notes: %v", err)
+	}
+}
+
+func (a *Agent) queueDumpNotes(entries []collect.Entry) error {
+	var items []outItem
 	for _, e := range entries {
-		a.noteScan(e)
+		a.noteScanInto(&items, e)
 		if e.Unreplied || e.State == "SYN_SENT" {
-			a.noteLearn(e)
+			a.noteLearnInto(&items, e)
 		}
 	}
+	return a.enqueueAll(items)
 }
 
 func (a *Agent) noteLearnSets() {
@@ -716,7 +928,7 @@ func (a *Agent) noteOnce(e collect.Entry) {
 	var proc collect.Process
 	addr, _ := netip.ParseAddr(lip)
 	if !inPrefixes(addr.Unmap(), nets) && !inPrefixes(e.ReplySrc.Unmap(), nets) {
-		proc = a.process.Lookup(e)
+		proc = a.process.LookupExact(e)
 	}
 	lp, rp := 0, 0
 	if lport != nil {
@@ -757,6 +969,10 @@ func (a *Agent) noteOnce(e collect.Entry) {
 }
 
 func (a *Agent) noteLearn(e collect.Entry, dropped ...bool) {
+	a.noteLearnInto(nil, e, dropped...)
+}
+
+func (a *Agent) noteLearnInto(batch *[]outItem, e collect.Entry, dropped ...bool) {
 	// A reply belongs to an existing contact, even if an alert group logged it
 	// before the policy tail. Keep its firewall event, but do not ask again.
 	if e.CTDirectionKnown && e.CTReply {
@@ -794,9 +1010,11 @@ func (a *Agent) noteLearn(e collect.Entry, dropped ...bool) {
 	}
 	// У контейнера нет процесса хоста: на опубликованном порту поиск нашёл бы
 	// docker-proxy, а правила по процессу в forward не действуют.
+	// Правило и вопрос по процессу — только по точному владельцу: догадка
+	// «к этому адресу ходил только resolved» погасила бы вопрос о чужой программе.
 	var proc collect.Process
 	if cip == "" {
-		proc = a.process.Lookup(e)
+		proc = a.process.LookupExact(e)
 	}
 	if a.flowAllowed(e, dir, remoteIP, lport, rport, proc) {
 		return
@@ -808,16 +1026,20 @@ func (a *Agent) noteLearn(e collect.Entry, dropped ...bool) {
 	if lport != nil {
 		lp = *lport
 	}
-	a.enqueueLearnProcess(dir, e.Protocol, remoteIP, lp, rp, proc, cip)
+	a.enqueueLearnInto(batch, dir, e.Protocol, remoteIP, lp, rp, proc, cip)
 }
 
 func (a *Agent) enqueueLearn(dir, proto, remoteIP string, lp, rp int) {
-	a.enqueueLearnProcess(dir, proto, remoteIP, lp, rp, collect.Process{}, "")
+	a.enqueueLearnInto(nil, dir, proto, remoteIP, lp, rp, collect.Process{}, "")
 }
 
 // containerIP — адрес контейнера, если соединение его. Ключ склейки строится по
 // адресу: имя из config.v2.json у свежего контейнера появляется не сразу.
 func (a *Agent) enqueueLearnProcess(dir, proto, remoteIP string, lp, rp int, proc collect.Process, containerIP string) {
+	a.enqueueLearnInto(nil, dir, proto, remoteIP, lp, rp, proc, containerIP)
+}
+
+func (a *Agent) enqueueLearnInto(batch *[]outItem, dir, proto, remoteIP string, lp, rp int, proc collect.Process, containerIP string) {
 	a.fwMu.RLock()
 	defer a.fwMu.RUnlock()
 	a.askedMu.Lock()
@@ -860,7 +1082,7 @@ func (a *Agent) enqueueLearnProcess(dir, proto, remoteIP string, lp, rp int, pro
 		container = a.containerName(containerIP)
 	}
 	log.Printf("question %s", key)
-	err = a.Enqueue("question", 7, protocol.QuestionPayload{
+	err = a.emit(batch, "question", 7, protocol.QuestionPayload{
 		Direction: dir, Protocol: proto, RemoteIP: rip.String(), RemotePort: rp, LocalPort: lp, DedupKey: key, ProcComm: proc.Comm, ProcPath: pol.FormatIdentity(proc.Path, proc.UID, proc.Cgroup), Container: container, Repeats: 1,
 	})
 	if err != nil {
@@ -917,6 +1139,10 @@ func (a *Agent) flowAllowed(e collect.Entry, dir, remote string, lport, rport *i
 }
 
 func (a *Agent) noteScan(e collect.Entry) {
+	a.noteScanInto(nil, e)
+}
+
+func (a *Agent) noteScanInto(batch *[]outItem, e collect.Entry) {
 	if a.scan == nil {
 		return
 	}
@@ -926,29 +1152,36 @@ func (a *Agent) noteScan(e collect.Entry) {
 		return
 	}
 	log.Printf("scan %s ports %v", hit.IP, hit.Ports)
-	logAgentError("enqueue", a.Enqueue("scan", 9, protocol.ScanPayload{IP: hit.IP.Unmap().String(), Ports: hit.Ports, Attempts: hit.Attempts}))
+	logAgentError("enqueue", a.emit(batch, "scan", 9, protocol.ScanPayload{IP: hit.IP.Unmap().String(), Ports: hit.Ports, Attempts: hit.Attempts}))
 }
 
 func (a *Agent) saveSSH(hits []collect.SSHFail, next string) error {
-	return a.st.Update(func(tx *sql.Tx) error {
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	{
+		defer a.spoolMu.Unlock()
+		var events []collect.MemEvent
 		for _, h := range hits {
-			if err := enqueueTx(tx, "ssh", 8, protocol.SSHPayload{RemoteIP: h.IP, User: h.User, Note: h.Note, ObservedAtMS: h.AtMS}); err != nil {
-				return err
+			if h.AtMS < a.telemetrySince {
+				continue
 			}
+			events = append(events, collect.MemEvent{Kind: "ssh", Pri: 8, Now: h.AtMS, Payload: protocol.SSHPayload{RemoteIP: h.IP, User: h.User, Note: h.Note, ObservedAtMS: h.AtMS}})
 		}
-		if next != "" {
-			_, err := tx.Exec("INSERT INTO meta(k,v) VALUES('ssh_cursor',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", next)
+		if err := a.acceptMemLocked(events); err != nil {
 			return err
 		}
+		if next != "" {
+			a.sshCursor = next
+		}
 		return nil
-	})
+	}
+
 }
 func (a *Agent) sshOnce() {
-	cur, err := meta(a.st.DB, "ssh_cursor")
-	if err != nil && err != sql.ErrNoRows {
-		log.Printf("ssh cursor: %v", err)
-		return
-	}
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	cur := a.sshCursor
+	a.spoolMu.Unlock()
 	hits, next, err := collect.ReadSSHFailures(cur)
 	if err != nil {
 		log.Printf("ssh journal: %v", err)
@@ -999,11 +1232,24 @@ func (a *Agent) watchCT(stop <-chan struct{}, ready chan<- struct{}) {
 			}
 		}
 	}()
+	take := func(first event) []event {
+		out := []event{first}
+		for len(out) < 128 {
+			select {
+			case ev := <-events:
+				out = append(out, ev)
+			default:
+				return out
+			}
+		}
+		return out
+	}
 	for {
 		select {
 		case <-stop:
 			return
 		case ev := <-events:
+			batch := take(ev)
 			if n := lost.Swap(0); n > 0 {
 				_ = a.Enqueue("health", 10, protocol.HealthPayload{Kind: "conntrack_gap", LostEvents: &n, Note: "collector channel full"})
 				select {
@@ -1011,13 +1257,24 @@ func (a *Agent) watchCT(stop <-chan struct{}, ready chan<- struct{}) {
 				default:
 				}
 			}
-			if err := a.st.Update(func(tx *sql.Tx) error { return collect.ApplyEvent(tx, ev.e, ev.kind, ev.opt) }); err != nil {
-				logAgentError("conntrack SQL", err)
-				lost.Add(1)
+			err := a.collectMem(func(book *collect.Mem) error {
+				for _, ev := range batch {
+					if err := book.ApplyEvent(ev.e, ev.kind, ev.opt); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				logAgentError("conntrack", err)
+				lost.Add(int64(len(batch)))
 				_ = a.Enqueue("health", 10, protocol.HealthPayload{Kind: "conntrack_gap", Note: err.Error()})
 				continue
 			}
-			if ev.kind == "new" {
+			for _, ev := range batch {
+				if ev.kind != "new" {
+					continue
+				}
 				a.noteScan(ev.e)
 				a.noteOnce(ev.e)
 				a.noteLearn(ev.e)
@@ -1028,6 +1285,7 @@ func (a *Agent) watchCT(stop <-chan struct{}, ready chan<- struct{}) {
 func (a *Agent) watchDNS(stop <-chan struct{}) {
 	for {
 		err := collect.ListenDNS(stop, func(r collect.DNSRecord) {
+			a.absorbName(r.Name, r.IP)
 			logAgentError("DNS queue", a.Enqueue("dns", 6, protocol.DNSPayload{Name: r.Name, IP: r.IP, Kind: r.Kind}))
 		})
 		select {
@@ -1203,9 +1461,15 @@ func (a *Agent) watchNFLog(stop <-chan struct{}) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	emit := func(ps []protocol.FirewallPayload) {
-		for _, p := range ps {
-			logAgentError("NFLOG queue", a.Enqueue("firewall", 8, p))
+		if len(ps) == 0 {
+			return
 		}
+		now := store.NowMS()
+		ev := make([]collect.MemEvent, len(ps))
+		for i, p := range ps {
+			ev[i] = collect.MemEvent{Kind: "firewall", Pri: 8, Payload: p, Now: now}
+		}
+		logAgentError("NFLOG queue", a.acceptMem(ev))
 	}
 	for {
 		select {
@@ -1226,33 +1490,29 @@ func (a *Agent) conntrackHealth() error {
 	if err != nil {
 		return a.Enqueue("health", 10, protocol.HealthPayload{Kind: "conntrack_stats_error", Note: err.Error()})
 	}
-	return a.st.Update(func(tx *sql.Tx) error {
-		key := "ct_failures:" + a.bootID
-		old := map[string]uint64{}
-		var raw string
-		err := tx.QueryRow("SELECT v FROM meta WHERE k=?", key).Scan(&raw)
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-		if err == nil {
-			if err = json.Unmarshal([]byte(raw), &old); err != nil {
-				return err
-			}
+	return a.saveConntrackStats(stats)
+}
+
+func (a *Agent) saveConntrackStats(stats map[string]uint64) error {
+	a.prepareSpool()
+	a.spoolMu.Lock()
+	{
+		defer a.spoolMu.Unlock()
+		var events []collect.MemEvent
+		if a.ctFailures != nil {
 			for name, n := range stats {
-				if n > old[name] {
-					if err := enqueueTx(tx, "health", 10, protocol.HealthPayload{Kind: "conntrack_gap", Note: fmt.Sprintf("kernel %s increased by %d", name, n-old[name])}); err != nil {
-						return err
-					}
+				if n > a.ctFailures[name] {
+					events = append(events, collect.MemEvent{Kind: "health", Pri: 10, Now: store.NowMS(), Payload: protocol.HealthPayload{Kind: "conntrack_gap", Note: fmt.Sprintf("kernel %s increased by %d", name, n-a.ctFailures[name])}})
 				}
 			}
 		}
-		body, err := json.Marshal(stats)
-		if err != nil {
+		if err := a.acceptMemLocked(events); err != nil {
 			return err
 		}
-		_, err = tx.Exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", key, string(body))
-		return err
-	})
+		a.ctFailures = stats
+		return nil
+	}
+
 }
 
 // Caller holds fwMu. Manual blocks precede groups and user rules.

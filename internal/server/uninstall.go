@@ -42,7 +42,14 @@ func (s *Server) recordUninstall(fp string, in protocol.UninstallResult) error {
 	if in.Phase != "failed" && in.Error != "" || in.Phase == "failed" && in.Error == "" {
 		return fmt.Errorf("invalid removal error")
 	}
-	return s.st.Update(func(tx *sql.Tx) error {
+	if in.Phase == "complete" {
+		s.agentStateMu.Lock()
+		defer s.agentStateMu.Unlock()
+		s.flushMu.Lock()
+		defer s.flushMu.Unlock()
+	}
+	var removed string
+	err := s.st.Update(func(tx *sql.Tx) error {
 		key := "uninstall_done:" + in.CommandID
 		var receipt string
 		err := tx.QueryRow("SELECT v FROM settings WHERE k=?", key).Scan(&receipt)
@@ -80,8 +87,16 @@ func (s *Server) recordUninstall(fp string, in protocol.UninstallResult) error {
 			if err := store.PutSetting(tx, key, fp); err != nil {
 				return err
 			}
-			return deleteAgentRow(tx, agentID, trust, host, name, "", "снял агента с сервера")
+			if err := deleteAgentRow(tx, agentID, trust, host, name, "", "снял агента с сервера"); err != nil {
+				return err
+			}
+			removed = agentID
+			return nil
 		}
 		return nil
 	})
+	if err == nil && removed != "" {
+		s.forgetAgentMemory(removed)
+	}
+	return err
 }

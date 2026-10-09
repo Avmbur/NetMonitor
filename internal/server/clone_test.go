@@ -15,7 +15,8 @@ import (
 
 func sendBatchFrom(t *testing.T, s *Server, cert *x509.Certificate, src string, events ...protocol.Event) (int, protocol.Ack) {
 	t.Helper()
-	raw, err := json.Marshal(protocol.Batch{Events: events})
+	pollFrom(t, s, cert, src, protocol.PollReq{Instance: "test-process", Rev: -1})
+	raw, err := json.Marshal(protocol.Batch{Session: s.session, Instance: "test-process", Events: events})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestCloneQuarantineSeparatesDataAndCommands(t *testing.T) {
 	if code != 200 {
 		t.Fatal(code)
 	}
-	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=? WHERE host_id='h'`, store.NowMS())
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	raw, _ := json.Marshal(protocol.HealthPayload{Kind: "alive", BootID: "clone-boot"})
 	code, ack := sendBatchFrom(t, s, cert, "198.51.100.20:2", protocol.Event{
 		EventID: "clone-h", Seq: 1, Kind: "health", ObservedAtMS: store.NowMS(), Payload: raw,
@@ -111,7 +112,7 @@ func TestSameIPAndReconnectAreNotClones(t *testing.T) {
 	if n != 1 {
 		t.Fatal("parallel batch cloned", n)
 	}
-	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=1`)
+	s.hostSeen = map[string]int64{"h": 1}
 	if code, _ := sendBatchFrom(t, s, cert, "203.0.113.9:9", scanEvent("moved", 3)); code != 200 {
 		t.Fatal(code)
 	}
@@ -125,7 +126,7 @@ func TestRevokeCloneLeavesOriginal(t *testing.T) {
 	s, cert := batchFixture(t)
 	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=?`, store.NowMS())
 	sendBatchFrom(t, s, cert, "192.0.2.10:1", scanEvent("o", 1))
-	s.st.DB.Exec(`UPDATE hosts SET last_seen_ms=? WHERE host_id='h'`, store.NowMS())
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	sendBatchFrom(t, s, cert, "198.51.100.20:2", scanEvent("c", 1))
 	var cloneID string
 	s.st.DB.QueryRow(`SELECT agent_id FROM agents WHERE trust_state='quarantined'`).Scan(&cloneID)

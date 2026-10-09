@@ -139,17 +139,57 @@ func TestQueueConfirmationMigration(t *testing.T) {
 			if err := ApplyMonitor(db); err != nil {
 				t.Fatal(err)
 			}
-			var out, in, n int
-			if err := db.QueryRow("SELECT bytes_out,bytes_in,samples FROM traffic_1m").Scan(&out, &in, &n); err != nil {
-				t.Fatal(err)
-			}
-			if out != 100 || in != 200 || n != 3 {
-				t.Fatalf("data lost: %d/%d/%d", out, in, n)
+			var n int
+			if err := db.QueryRow("SELECT COUNT(*) FROM traffic_1m").Scan(&n); err != nil || n != 0 {
+				t.Fatal("legacy traffic retained", n, err)
 			}
 			var columns int
 			if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name='pending_from'").Scan(&columns); err != nil || columns != 1 {
 				t.Fatalf("confirmation field: %d %v", columns, err)
 			}
+			if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name='assigned_through'").Scan(&columns); err != nil || columns != 1 {
+				t.Fatalf("assigned high water: %d %v", columns, err)
+			}
 		})
+	}
+}
+
+func TestServiceMigrationPreservesDecisions(t *testing.T) {
+	db := openTestDB(t)
+	if err := ApplyMonitor(db); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"PRAGMA user_version=15",
+		"INSERT INTO settings(k,v) VALUES('samples_n','30'),('db_max_gb','2'),('adm_password','keep'),('cf','old')",
+		"INSERT INTO policy_rules VALUES('keep',1,1,'{}')",
+		"INSERT INTO blocks(block_id,scope_kind,state,reason,source,created_by,created_at_ms) VALUES('keep','all','active','manual','manual','adm',1)",
+		"INSERT INTO hosts(host_id) VALUES('h')",
+		"INSERT INTO learn_questions(question_id,host_id,dedup_key,opened_at_ms,last_seen_ms,repeats,direction,protocol,remote_ip,status) VALUES('keep','h','key',1,2,4,'out','tcp','1.1.1.1','open')",
+		"INSERT INTO traffic_1m VALUES('h',1,'out','internet',1,2,3)",
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ApplyMonitor(db); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"policy_rules", "blocks", "learn_questions"} {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil || n != 1 {
+			t.Fatal(table, n, err)
+		}
+	}
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM traffic_1m").Scan(&n); err != nil || n != 0 {
+		t.Fatal(n, err)
+	}
+	var mb, pw string
+	if err := db.QueryRow("SELECT v FROM settings WHERE k='db_max_mb'").Scan(&mb); err != nil || mb != "2048" {
+		t.Fatal(mb, err)
+	}
+	if err := db.QueryRow("SELECT v FROM settings WHERE k='adm_password'").Scan(&pw); err != nil || pw != "keep" {
+		t.Fatal(pw, err)
 	}
 }

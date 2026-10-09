@@ -225,16 +225,7 @@ func settingValue(db policyReader, k, fallback string) string {
 	return v
 }
 
-func closeCoveredQuestions(tx *sql.Tx, host string, now int64) error {
-	d, err := loadHostDecision(tx, host, neverPrefixes(tx), settingValue(tx, "park_mode", "learn"))
-	if err != nil {
-		return err
-	}
-	// Карантин сам по себе не ответ. Закрытие смотрит режим, который был бы без него.
-	// Шторм остаётся выключенным: в фильтре карантин его тоже гасит.
-	if d.mode == "quarantine" {
-		d.mode = d.plain
-	}
+func closeCoveredQuestions(tx *sql.Tx, host string, now int64, before ...func(string) error) error {
 	rows, err := tx.Query("SELECT question_id,host_id,direction,protocol,remote_ip,COALESCE(local_port,0),COALESCE(remote_port,0),COALESCE(proc_path,''),COALESCE(proc_comm,'') FROM learn_questions WHERE status='open' AND host_id=?", host)
 	if err != nil {
 		return err
@@ -261,6 +252,19 @@ func closeCoveredQuestions(tx *sql.Tx, host string, now int64) error {
 	if err != nil {
 		return err
 	}
+	// Политика хоста собирается только когда есть что закрывать.
+	if len(qs) == 0 {
+		return nil
+	}
+	d, err := loadHostDecision(tx, host, neverPrefixes(tx), settingValue(tx, "park_mode", "learn"))
+	if err != nil {
+		return err
+	}
+	// Карантин сам по себе не ответ. Закрытие смотрит режим, который был бы без него.
+	// Шторм остаётся выключенным: в фильтре карантин его тоже гасит.
+	if d.mode == "quarantine" {
+		d.mode = d.plain
+	}
 	for _, q := range qs {
 		if d.needsQuestion(q.c, now) {
 			continue
@@ -268,6 +272,11 @@ func closeCoveredQuestions(tx *sql.Tx, host string, now int64) error {
 		_, action, _ := d.resolve(q.c, now)
 		if action == "" || action == "learn" {
 			continue
+		}
+		for _, fn := range before {
+			if err := fn(q.id); err != nil {
+				return err
+			}
 		}
 		if _, err = tx.Exec("UPDATE learn_questions SET status='answered',answer=? WHERE question_id=?", action, q.id); err != nil {
 			return err

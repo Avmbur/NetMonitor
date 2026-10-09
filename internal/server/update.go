@@ -378,7 +378,7 @@ func parseRelease(body []byte) (releaseInfo, error) {
 }
 
 func releaseAssetURL(version, arch string) (string, error) {
-	if !versionOK(version) || (arch != "amd64" && arch != "arm64") {
+	if !versionOK(version) || arch != "amd64" && arch != "arm64" {
 		return "", fmt.Errorf("bad release")
 	}
 	return "https://github.com/" + releaseOwner + "/releases/download/v" + version + "/netmonitor-linux-" + arch + ".tar.gz", nil

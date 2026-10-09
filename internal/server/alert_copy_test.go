@@ -23,7 +23,7 @@ func TestAlertEventText(t *testing.T) {
 		{uiAlert{Rule: "persist", Addr: "203.0.113.88"}, "", "203.0.113.88 — вернулся после бана на 7 суток"},
 		{uiAlert{Rule: "paused_local", Addr: "185.234.52.11"}, "dev-postgres", "185.234.52.11 — бан снят руками на dev-postgres"},
 		{uiAlert{Rule: "clone", Addr: "10.0.0.5", Text: "клон сертификата с 10.0.0.5"}, "dev-redis", "dev-redis — чужая копия ключа с 10.0.0.5"},
-		{uiAlert{Rule: "disk-90"}, "монитор", "диск 90% — трафик не пишется"},
+		{uiAlert{Rule: "disk-90"}, "монитор", "диск 90% — мало места"},
 		{uiAlert{Rule: "storm", Text: "шторм по SSH — новые входы с улицы закрыты"}, "", "шторм SSH"},
 		{uiAlert{Rule: "storm", Text: "шторм сканов — новые входы с улицы закрыты"}, "", "шторм сканов"},
 	}

@@ -14,7 +14,7 @@ var MonitorSQL string
 //go:embed agent.sql
 var AgentSQL string
 
-const version = 10
+const version = 16
 const agentVersion = 6
 const monitorID = 0x4e4d4f4e // NMON
 const agentID = 0x4e4d4147   // NMAG
@@ -154,6 +154,115 @@ func apply(db *sql.DB, script string, appID int, required, forbidden string) err
 			if _, err := tx.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 				return fmt.Errorf("v10: %w", err)
 			}
+		}
+	}
+	// v11: живой список и счётчик читают только открытые потоки.
+	// flows_open — весь парк, flows_open_host — один сервер. Закрытая история в них не входит.
+	if ver < 11 && appID == monitorID {
+		for _, stmt := range []string{
+			`CREATE INDEX IF NOT EXISTS flows_open ON flows(last_seen_at_ms, flow_uid) WHERE ended_at_ms IS NULL`,
+			`CREATE INDEX IF NOT EXISTS flows_open_host ON flows(host_id, last_seen_at_ms, flow_uid) WHERE ended_at_ms IS NULL`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("v11: %w", err)
+			}
+		}
+	}
+	// v12: доказательства скана лежат в самом бане. Старые строки без них по-прежнему читают firewall_events.
+	if ver != 0 && ver < 12 && appID == monitorID {
+		for _, stmt := range []string{
+			`ALTER TABLE blocks ADD COLUMN scan_ports TEXT`,
+			`ALTER TABLE blocks ADD COLUMN scan_seen_ms INTEGER`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("v12: %w", err)
+			}
+		}
+	}
+	// v13: снимок открытых отдельно от исторической таблицы flows.
+	// Старые строки flows не переносятся и не удаляются.
+	if ver < 13 && appID == monitorID {
+		for _, stmt := range []string{
+			`CREATE TABLE IF NOT EXISTS open_flows(
+			  flow_uid TEXT PRIMARY KEY,
+			  state_seq INTEGER NOT NULL DEFAULT 0,
+			  host_id TEXT NOT NULL REFERENCES hosts(host_id),
+			  agent_id TEXT NOT NULL,
+			  boot_id TEXT NOT NULL,
+			  ct_id INTEGER,
+			  zone TEXT, ns TEXT,
+			  started_at_ms INTEGER,
+			  first_seen_at_ms INTEGER NOT NULL,
+			  last_seen_at_ms INTEGER NOT NULL,
+			  ip_version INTEGER NOT NULL,
+			  protocol TEXT NOT NULL,
+			  orig_src_ip TEXT NOT NULL, orig_src_ip_bin BLOB NOT NULL, orig_src_port INTEGER,
+			  orig_dst_ip TEXT NOT NULL, orig_dst_ip_bin BLOB NOT NULL, orig_dst_port INTEGER,
+			  reply_src_ip TEXT, reply_dst_ip TEXT,
+			  direction TEXT NOT NULL,
+			  local_ip TEXT NOT NULL, local_ip_bin BLOB NOT NULL, local_port INTEGER,
+			  remote_ip TEXT NOT NULL, remote_ip_bin BLOB NOT NULL, remote_port INTEGER,
+			  remote_scope TEXT NOT NULL,
+			  origin TEXT NOT NULL DEFAULT 'host',
+			  icmp_type INTEGER, icmp_code INTEGER,
+			  state TEXT,
+			  reply_seen INTEGER NOT NULL DEFAULT 0,
+			  orig_bytes INTEGER, reply_bytes INTEGER,
+			  orig_packets INTEGER, reply_packets INTEGER,
+			  proc_path TEXT, proc_uid INTEGER, proc_cgroup TEXT, proc_comm TEXT,
+			  container TEXT,
+			  dns_name TEXT,
+			  incomplete INTEGER NOT NULL DEFAULT 0,
+			  received_at_ms INTEGER NOT NULL)`,
+			`CREATE INDEX IF NOT EXISTS open_flows_local ON open_flows(host_id, local_ip)`,
+			`CREATE INDEX IF NOT EXISTS open_flows_seen ON open_flows(last_seen_at_ms, flow_uid)`,
+			`CREATE TABLE IF NOT EXISTS flow_owner(
+			  flow_uid TEXT PRIMARY KEY,
+			  agent_id TEXT NOT NULL,
+			  host_id TEXT NOT NULL,
+			  state_seq INTEGER NOT NULL,
+			  closed_at_ms INTEGER NOT NULL)`,
+			`CREATE INDEX IF NOT EXISTS flow_owner_closed ON flow_owner(closed_at_ms)`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("v13: %w", err)
+			}
+		}
+	}
+	// v14: агент сообщает последний занятый seq. Без этой границы монитор не знает,
+	// что более поздняя проба ещё не приехала. Ноль — агент границу ещё не присылал.
+	if ver < 14 && appID == monitorID {
+		if _, err := tx.Exec("ALTER TABLE agents ADD COLUMN assigned_through INTEGER NOT NULL DEFAULT 0"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("v14: %w", err)
+		}
+	}
+	// v15: адреса, дошедшие до порога перебора SSH. Срок отдельный не задаётся.
+	if ver < 15 && appID == monitorID {
+		if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS ssh_brute(
+			remote_ip TEXT NOT NULL,
+			host_id TEXT NOT NULL,
+			attempts INTEGER NOT NULL,
+			first_at_ms INTEGER NOT NULL,
+			last_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(remote_ip, host_id))`); err != nil {
+			return fmt.Errorf("v15: %w", err)
+		}
+	}
+	// v16: discard cancelled telemetry once; retain all policy and service records.
+	if ver < 16 && appID == monitorID {
+		for _, table := range []string{"flow_samples", "flows", "open_flows", "flow_owner", "traffic_1m", "traffic_1h", "firewall_events", "collector_health", "ssh_failures", "remote_seen"} {
+			if _, err := tx.Exec("DELETE FROM " + table); err != nil {
+				return fmt.Errorf("v16 %s: %w", table, err)
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM ingest_events WHERE kind NOT IN ('question','queue_drop')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM settings WHERE k IN ('samples_n','samples_u','flows_n','flows_u','hours_n','hours_u','cf') OR substr(k,1,3) IN ('am:','dp:','sh:','ln:','as:')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO settings(k,v) SELECT 'db_max_mb',CAST(MIN(99,MAX(1,CAST(v AS INTEGER)))*1024 AS TEXT) FROM settings WHERE k='db_max_gb'`); err != nil {
+			return err
 		}
 	}
 	// Collector and policy schema changes use a fresh test database; do not silently upgrade incompatible data.

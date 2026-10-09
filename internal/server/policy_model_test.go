@@ -127,8 +127,8 @@ func TestOrdinaryAllowProtectsSSHUntilDisabled(t *testing.T) {
 	}
 	var n int
 	s.st.DB.QueryRow("SELECT count(*) FROM ssh_failures").Scan(&n)
-	if n != 6 {
-		t.Fatal(n)
+	if n != 0 || s.ssh.count("h", "203.0.113.61", store.NowMS()) != 6 {
+		t.Fatal(n, s.ssh.count("h", "203.0.113.61", store.NowMS()))
 	}
 	s.st.DB.QueryRow("SELECT count(*) FROM blocks").Scan(&n)
 	if n != 0 {

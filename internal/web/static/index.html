@@ -1158,7 +1158,6 @@
   .log-bar select[data-lf="act"] { width: 132px; }
   .log-bar select[data-lf="who"] { width: 78px; }
   .log-bar [data-log-apply] { height: 24px; padding: 0 8px; }
-  .log-bar [data-rep-export], .log-bar [data-rep-build] { color: var(--text); }
   .log-pager {
     display: flex; gap: 8px; align-items: center;
     padding: 6px 8px; border-top: 1px solid var(--line);
@@ -1266,10 +1265,7 @@ const STARTER_OPTS = [
 ];
 const SETTINGS = {
   listenHost: "", listenPort: "",
-  samplesN: 30, samplesU: "d",
-  flowsN: 90, flowsU: "d",
-  hoursN: 12, hoursU: "mo",
-  dbMaxGb: 2,
+  dbMaxMb: 2048,
   lan: "",
   starter: { dns: true, ntp: true, monitor: true, ssh: true, ubuntu: true },
   parkMode: "learn",
@@ -1411,8 +1407,11 @@ function sndIntHtml(kind, d) {
     <button type="button" data-snd-int="${kind}" data-snd-int-step="1">+</button>
   </div>`;
 }
-function sndMuteSvg() {
-  return `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.8 6.2h2.4L9 3.2v9.6L5.2 9.8H2.8z" fill="currentColor"/><path d="M3 3.2l10 9.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+function sndMuteSvg(muted) {
+  const mark = muted
+    ? `<path d="M11.1 5.1l3 5.8M14.1 5.1l-3 5.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`
+    : `<path d="M11 6.1c.7.6.7 3.2 0 3.8M12.5 4.6c1.4 1.3 1.4 5.5 0 6.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>`;
+  return `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.8 6.2h2.4L9 3.2v9.6L5.2 9.8H2.8z" fill="currentColor"/>${mark}</svg>`;
 }
 const LOG_PAGE = 50;
 const POLICY_IDS = ["questions", "groups", "rules", "bans", "never", "alerts"];
@@ -1438,7 +1437,7 @@ function hasRowRule(row) {
 const GROUPS = [];
 const GROUP_POLICIES = [
   { id: "allow", title: "разрешить", hint: "совпадения проходят" },
-  { id: "watch", title: "наблюдать", hint: "проходят, в отчётах как эта группа" },
+  { id: "watch", title: "наблюдать", hint: "соединения проходят без вопросов обучения" },
   { id: "signal", title: "сообщать", hint: "режем, ждём решения" },
   { id: "block", title: "блокировать", hint: "совпадения режем" }
 ];
@@ -1604,39 +1603,38 @@ function refreshView() {
     else renderSettings();
   }
   else if (state.section === "log") renderLog();
-  else if (state.section === "reports") renderReports();
+  else if (state.section === "reports") {
+    renderReports();
+    if (window.nmLoadReport) window.nmLoadReport();
+  }
 }
 function vmTraffic(vm) {
   return (vm.rows || []).reduce((s, r) => s + (r.rx || 0) + (r.tx || 0), 0);
 }
 function resTip(vm) {
   const r = VM_RES[vm.id] || { cpu: 0, ram: 0, disk: 0 };
-  const d = VM_DAY[vm.id] || {};
+  const d = {};
   const live = vmTraffic(vm);
   return [
     "CPU " + r.cpu + "% · " + (d.cpuWin || "среднее 5 с") + " · замер " + (d.age || "—"),
     "RAM " + r.ram + "% · " + (d.ram || "использовано / всего"),
     "DISK " + r.disk + "% · " + (d.disk || "выбранный диск"),
-    "трафик за сутки: вход " + bytes(d.rx24 || 0) + " · исход " + bytes(d.tx24 || 0) + (d.overlay ? " · overlay " + bytes(d.overlay) : ""),
     "живые соединения сейчас: " + bytes(live)
   ].join("\n");
 }
 function resHtml(vm) {
   if (vm.monitor) return "";
   const r = VM_RES[vm.id];
-  const d = VM_DAY[vm.id] || {};
-  const day = (d.rx24 || 0) + (d.tx24 || 0) + (d.overlay || 0);
   const hasRes = !vm.down && r;
-  const cpu = hasRes ? r.cpu + "%" : "—";
-  const ram = hasRes ? r.ram + "%" : "—";
-  const disk = hasRes ? r.disk + "%" : "—";
-  const traf = hasRes || d.rx24 || d.tx24 ? bytes(day) : "—";
-  const why = vm.down ? "агент молчит" : (hasRes ? resTip(vm) : "агент ещё не прислал CPU/RAM/DISK");
+  const mark = vm.down ? "устарело" : "";
+  const cpu = hasRes && !vm.down ? r.cpu + "%" : (vm.down ? mark : "—");
+  const ram = hasRes && !vm.down ? r.ram + "%" : (vm.down ? mark : "—");
+  const disk = hasRes && !vm.down ? r.disk + "%" : (vm.down ? mark : "—");
+  const why = vm.down ? "устарело: агент молчит" : (hasRes ? resTip(vm) : "агент ещё не прислал CPU/RAM/DISK");
   return `<span class="res" title="${esc(why)}">
     <span><span class="k">CPU</span> ${cpu}</span>
     <span><span class="k">RAM</span> ${ram}</span>
     <span><span class="k">DISK</span> ${disk}</span>
-    <span><span class="k">трафик</span> ${traf}</span>
   </span>`;
 }
 function esc(s) {
@@ -1673,96 +1671,34 @@ const NAV = [
   { id: "reports", title: "Отчёты" }
 ];
 const AGENTS = [];
-const HISTORY = [];
+const DROPS = [];
 const AUDIT = [];
 const REPORTS = [
-  { id: "maxaddr", title: "Максимум с адреса (интернет)",
-    sub: "внешний IP, сколько накачал на парк за окно и за сутки",
-    cols: ["адрес", "главный сервер", "куда стучался", "пик за 3 с", "сумма 24 ч", "соединений"],
-    rows: [] },
-  { id: "topout", title: "Топ исходящих назначений",
-    sub: "куда парк сам ходит в интернет, по объёму",
-    cols: ["назначение", "сервер", "процесс", "сумма 24 ч", "соединений", "правило"],
-    rows: [] },
-  { id: "new24", title: "Новые адреса за 24 ч",
-    sub: "первый контакт, не из группы и не из стартового набора",
-    cols: ["адрес", "сервер", "направление", "порт", "процесс", "первый раз"],
-    rows: [] },
   { id: "scanners", title: "Сканеры портов",
-    sub: "один IP на несколько локальных портов за окно",
+    sub: "баны за сканирование и основания в строке бана",
     cols: ["адрес", "сервер", "портов за 1 мин", "какие", "статус"],
     rows: [] },
   { id: "sshfail", title: "Неудачные SSH",
-    sub: "неудачный вход по SSH, порог 5 за 10 мин",
+    sub: "окно памяти, после перезапуска начинается заново",
     cols: ["адрес", "сервер", "неудач / 10 мин", "последняя", "статус"],
     rows: [] },
   { id: "blocked", title: "Заблокированные сейчас",
-    sub: "живые баны и отрезанные обучением",
+    sub: "действующие баны",
     cols: ["цель", "причина", "сервер", "TTL", "настойчивый"],
     rows: [] },
   { id: "persist", title: "Настойчивые баны",
-    sub: "TTL истёк, адрес сразу стучится снова",
+    sub: "повторные нарушители и ступени",
     cols: ["адрес", "ступень", "срабатываний", "сервер", "следующий TTL"],
-    rows: [] },
-  { id: "rulehits", title: "Срабатывания правил за сутки",
-    sub: "сколько раз правило совпало",
-    cols: ["правило", "сервер", "совпадений", "последнее", "тип"],
-    rows: [] },
-  { id: "noreply", title: "Без ответа",
-    sub: "исходящий ушёл, ответа не было",
-    cols: ["сервер", "процесс", "назначение", "попыток", "последний"],
-    rows: [] },
-  { id: "byvm", title: "Объём по серверам за сутки",
-    sub: "вход / исход, internet отдельно от lan и своих",
-    cols: ["сервер", "вход интернет", "исход интернет", "lan / свои", "overlay"],
-    rows: [] },
-  { id: "groups", title: "Группы: объём и контакты",
-    sub: "сколько ушло в известные наборы адресов",
-    cols: ["группа", "политика", "контактов 24 ч", "объём", "сервер"],
-    rows: [] },
-  { id: "gaps", title: "Провалы сбора",
-    sub: "агент молчал или батч не доехал",
-    cols: ["сервер", "с", "по", "минут", "причина"],
-    rows: [] },
-  { id: "topproc", title: "Топ процессов по объёму",
-    sub: "какой процесс сколько прокачал за окно",
-    cols: ["процесс", "сервер", "объём", "соединений"],
-    rows: [] },
-  { id: "newdns", title: "Новые DNS-имена",
-    sub: "имя впервые увидели в окне",
-    cols: ["имя", "адрес", "сервер", "первый раз"],
-    rows: [] },
-  { id: "drops", title: "DROP: кто режется",
-    sub: "срез по NFLOG, адрес и причина",
-    cols: ["адрес", "сервер", "причина", "срабатываний"],
-    rows: [] },
-  { id: "rulenone", title: "Правила без срабатываний",
-    sub: "включённые правила, ни одного совпадения за окно",
-    cols: ["правило", "тип", "сервер"],
-    rows: [] },
-  { id: "longsess", title: "Длинные открытые сессии",
-    sub: "живые соединения, самые старые сначала",
-    cols: ["сервер", "процесс", "направление", "адрес", "длится", "с"],
-    rows: [] },
-  { id: "lanin", title: "Вход с LAN",
-    sub: "кто из локальной сети ходит на серверы парка",
-    cols: ["адрес", "сервер", "порт", "соединений", "объём"],
-    rows: [] },
-  { id: "montraf", title: "Трафик к монитору",
-    sub: "обмен с адресом и портом nmserver",
-    cols: ["сервер", "направление", "адрес", "порт", "объём", "соединений"],
     rows: [] }
 ];
 const VM_RES = {};
 let SETTINGS_ALERTS = 0;
-const CATCHUP_HINT = "агент был офлайн, дослали очередь. живое не режет.";
 const ALERTS = [];
 const PARK_MODES = [
   { id: "allow", title: "разрешить", hint: "всё, что не запрещено — проходит" },
   { id: "learn", title: "обучение", hint: "неизвестное спрашивает и режется, пока не ответишь" },
   { id: "block", title: "блокировать", hint: "запрещено всё, что не разрешено" }
 ];
-const VM_DAY = {};
 
 const vmById = Object.fromEntries(VMS.map(v => [v.id, v]));
 function defaultLogFilter() {
@@ -1786,9 +1722,8 @@ const AUDIT_KINDS = [
 const state = {
   section: "activity", modal: null, tilePause: {},
   monitorLost: false, emptyPark: false, login: false,
-  auditFilter: defaultLogFilter(), auditApplied: defaultLogFilter(), histFilter: defaultLogFilter(),
-  reportFilter: defaultLogFilter(),
-  auditPage: 0, histPage: 0
+  auditFilter: defaultLogFilter(), auditApplied: defaultLogFilter(),
+  auditPage: 0, dropPage: 0
 };
 const tilesEl = document.getElementById("tiles");
 const menu = document.getElementById("menu");
@@ -1943,7 +1878,7 @@ function defaultUi() {
     filters: { activity: defaultFilter(), policy: defaultFilter(), log: defaultFilter(), reports: defaultFilter() },
     policyOrder: defaultPolicyOrder(),
     policyExpanded: Object.fromEntries(POLICY_IDS.map(id => [id, true])),
-    report: "maxaddr",
+    report: "scanners",
     hidden: [],
     sort: { col: null, dir: 1 },
     policySort: {},
@@ -2267,7 +2202,7 @@ function renderNav() {
         : hasYellow
           ? `<span class="dot ask" title="тревоги сняты, не просмотрены"></span>`
           : `<span class="dot ask" title="обучение"></span>`;
-      mute = `<span class="snd-mute${LIVE.sound.muted ? " on" : ""}" data-snd-mute="1" title="${LIVE.sound.muted ? "включить звук" : "выключить звук"}">${sndMuteSvg()}</span>`;
+      mute = `<span class="snd-mute${LIVE.sound.muted ? " on" : ""}" data-snd-mute="1" title="${LIVE.sound.muted ? "звук выключен" : "звук включён"}">${sndMuteSvg(!!LIVE.sound.muted)}</span>`;
     }
     if (n.id === "settings" && settingsAlert) {
       cls += (cls ? " " : "") + "alert";
@@ -2335,13 +2270,16 @@ function packPickedVm(id) {
   ui.order = onIds.concat(id, offIds);
 }
 
+const HOST_NAMES = {};
 function hostName(id) {
   if (!id) return "";
   if (id === "monitor") return "монитор";
   const v = vmById[id];
   if (v && v.name) return v.name;
   const a = AGENTS.find(x => x.hostID === id || x.id === id);
-  return (a && a.name) || id;
+  if (a && a.name) return a.name;
+  if (HOST_NAMES[id]) return HOST_NAMES[id];
+  return id;
 }
 function renderMonitorRes() {
   const el = document.getElementById("fnav-monres");
@@ -2388,7 +2326,7 @@ function renderNavBot() {
     </div>`;
   } else if (state.section === "policy") {
     bot.innerHTML = `<div class="bot-cta">
-      <button type="button" data-export-policy="1">выгрузить правила и группы</button>
+
     </div>`;
   } else {
     bot.innerHTML = "";
@@ -2442,10 +2380,7 @@ function settingsSnap(s) {
   return JSON.stringify({
     listenHost: s.listenHost, listenPort: String(s.listenPort == null ? "" : s.listenPort),
     lan: s.lan, parkMode: s.parkMode,
-    samplesN: s.samplesN, samplesU: s.samplesU,
-    flowsN: s.flowsN, flowsU: s.flowsU,
-    hoursN: s.hoursN, hoursU: s.hoursU,
-    dbMaxGb: Math.max(1, Math.min(99, Number(s.dbMaxGb) || 2)),
+    dbMaxMb: Math.max(64, Math.min(99 * 1024, Number(s.dbMaxMb) || 2048)),
     soundAsk: !!s.soundAsk, soundAlert: !!s.soundAlert,
     soundAskSec: Number(s.soundAskSec) || 10, soundAlertSec: Number(s.soundAlertSec) || 10,
     starter: s.starter || {}
@@ -2531,23 +2466,23 @@ function flushSettingsDraft() {
   });
   const dbm = document.querySelector("#settings-tiles input[data-dbmax]");
   if (dbm) {
-    const n = Math.max(1, Math.min(99, Math.floor(Number(dbm.value) || 2)));
-    d.dbMaxGb = n;
+    const n = Math.max(64, Math.min(99 * 1024, Math.floor(Number(dbm.value) || 2048)));
+    d.dbMaxMb = n;
     dbm.value = String(n);
   }
 }
 function dbMaxHtml(d) {
-  const n = Math.max(1, Math.min(99, Math.floor(Number(d.dbMaxGb) || 2)));
+  const n = Math.max(64, Math.min(99 * 1024, Math.floor(Number(d.dbMaxMb) || 2048)));
   return `<div class="dbmax">
     <span title="горячая база sqlite. при превышении срезаем самое старое">макс размер базы</span>
     <div class="step">
-      <button type="button" data-dbmax-step="-1">−</button>
-      <input type="number" min="1" max="99" data-dbmax="1" value="${n}">
-      <button type="button" data-dbmax-step="1">+</button>
+      <button type="button" data-dbmax-step="-256">−</button>
+      <input type="number" min="64" max="101376" step="1" data-dbmax="1" value="${n}">
+      <button type="button" data-dbmax-step="256">+</button>
     </div>
-    <span>ГБ</span>
+    <span>МБ</span>
   </div>
-  <div class="hint">при превышении срезаем самое старое. на диске — база и один снимок</div>`;
+  <div class="hint">при превышении срезаем самое старое. действующие баны не вытесняются</div>`;
 }
 function keepFieldHtml(label, title, nKey, uKey, d) {
   const n = Math.max(1, Math.floor(Number(d[nKey]) || 1));
@@ -2585,9 +2520,6 @@ function settingsForm() {
           <input id="listen-port" data-cfg="listenPort" value="${esc(d.listenPort)}">
           <div class="ferr" data-ferr="listenPort" hidden>порт 1–65535</div>
         </div>
-        ${keepFieldHtml("данные по трафику", "как долго хранить данные по трафику", "samplesN", "samplesU", d)}
-        ${keepFieldHtml("соединения", "как долго хранить записи соединений", "flowsN", "flowsU", d)}
-        ${keepFieldHtml("сводки", "как долго хранить часовые сводки", "hoursN", "hoursU", d)}
         <div class="rfield"><span title="префиксы LAN в морде. свои агенты — не LAN, а «свои»">LAN</span>
           <input data-cfg="lan" value="${esc(d.lan)}">
           <div class="ferr" data-ferr="lan" hidden>CIDR через запятую, как в примере</div>
@@ -2640,6 +2572,7 @@ function settingsForm() {
 }
 
 function agentStatusHtml(a) {
+  if (a.stopped) return `<span class="st-block">остановлен</span>`;
   if (a.kind === "revoked") return `<span class="st-block">отозван</span>`;
   if (a.kind === "pending") {
     return `<button type="button" class="pill amode-learn" data-pending="${esc(a.id)}" title="подтвердить или отклонить">ожидает</button>`;
@@ -2739,7 +2672,8 @@ function agentsTable() {
     const mode = a.kind === "trusted"
       ? `<button type="button" class="pill ${agentModeClass(a)}" data-amode="${esc(a.id)}" title="выбрать режим">${esc(agentModeLabel(a))}</button>`
       : "—";
-    return [`<span title="${esc(a.scopeNote || "")}">${esc(a.name)}</span>`, agentStatusHtml(a), esc(a.last || "—"), esc(a.ver || "—"), pol, mode, agentPauseHtml(a), String(a.qlen == null ? "—" : a.qlen), a.key || "ещё нет", agentLearnHtml(a), ""];
+    const fault = a.collect_fault ? `<div class="hint">${esc(a.collect_fault)}</div>` : "";
+    return [`<span title="${esc(a.scopeNote || "")}">${esc(a.name)}</span>${fault}`, agentStatusHtml(a), esc(a.last || "—"), esc(a.ver || "—"), pol, mode, agentPauseHtml(a), String(a.qlen == null ? "—" : a.qlen), a.key || "ещё нет", agentLearnHtml(a), ""];
   });
   const kinds = headers.map(() => "fit").concat(["flex"]);
   return fwTable(
@@ -2785,20 +2719,18 @@ function renderSettings() {
 }
 
 function logBarHtml(kind) {
-  const lf = kind === "audit" ? state.auditFilter : state.histFilter;
+  const lf = state.auditFilter;
   const opt = (field, list) => list.map(([v, t]) =>
     `<option value="${esc(v)}" ${(lf[field] || "") === v ? "selected" : ""}>${esc(t)}</option>`).join("");
-  const extra = kind === "audit"
-    ? `<select data-lf="act" data-lf-kind="audit">${opt("act", [["", "любое действие"]].concat(AUDIT_KINDS.map(k => [k.id, k.label])))}</select>
+  const extra = `<select data-lf="act" data-lf-kind="audit">${opt("act", [["", "любое действие"]].concat(AUDIT_KINDS.map(k => [k.id, k.label])))}</select>
       <select data-lf="who" data-lf-kind="audit">${opt("who", [["", "все"], ["me", "я"], ["auto", "автомат"]])}</select>
-      <button type="button" class="pill" data-log-apply="audit">применить</button>`
-    : `<input data-lf="proc" data-lf-kind="hist" placeholder="процесс" value="${esc(lf.proc || "")}">`;
+      <button type="button" class="pill" data-log-apply="audit">применить</button>`;
   return `<div class="log-bar">
     <span class="rlab">с</span>
-    ${dateFieldHtml("from", lf.from, kind === "audit" ? "audit" : "hist")}
+    ${dateFieldHtml("from", lf.from, "audit")}
     <span class="rlab">по</span>
-    ${dateFieldHtml("to", lf.to, kind === "audit" ? "audit" : "hist")}
-    <input data-lf="addr" data-lf-kind="${kind === "audit" ? "audit" : "hist"}" placeholder="адрес" value="${esc(lf.addr || "")}">
+    ${dateFieldHtml("to", lf.to, "audit")}
+    <input data-lf="addr" data-lf-kind="${"audit"}" placeholder="адрес" value="${esc(lf.addr || "")}">
     ${extra}
   </div>`;
 }
@@ -2845,7 +2777,7 @@ function renderLog() {
     el.className = "tiles n1 fill";
     el.style.gridTemplateColumns = "";
     el.style.gridTemplateRows = "";
-    el.innerHTML = parkEmptyHtml("журнал и история пусты: контактов ещё не было. ручные действия пишем с первого дня, сюда попадёт и выдача токена.");
+    el.innerHTML = parkEmptyHtml("журнал и история пусты: ручные действия пишем с первого дня, сюда попадёт и выдача токена.");
     return;
   }
   if (logSelectOpen) return;
@@ -2861,15 +2793,8 @@ function renderLog() {
   el.style.gridTemplateRows = "1fr";
   const f = currentFilter();
   const ids = new Set(shownVms().map(v => v.id));
-  const hf = state.histFilter;
   const af = state.auditApplied || state.auditFilter;
-  const histSrc = HISTORY.filter(r => {
-    if (!(f.all || ids.has(r.vm))) return false;
-    if (!matchLogPeriod(r.at, hf)) return false;
-    if (hf.addr && String(r.addr || r.peer || "").toLowerCase().indexOf(hf.addr.toLowerCase()) < 0) return false;
-    if (hf.proc && String(r.proc || "").toLowerCase().indexOf(hf.proc.toLowerCase()) < 0) return false;
-    return true;
-  });
+  const dropSrc = DROPS.filter(r => f.all || ids.has(r.vm));
   const auditSrc = AUDIT.filter(r => {
     const vm = r.vm || r.target;
     if (!f.all && (!vm || !ids.has(vm))) return false;
@@ -2879,18 +2804,15 @@ function renderLog() {
     return true;
   });
   const auditPage = logPageInfo(auditSrc.length, state.auditPage);
-  const histPage = logPageInfo(histSrc.length, state.histPage);
+  const dropPage = logPageInfo(dropSrc.length, state.dropPage);
   state.auditPage = auditPage.page;
-  state.histPage = histPage.page;
+  state.dropPage = dropPage.page;
   const auditView = auditSrc.slice(auditPage.sliceFrom, auditPage.sliceTo);
-  const histView = histSrc.slice(histPage.sliceFrom, histPage.sliceTo);
+  const dropView = dropSrc.slice(dropPage.sliceFrom, dropPage.sliceTo);
   const audit = auditView.map(r => [whenText(r.at), r.who, r.action, r.object]);
-  const hist = histView.map(r => [
-    whenText(r.at), hostName(r.vm), r.container ? "▣ " + r.container : r.proc,
-    r.dir === "in" ? `<span class="dir-in">вход</span>` : insideDir(r.dir) ? `<span class="dir-out">внутри</span>` : `<span class="dir-out">исход</span>`,
-    r.proto, `<span class="addr">${esc(r.addr)}</span>`, r.rx, r.tx, r.rule
-  ]);
-  const emptyH = histSrc.length ? "" : `<div class="hint">ничего не нашлось · конец списка</div>`;
+  const hist = dropView.map(r => [whenText(r.at), hostName(r.vm),
+    r.dir === "in" ? "вход" : "исход", r.proto, esc(r.addr), esc(r.rule)]);
+  const emptyH = dropSrc.length ? "" : `<div class="hint">ничего не нашлось · конец списка</div>`;
   const emptyA = auditSrc.length ? "" : `<div class="hint">ничего не нашлось · конец списка</div>`;
   el.innerHTML = `
     <div class="ptile expanded" data-sid="audit">
@@ -2907,17 +2829,17 @@ function renderLog() {
     <div class="ptile expanded" data-sid="history">
       <div class="th">
         <span class="name">История</span>
-        <span class="meta">${esc(filterLabel())} · прошлые контакты</span>
+        <span class="meta">${esc(filterLabel())} · блокировки DROP/REJECT</span>
       </div>
-      <div class="body">${logBarHtml("hist")}${fwTable(
-        ["когда", "сервер", "процесс", "тип", "протокол", "адрес:порт", "получено", "отправлено", "правило"],
+      <div class="body">${fwTable(
+        ["когда", "сервер", "тип", "протокол", "адрес:порт", "правило"],
         hist,
         (_, i) => {
-          const src = histView[i];
+          const src = dropView[i];
           return src ? ` data-hist="${esc(src.vm + "|" + src.at + "|" + src.addr)}"` : "";
         },
-        ["fit", "fit", "fit", "fit", "fit", "flex", "fit", "fit", "fit"], "hist"
-      )}${emptyH}${pagerHtml("hist", histPage)}</div>
+        ["fit", "fit", "fit", "fit", "flex", "fit"], "hist"
+      )}${emptyH}${pagerHtml("hist", dropPage)}</div>
     </div>`;
   restoreScrolls(el);
   const next = keep && el.querySelector(`[data-lf="${keep.field}"][data-lf-kind="${keep.kind}"]`);
@@ -2927,21 +2849,6 @@ function renderLog() {
   }
 }
 
-function reportBarHtml() {
-  const lf = state.reportFilter;
-  const busy = !!LIVE.reportBusy;
-  return `<div class="log-bar">
-    <span class="rlab">с</span>
-    ${dateFieldHtml("from", lf.from, "report")}
-    <span class="rlab">по</span>
-    ${dateFieldHtml("to", lf.to, "report")}
-    <button type="button" class="pill" data-rep-build="1"${busy ? " disabled" : ""}>${busy ? "считаю…" : "сформировать"}</button>
-    <button type="button" class="pill" data-rep-export="1">выгрузить</button>
-  </div>`;
-}
-function matchReportPeriod() {
-  return true;
-}
 function reportSortOf(tableId) {
   const id = String(tableId || "").replace(/^report:/, "");
   LIVE.reportSortBy = LIVE.reportSortBy || {};
@@ -3065,19 +2972,6 @@ function exportPolicySet() {
     toastMsg("выгружено");
   }).catch(e => toastMsg(e.message || "не удалось выгрузить"));
 }
-function exportReportCsv(cur, rows) {
-  const lines = [cur.cols.join(";")].concat(rows.map(r =>
-    r.map(c => cellPlain(c).replace(/;/g, ",")).join(";")
-  ));
-  const blob = new Blob(["\uFEFF" + lines.join("\n")], { type: "text/csv;charset=utf-8" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = (cur.title || "report") + ".csv";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 500);
-}
 function renderReports() {
   const el = document.getElementById("reports-tiles");
   if (state.emptyPark) {
@@ -3098,10 +2992,7 @@ function renderReports() {
   const f = currentFilter();
   const names = new Set(shownVms().map(v => v.name));
   const vi = cur.cols.findIndex(c => /сервер/.test(c));
-  const inPeriod = matchReportPeriod(state.reportFilter);
   const raw = (cur.rows || []).filter(r => {
-    if (!inPeriod) return false;
-    if (cur.id === "rulehits" && ui.reportRule && r[0] !== ui.reportRule) return false;
     if (f.all || vi < 0) return true;
     const cell = String(r[vi] || "");
     if (cell.indexOf("все") >= 0) return true;
@@ -3110,8 +3001,7 @@ function renderReports() {
   const sorted = sortReportRows(cur.id, raw);
   const rows = sorted.map(r => r.map(c => esc(c)));
   const tried = !!(LIVE.reportTried && LIVE.reportTried[cur.id]);
-  const empty = rows.length ? "" : `<div class="hint">${tried ? "ничего не нашлось · конец списка" : "нажми «сформировать»"}</div>`;
-  const ruleMeta = cur.id === "rulehits" && ui.reportRule ? " · правило «" + ui.reportRule + "»" : "";
+  const empty = rows.length ? "" : `<div class="hint">${tried ? "ничего не нашлось" : "загрузка…"}</div>`;
   el.innerHTML = `
     <div class="ptile expanded" data-sid="replist">
       <div class="th"><span class="name">Отчёты</span><span class="meta">${REPORTS.length}</span></div>
@@ -3120,9 +3010,9 @@ function renderReports() {
     <div class="ptile expanded" data-sid="repbody">
       <div class="th">
         <span class="name">${esc(cur.title)}</span>
-        <span class="meta">${esc(filterLabel())}${esc(ruleMeta)} · ${esc(cur.sub)}</span>
+        <span class="meta">${esc(filterLabel())} · ${esc(cur.sub)}</span>
       </div>
-      <div class="body">${reportBarHtml()}${fwTable(cur.cols, rows, null, null, "report:" + cur.id)}${empty}</div>
+      <div class="body">${fwTable(cur.cols, rows, null, null, "report:" + cur.id)}${empty}</div>
     </div>`;
   restoreScrolls(el);
 }
@@ -3248,14 +3138,13 @@ function alertEventText(a) {
   if (k === "persist") return (ip ? ip + " — " : "") + "вернулся после бана на 7 суток";
   if (k === "paused_local" || k === "paused") return (ip ? ip + " — " : "") + "бан снят руками" + (host && host !== "монитор" ? " на " + host : "");
   if (k === "clone") return (host || "сервер") + " — чужая копия ключа" + (ip ? " с " + ip : "");
-  if (k === "disk-90") return "диск 90% — трафик не пишется";
+  if (k === "disk-90") return "диск 90% — мало места";
   if (k === "disk-80") return "диск 80% — мало места";
   if (k === "silent") return (a && a.text) || ((host || "сервер") + " — агент молчит");
   if (k === "policy-fail") return (a && a.text) || ((host || "сервер") + " — политика не применилась");
   return (a && a.text) || "";
 }
 function alertHint(a) {
-  if (a && a.hist) return CATCHUP_HINT;
   const k = alertKind(a);
   if ((k === "scan" || k === "ssh") && a && a.banState) {
     if (a.banState === "expired") return "срок этого бана кончился.";
@@ -3272,7 +3161,7 @@ function alertHint(a) {
   if (k === "persist") return "вернулся после 7 суток. лестница кончилась: бан навсегда или оставить.";
   if (k === "paused_local" || k === "paused") return "снят с консоли сервера. монитор не вернёт, пока бан не вернут.";
   if (k === "clone") return "тот же ключ агента с другого адреса";
-  if (k === "disk-90") return "диск заполнен, запись трафика остановлена";
+  if (k === "disk-90") return "на диске совсем мало места";
   if (k === "disk-80") return "на диске мало места";
   if (k === "silent") return "нет связи больше 2 мин. трафик и новые баны не доходят.";
   if (k === "policy-fail") return "политика не применилась. на сервере прежние правила.";
@@ -3294,11 +3183,11 @@ function alertDone(a) {
   }
   if (k === "paused_local" || k === "paused") return "бан на этом сервере не ставится, пока его не вернут";
   if (k === "clone") return "перевёл агента в карантин";
-  if (k === "disk-90") return "остановил запись трафика, баны и правила работают";
+  if (k === "disk-90") return "ничего — трафик пишется, баны и правила работают";
   if (k === "disk-80") return "ничего — пока место есть";
   if (k === "silent") return "ничего — ждёт, пока агент выйдет на связь";
   if (k === "policy-fail") return "ничего — агент держит прежние правила";
-  if (a && a.hist) return "ничего — это досланная история";
+  if (a && a.hist) return "ничего";
   return "";
 }
 // Кнопки карточки: [op, подпись, главная?]. «Открыть бан» остаётся и у просмотренной.
@@ -3446,7 +3335,7 @@ function alertChipsHtml() {
 function alertEventHtml(a) {
   const text = alertEventText(a);
   const hint = alertHint(a);
-  const inner = a.hist ? `<span class="tag">догон</span> ${esc(text)}` : esc(text);
+  const inner = esc(text);
   return hint ? `<span title="${esc(hint)}">${inner}</span>` : inner;
 }
 function banByAlert(a) {
@@ -3997,10 +3886,10 @@ function makeTile(vm) {
   const exp = ui.expanded[vm.id] !== false;
   th.innerHTML = `<span class="chev" title="${exp ? "свернуть" : "развернуть"}"><i class="${exp ? "down" : "right"}"></i></span>
     <span class="name">${esc(vm.monitor ? "монитор" : vm.name)}</span>
-    <span class="meta host-address" title="${esc((vm.addresses || []).join(' · '))}">${esc((vm.addresses || [])[0] || "—")}</span>
+    <span class="meta host-address" title="${esc((vm.addresses || []).join(' · '))}">${esc((vm.addresses || [])[0] || "—")}${vm.down ? " · устарело" : ""}</span>
     <span class="host-ports" title="слушающие порты">
       <button type="button" class="pill tile-icon" data-tile-ports="${esc(vm.id)}" title="слушающие порты" aria-label="слушающие порты"><svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="10" rx="2" stroke="currentColor" stroke-width="1.4"/><circle cx="5.5" cy="8" r="1.1" fill="currentColor"/><circle cx="8" cy="8" r="1.1" fill="currentColor"/><circle cx="10.5" cy="8" r="1.1" fill="currentColor"/></svg></button>
-      <span class="meta">${vm.openPorts == null ? "—" : vm.openPorts}</span>
+      <span class="meta">${vm.openPorts == null ? "—" : vm.openPorts}${vm.down ? " · устарело" : ""}</span>
     </span>
     <span class="meta host-sep">|</span>
     <span class="meta">${nConn(nLive)}</span>${tags}
@@ -4431,7 +4320,6 @@ function openMenu(x, y, ctx) {
       ${item("editrule", "редактировать", !locked)}
       ${item("duprule", "дублировать", !locked)}
       ${item("grp", "добавить в группу", !locked)}
-      <button type="button" data-a="hits">срабатывания за сутки</button>
       <button type="button" data-a="whois">whois</button>
       <div class="sep"></div>
       ${item("delrule", "удалить", !locked)}`;
@@ -4458,8 +4346,9 @@ function openMenu(x, y, ctx) {
       ${item("no", "отклонить…", pending)}
       ${item("revoke", "отозвать сертификат…", qtn)}
       <div class="sep"></div>
-      ${item("pause", a.pauseUntil>Date.now() ? "снять паузу авто-банов…" : "пауза авто-банов…", online)}
-      ${item("qtn", a.quarantine ? "снять карантин…" : "карантин сервера…", online)}
+      ${item("pause", a.pauseUntil>Date.now() ? "снять паузу авто-банов…" : "пауза авто-банов…", online && !a.stopped)}
+      ${item("qtn", a.quarantine ? "снять карантин…" : "карантин сервера…", online && !a.stopped)}
+      ${item("stop", "остановить агента…", online && !a.stopped)}
       <div class="sep"></div>
       ${item("del", "забыть…", true)}
       ${item("remove", "удалить с сервера…", true)}
@@ -4496,9 +4385,7 @@ function openMenu(x, y, ctx) {
     const inbound = ctx.row.dir === "in";
     const never = ctx.row.rule === "never-block";
     const hasRule = hasRowRule(ctx.row);
-    const histNote = ctx.type === "hist" ? `<div class="sub">история · контакт уже закрыт, действие на следующие</div>` : "";
     menu.innerHTML = `
-      ${histNote}
       <div class="sub">${esc(ctx.row.proc)} · ${esc(ctx.row.proto)} · ${esc(ctx.row.addr)}</div>
       <button type="button" data-a="once">разрешить однократно</button>
       <button type="button" data-a="allowp">на период</button>
@@ -4628,22 +4515,17 @@ document.addEventListener("click", ev => {
     s.value = localDateValue(now); s.year = now.getFullYear(); s.month = now.getMonth();
   } else if (button.hasAttribute("data-date-clear")) {
     const holder = s.owner === "period" ? periodHolder()
-      : s.owner === "audit" ? state.auditFilter
-      : s.owner === "report" ? state.reportFilter
-      : state.histFilter;
+      : state.auditFilter;
     if (s.owner === "period") flushPeriod();
     holder[s.key] = "";
     const owner = s.owner;
     closeDatePicker();
     if (owner === "period") { holder.mode = "range"; syncConnectionPeriod(); renderPeriodOwner(); }
-    else if (owner === "report") renderReports();
     else renderLog();
     return;
   } else if (button.hasAttribute("data-date-apply")) {
     const holder = s.owner === "period" ? periodHolder()
-      : s.owner === "audit" ? state.auditFilter
-      : s.owner === "report" ? state.reportFilter
-      : state.histFilter;
+      : state.auditFilter;
     if (s.owner === "period") flushPeriod();
     const from = s.key === "from" ? s.value : String(holder.from || "").slice(0,10);
     const to = s.key === "to" ? s.value : String(holder.to || "").slice(0,10);
@@ -4653,7 +4535,6 @@ document.addEventListener("click", ev => {
     const owner = s.owner;
     closeDatePicker();
     if (owner === "period") { syncConnectionPeriod(); renderPeriodOwner(); }
-    else if (owner === "report") renderReports();
     else renderLog();
     return;
   }
@@ -4664,14 +4545,11 @@ document.addEventListener("keydown", ev => {
   if (field && (ev.key === "Backspace" || ev.key === "Delete")) {
     const owner = field.dataset.dateOwner;
     const holder = owner === "period" ? periodHolder()
-      : owner === "audit" ? state.auditFilter
-      : owner === "report" ? state.reportFilter
-      : state.histFilter;
+      : state.auditFilter;
     if (owner === "period") flushPeriod();
     holder[field.dataset.dateKey] = "";
     closeDatePicker();
     if (owner === "period") renderPeriodOwner();
-    else if (owner === "report") renderReports();
     else renderLog();
     ev.preventDefault(); ev.stopImmediatePropagation();
     return;
@@ -4796,7 +4674,6 @@ function openAlertJournal() {
 }
 function openBanAddrHistory(ban) {
   const q = banFilterAddr(ban.addr);
-  state.histFilter.addr = q;
   state.auditFilter.addr = q;
   state.auditApplied = Object.assign({}, state.auditFilter);
   setSection("log");
@@ -5169,6 +5046,10 @@ function renderAgentModal() {
     title = "Забыть агента";
     meta = esc(a.name);
     inner = `<div class="hint" style="padding:0">строка пропадёт из списка, этот ключ больше не принимаем. программа на сервере остаётся. история и правила сохраняются: при новой установке можно нажать «Продолжить историю».</div>`;
+  } else if (m.act === "stop") {
+    title = "Остановить агента";
+    meta = esc(a.name);
+    inner = `<div class="hint" style="padding:0">служба nmagent остановится. программа, /var/lib/nmagent и таблица inet netmon остаются. снова запустить можно на самом сервере: systemctl start nmagent</div>`;
   } else if (m.act === "remove") {
     title = "Удалить с сервера";
     meta = esc(a.name);
@@ -5206,6 +5087,9 @@ function renderAgentModal() {
   }
   if (m.act === "del") {
     html = html.replace('<button type="button" data-a="save">Сохранить</button>', '<button type="button" data-a="save">Забыть</button>');
+  }
+  if (m.act === "stop") {
+    html = html.replace('<button type="button" data-a="save">Сохранить</button>', '<button type="button" data-a="save">Остановить</button>');
   }
   if (m.act === "remove") {
     html = html.replace(
@@ -5584,7 +5468,6 @@ function renderRuleModal() {
         <label class="chk"><input type="checkbox" data-k="enabled" ${d.enabled ? "checked" : ""}> вкл</label>
       </div></div>
     </div>` : ""}
-    ${m.ctx && m.ctx.type === "hist" ? '<div class="hint rule-history">история: правило для следующих контактов</div>' : ""}
     ${matching}${effect}
     ${ruleQuestionHtml(m)}
     ${!grouping ? `<div class="rhosts"><div class="rule-section">На каких серверах</div>${ruleHostsHtml(d, { allInFooter: true })}</div>` : ""}
@@ -5927,21 +5810,17 @@ document.getElementById("log-tiles").addEventListener("input", ev => {
   const el = ev.target;
   if (!el.dataset || el.dataset.lf == null) return;
   if (el.tagName === "SELECT") return;
-  const lf = el.dataset.lfKind === "audit" ? state.auditFilter : state.histFilter;
+  const lf = el.dataset.lfKind === "audit" ? state.auditFilter : state.auditFilter;
   lf[el.dataset.lf] = el.value;
-  if (el.dataset.lfKind === "audit") return;
-  state.histPage = 0; resetScrolls("log", "history");
-  renderLog();
+
 });
 document.getElementById("log-tiles").addEventListener("change", ev => {
   const el = ev.target;
   if (!el || !el.dataset || el.dataset.lf == null) return;
   logSelectOpen = false;
-  const lf = el.dataset.lfKind === "audit" ? state.auditFilter : state.histFilter;
+  const lf = el.dataset.lfKind === "audit" ? state.auditFilter : state.auditFilter;
   lf[el.dataset.lf] = el.value;
-  if (el.dataset.lfKind === "audit") return;
-  state.histPage = 0; resetScrolls("log", "history");
-  renderLog();
+
 });
 document.getElementById("log-tiles").addEventListener("click", ev => {
   if (ev.target.closest("[data-log-apply]")) {
@@ -5956,7 +5835,7 @@ document.getElementById("log-tiles").addEventListener("click", ev => {
     state.auditPage = Math.max(0, (state.auditPage || 0) + dir);
     resetScrolls("log", "audit");
   } else {
-    state.histPage = Math.max(0, (state.histPage || 0) + dir);
+    state.dropPage = Math.max(0, (state.dropPage || 0) + dir);
     resetScrolls("log", "history");
   }
   renderLog();
@@ -5979,7 +5858,7 @@ document.getElementById("log-tiles").addEventListener("contextmenu", ev => {
   if (trH) {
     ev.preventDefault();
     const key = trH.dataset.hist;
-    const h = HISTORY.find(x => x.vm + "|" + x.at + "|" + x.addr === key);
+    const h = DROPS.find(x => x.vm + "|" + x.at + "|" + x.addr === key);
     if (!h) return;
     const vm = vmById[h.vm] || { id: h.vm, name: h.vm };
     openMenu(ev.clientX, ev.clientY, {
@@ -5991,38 +5870,17 @@ document.getElementById("log-tiles").addEventListener("contextmenu", ev => {
 document.getElementById("reports-tiles").addEventListener("click", ev => {
   const sortTh = ev.target.closest("th[data-rep-sort]");
   if (sortTh && !ev.target.closest(".grip")) {
-    cycleReportSort(ui.report || "maxaddr", Number(sortTh.dataset.repSort));
+    cycleReportSort(ui.report || "scanners", Number(sortTh.dataset.repSort));
     renderReports();
-    return;
-  }
-  if (ev.target.closest("[data-rep-build]")) {
-    resetScrolls("reports", "repbody");
-    if (window.nmLoadReport) window.nmLoadReport();
-    return;
-  }
-  if (ev.target.closest("[data-rep-export]")) {
-    const cur = REPORTS.find(r => r.id === ui.report) || REPORTS[0];
-    const table = document.querySelector("#reports-tiles [data-sid=repbody] table");
-    const rows = table
-      ? [...table.querySelectorAll("tbody tr")].map(tr => [...tr.children].map(td => td.textContent.trim()))
-      : [];
-    if (rows.length) {
-      exportReportCsv(cur, rows);
-      return;
-    }
-    const lf = state.reportFilter || {};
-    const from = lf.from ? Date.parse(lf.from) : "";
-    const to = lf.to ? Date.parse(lf.to) + 86400000 - 1 : "";
-    location.href = "/ui/api/reports?id=" + encodeURIComponent(cur.id) + "&export=1&from_ms=" + from + "&to_ms=" + to;
     return;
   }
   const b = ev.target.closest("[data-rep]");
   if (!b) return;
   ui.report = b.dataset.rep;
-  ui.reportRule = "";
   persist();
   resetScrolls("reports", "repbody");
   renderReports();
+  if (window.nmLoadReport) window.nmLoadReport();
 });
 document.addEventListener("click", onAddrCellClick, true);
 document.addEventListener("contextmenu", ev => {
@@ -6231,9 +6089,9 @@ document.getElementById("settings-tiles").addEventListener("click", ev => {
   if (dbmBtn) {
     const d = getSettingsDraft();
     const inp = dbmBtn.parentElement.querySelector("input[data-dbmax]");
-    const cur = Number(inp ? inp.value : d.dbMaxGb);
-    const next = Math.max(1, Math.min(99, Math.floor((Number.isFinite(cur) ? cur : 2) + Number(dbmBtn.dataset.dbmaxStep))));
-    d.dbMaxGb = next;
+    const cur = Number(inp ? inp.value : d.dbMaxMb);
+    const next = Math.max(64, Math.min(99 * 1024, Math.floor((Number.isFinite(cur) ? cur : 2048) + Number(dbmBtn.dataset.dbmaxStep))));
+    d.dbMaxMb = next;
     if (inp) inp.value = String(next);
     ev.preventDefault();
     ev.stopPropagation();
@@ -6325,8 +6183,8 @@ function onSettingsField(el) {
   }
   if (el.dataset && el.dataset.keepU) d[el.dataset.keepU] = el.value === "mo" ? "mo" : "d";
   if (el.dataset && el.dataset.dbmax) {
-    const n = Math.max(1, Math.min(99, Math.floor(Number(el.value) || 2)));
-    d.dbMaxGb = n;
+    const n = Math.max(64, Math.min(99 * 1024, Math.floor(Number(el.value) || 2048)));
+    d.dbMaxMb = n;
     el.value = String(n);
   }
   if (el.dataset && el.dataset.snd) {
@@ -6418,7 +6276,7 @@ function openBrandModal() {
       <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
     </div>`;
-  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.5 · 05.10.2026", body, ""), "brand");
+  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.6 · 09.10.2026", body, ""), "brand");
 }
 
 document.getElementById("profile").addEventListener("click", openProfileModal);
@@ -6533,7 +6391,7 @@ function saveModal() {
     const el = document.querySelector("#modal [data-k=name]");
     if (el) m.name = el.value;
     const a = m.agent;
-    const action = {ok:"trust",no:"reject",revoke:"revoke",del:"delete",remove:"remove"}[m.act];
+    const action = {ok:"trust",no:"reject",revoke:"revoke",del:"delete",remove:"remove",stop:"stop"}[m.act];
     if (action === "remove" && !agentRemoveLive(a)) return;
     if (action) {
       if (m.saving) return;
@@ -6542,7 +6400,7 @@ function saveModal() {
         method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name:m.name, resume: !!m.resume})
       }).then(async r => {
         if (!r.ok) throw new Error(await r.text());
-        closeModal(); await window.nmRefresh(); toastMsg(action === "remove" ? "ждём ответ машины" : action === "delete" ? "агент забыт" : "сохранено");
+        closeModal(); await window.nmRefresh(); toastMsg(action === "remove" ? "ждём ответ машины" : action === "delete" ? "агент забыт" : action === "stop" ? "агент останавливается" : "сохранено");
       }).catch(e => {m.saving=false;toastMsg(e.message || "не удалось сохранить");});
     } else if (m.act === "asnew") { toastMsg("подтверждение клона ещё не реализовано"); }
     else if (m.act === "pause") {
@@ -6826,14 +6684,6 @@ menu.addEventListener("click", ev => {
       openRuleModal("create", { draft: d });
       return;
     }
-    if (a === "hits") {
-      ui.report = "rulehits";
-      ui.reportRule = r.name;
-      persist();
-      setSection("reports");
-      if (window.nmLoadReport) window.nmLoadReport();
-      return;
-    }
     if (a === "delrule") { window.nmSaveRule(r, null, "delete"); return; }
     return;
   }
@@ -7023,12 +6873,10 @@ requestAnimationFrame(() => {
         });
       });
       Object.keys(VM_RES).forEach(k => delete VM_RES[k]);
-      Object.keys(VM_DAY).forEach(k => delete VM_DAY[k]);
       servers.forEach(s => {
         if (s.cpu_pct != null || s.ram_pct != null || s.disk_pct != null) {
           VM_RES[s.host_id] = { cpu: s.cpu_pct || 0, ram: s.ram_pct || 0, disk: s.disk_pct || 0 };
         }
-        VM_DAY[s.host_id] = { rx24: s.rx24 || 0, tx24: s.tx24 || 0 };
       });
     } else if (Array.isArray(d.servers)) {
       const old = {};
@@ -7064,7 +6912,9 @@ requestAnimationFrame(() => {
       resumeHost: a.resume_host || "",
       resumeName: a.resume_name || "",
       removing: a.removing || "",
-      removalError: a.removalError || ""
+      collect_fault: a.collect_fault || "",
+      removalError: a.removalError || "",
+      stopped: !!a.stopped
     }));
     AGENTS.splice(0, AGENTS.length, ...ag);
     const bansLive = liveArr(d, "bans");
@@ -7190,7 +7040,7 @@ requestAnimationFrame(() => {
     }
     const histLive = liveArr(d, "history");
     if (histLive) {
-    const hist = histLive.map(f => ({
+    const hist = histLive.filter(f => f.state === "block").map(f => ({
       at: f.at || f.when || "", vm: f.host_id || f.vm || f.server, proc: f.container ? "—" : (f.proc || "—"), container: f.container || "",
       dir: (f.direction || f.dir) === "in" ? "in" : insideDir(f.direction || f.dir) ? (f.direction || f.dir) : "out",
       proto: f.protocol || f.proto || "",
@@ -7199,7 +7049,7 @@ requestAnimationFrame(() => {
       tx: typeof f.tx === "number" ? bytes(f.tx) : (f.tx || "0 B"),
       rule: f.rule || "—", state: f.state || "open"
     }));
-    HISTORY.splice(0, HISTORY.length, ...hist);
+    DROPS.splice(0, DROPS.length, ...hist);
     }
     const st = d.settings || {};
     if (st.listen_host) SETTINGS.listenHost = st.listen_host;
@@ -7211,16 +7061,15 @@ requestAnimationFrame(() => {
     if (st.sound_alert != null) SETTINGS.soundAlert = st.sound_alert !== "0";
     if (st.sound_ask_s) SETTINGS.soundAskSec = Math.max(1, Math.min(3600, Number(st.sound_ask_s) || 10));
     if (st.sound_alert_s) SETTINGS.soundAlertSec = Math.max(1, Math.min(3600, Number(st.sound_alert_s) || 10));
-    if (st.samples_n) SETTINGS.samplesN = Number(st.samples_n);
-    if (st.samples_u) SETTINGS.samplesU = st.samples_u;
-    if (st.flows_n) SETTINGS.flowsN = Number(st.flows_n);
-    if (st.flows_u) SETTINGS.flowsU = st.flows_u;
-    if (st.hours_n) SETTINGS.hoursN = Number(st.hours_n);
-    if (st.hours_u) SETTINGS.hoursU = st.hours_u;
-    if (st.db_max_gb) SETTINGS.dbMaxGb = Math.max(1, Math.min(99, Number(st.db_max_gb) || 2));
+    if (st.db_max_mb) SETTINGS.dbMaxMb = Math.max(64, Math.min(99 * 1024, Number(st.db_max_mb) || 2048));
+    else if (st.db_max_gb) SETTINGS.dbMaxMb = Math.max(64, Math.min(99 * 1024, (Number(st.db_max_gb) || 2) * 1024));
     if (d.starter && typeof d.starter === "object") {
       SETTINGS.starter = Object.assign({ dns: true, ntp: true, monitor: true, ssh: true, ubuntu: true }, d.starter);
       SETTINGS.starter.monitor = true;
+    }
+    if (d.host_names && typeof d.host_names === "object") {
+      Object.keys(HOST_NAMES).forEach(k => delete HOST_NAMES[k]);
+      Object.assign(HOST_NAMES, d.host_names);
     }
     state.emptyPark = !d.has_trusted;
     state.monitorLost = false;
@@ -7314,10 +7163,8 @@ requestAnimationFrame(() => {
       }
       if (state.section === "policy") url += banStateParams();
       if (state.section === "log") {
-        const hf = state.histFilter || {};
         const af = state.auditApplied || state.auditFilter || {};
-        if (hf.addr) url += "&addr=" + encodeURIComponent(hf.addr);
-        if (hf.proc) url += "&process=" + encodeURIComponent(hf.proc);
+        if (af.addr) url += "&addr=" + encodeURIComponent(af.addr);
         if (af.act) url += "&action=" + encodeURIComponent(af.act);
         if (af.who) url += "&who=" + encodeURIComponent(af.who);
       }
@@ -7458,19 +7305,15 @@ window.nmSaveRule = async function(d,m,op) {
     } catch (e) { toastMsg(e.message || "не удалось снять бан"); }
   };
   window.nmLoadReport = async function() {
-    if (LIVE.reportBusy) return;
-    const cur = ui.report || "maxaddr";
-    const lf = state.reportFilter || {};
-    const from = lf.from ? Date.parse(lf.from) : 0;
-    const to = lf.to ? Date.parse(lf.to) + 86400000 - 1 : 0;
-    const qs = "&from_ms=" + (Number.isFinite(from) && from > 0 ? from : 0) + "&to_ms=" + (Number.isFinite(to) && to > 0 ? to : 0);
+    if (LIVE.reportBusy) { LIVE.reportAgain = true; return; }
+    LIVE.reportAgain = false;
+    const cur = REPORTS.some(r => r.id === ui.report) ? ui.report : "scanners";
     const f = currentFilter();
     const server = (sectionHasVmPicker() && f && !f.all && f.shown && f.shown.length === 1) ? f.shown[0] : "";
-    const rule = (cur === "rulehits" && ui.reportRule) ? "&rule_id=" + encodeURIComponent(ui.reportRule) : "";
     LIVE.reportBusy = true;
     if (state.section === "reports") renderReports();
     try {
-      const r = await fetch("/ui/api/reports?id=" + encodeURIComponent(cur) + qs + (server ? "&server=" + encodeURIComponent(server) : "") + rule);
+      const r = await fetch("/ui/api/reports?id=" + encodeURIComponent(cur) + (server ? "&server=" + encodeURIComponent(server) : ""));
       if (!r.ok) throw new Error("http");
       const j = await r.json();
       const i = REPORTS.findIndex(x => x.id === j.id);
@@ -7482,7 +7325,10 @@ window.nmSaveRule = async function(d,m,op) {
       toastMsg("не удалось сформировать отчёт");
     } finally {
       LIVE.reportBusy = false;
-      if (state.section === "reports") renderReports();
+      if (state.section === "reports") {
+        renderReports();
+        if (LIVE.reportAgain) window.nmLoadReport();
+      }
     }
   };
   window.nmRefresh = pull;
@@ -7546,10 +7392,7 @@ window.nmSaveRule = async function(d,m,op) {
         sound_alert: !!d.soundAlert,
         sound_ask_s: Math.max(1, Math.floor(Number(d.soundAskSec) || 10)),
         sound_alert_s: Math.max(1, Math.floor(Number(d.soundAlertSec) || 10)),
-        samples_n: d.samplesN, samples_u: d.samplesU,
-        flows_n: d.flowsN, flows_u: d.flowsU,
-        hours_n: d.hoursN, hours_u: d.hoursU,
-        db_max_gb: Math.max(1, Math.min(99, Math.floor(Number(d.dbMaxGb) || 2))),
+        db_max_mb: Math.max(64, Math.min(99 * 1024, Math.floor(Number(d.dbMaxMb) || 2048))),
       })
     });
     if (r.status === 401) { showLogin(); return; }

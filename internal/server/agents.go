@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"netmonitor/internal/idgen"
+
 	"netmonitor/internal/store"
 	"strings"
 	"unicode"
@@ -24,7 +25,19 @@ func (s *Server) changeAgent(id, action, name, src string) error {
 }
 
 func (s *Server) applyAgentChange(id, action, name, src string, resume bool) error {
-	return s.st.Update(func(tx *sql.Tx) error {
+	// Перепривязка, удаление и сброс берут flushMu раньше записи в базу.
+	// Иначе сброс, уже держащий flushMu, ждёт писателя, а этот путь — его.
+	// Удаление ещё и снимает отложенные события этого агента, чтобы они
+	// не роняли общий сброс после исчезновения строки владельца.
+	lockFlush := resume || action == "delete"
+	if lockFlush {
+		// Wait for accepted batches to finish publishing before clearing their data.
+		s.agentStateMu.Lock()
+		defer s.agentStateMu.Unlock()
+		s.flushMu.Lock()
+	}
+	var movedFrom, movedTo string
+	err := s.st.Update(func(tx *sql.Tx) error {
 		var trust, host, oldName, lastIP string
 		err := tx.QueryRow("SELECT trust_state,host_id,COALESCE(display_name,''),COALESCE(last_src_ip,'') FROM agents WHERE agent_id=?", id).Scan(&trust, &host, &oldName, &lastIP)
 		if err == sql.ErrNoRows {
@@ -64,7 +77,9 @@ func (s *Server) applyAgentChange(id, action, name, src string, resume bool) err
 		case "delete":
 			return deleteAgentRow(tx, id, trust, host, oldName, src, "")
 		case "remove":
-			return queueAgentRemoval(tx, id, trust, host, oldName, src)
+			return s.queueAgentRemoval(tx, id, trust, host, oldName, src)
+		case "stop":
+			return s.queueAgentStop(tx, id, trust, host, oldName, src)
 		default:
 			return errAgentState
 		}
@@ -87,6 +102,7 @@ func (s *Server) applyAgentChange(id, action, name, src string, resume bool) err
 				if err := rebindAgentHost(tx, id, host, old); err != nil {
 					return err
 				}
+				movedFrom, movedTo = host, old
 				label = "подтвердил агента, продолжил историю"
 			}
 			if _, err = tx.Exec("UPDATE agents SET trust_state=?,display_name=?,approved_at_ms=?,approved_by='adm',policy_rev=policy_rev+1 WHERE agent_id=?", next, name, now, id); err != nil {
@@ -100,6 +116,33 @@ func (s *Server) applyAgentChange(id, action, name, src string, resume bool) err
 		_, err = tx.Exec("INSERT INTO audit_log(audit_id,at_ms,actor,action,object,src_ip) VALUES(?,?,?,?,?,?)", idgen.NewV7(), now, "adm", label, id+" "+name, src)
 		return err
 	})
+	if err == nil && action == "delete" {
+		s.forgetAgentMemory(id)
+	}
+	if err == nil && movedFrom != "" && movedTo != "" && movedFrom != movedTo {
+
+		s.moveDropHost(movedFrom, movedTo)
+		s.moveSSHHost(movedFrom, movedTo)
+
+	}
+	if err == nil && s.st != nil {
+	}
+	if lockFlush {
+		s.flushMu.Unlock()
+	}
+	if err != nil {
+		return err
+	}
+	// Продолжение истории переписывает host_id открытых flows. Память после коммита читает их заново.
+	// flushMu уже отпущен: liveReload берёт свою блокировку и очередь снимка.
+	if resume {
+
+	}
+	// Без диска перечитывать нечего: соединения в памяти переходят на прежний хост.
+	if movedFrom != "" && movedTo != "" && movedFrom != movedTo {
+		s.moveLiveHost(movedFrom, movedTo)
+	}
+	return nil
 }
 func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request) {
 	action := r.PathValue("action")
@@ -139,19 +182,18 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func queueAgentRemoval(tx *sql.Tx, id, trust, host, name, src string) error {
+func (s *Server) queueAgentRemoval(tx *sql.Tx, id, trust, host, name, src string) error {
 	if trust != "trusted" {
 		return errAgentState
 	}
 	var last int64
-	err := tx.QueryRow(`SELECT COALESCE(last_seen_ms,0) FROM hosts WHERE host_id=?`, host).Scan(&last)
-	if err == sql.ErrNoRows {
-		last = 0
-		err = nil
+	var err error
+	{
+		s.pulseMu.Lock()
+		last = s.hostSeen[host]
+		s.pulseMu.Unlock()
 	}
-	if err != nil {
-		return err
-	}
+
 	if last < store.NowMS()-60000 {
 		return errAgentSilent
 	}
@@ -170,6 +212,32 @@ func queueAgentRemoval(tx *sql.Tx, id, trust, host, name, src string) error {
 	return err
 }
 
+func (s *Server) queueAgentStop(tx *sql.Tx, id, trust, host, name, src string) error {
+	if trust != "trusted" {
+		return errAgentState
+	}
+	var last int64
+	s.pulseMu.Lock()
+	last = s.hostSeen[host]
+	s.pulseMu.Unlock()
+	if last < store.NowMS()-60000 {
+		return errAgentSilent
+	}
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='stop' AND acked_at_ms IS NULL`, id).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	now := store.NowMS()
+	if _, err := tx.Exec(`INSERT INTO commands(command_id,agent_id,kind,payload,created_at_ms) VALUES(?,?,?,?,?)`, idgen.NewV7(), id, "stop", "{}", now); err != nil {
+		return err
+	}
+	_, err := tx.Exec("INSERT INTO audit_log(audit_id,at_ms,actor,action,object,src_ip) VALUES(?,?,?,?,?,?)", idgen.NewV7(), now, "adm", "остановил агента", id+" "+name, src)
+	return err
+}
+
 func deleteAgentRow(tx *sql.Tx, id, trust, host, name, src, action string) error {
 	if action == "" {
 		action = "забыл агента"
@@ -182,13 +250,10 @@ func deleteAgentRow(tx *sql.Tx, id, trust, host, name, src, action string) error
 	if _, err := tx.Exec(`DELETE FROM commands WHERE agent_id=?`, id); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM collector_health WHERE agent_id=?`, id); err != nil {
-		return err
-	}
 	if _, err := tx.Exec(`DELETE FROM ingest_events WHERE agent_id=?`, id); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM settings WHERE k=?`, "fw_status:"+id); err != nil {
+	if _, err := tx.Exec(`DELETE FROM settings WHERE k IN (?,?)`, "fw_status:"+id, "question_floor:"+id); err != nil {
 		return err
 	}
 	var lastIP string
@@ -242,9 +307,8 @@ func scanOrphanHost(q orphanScanner, hostname, ip, exceptHost string) (id, name 
 	err = q.QueryRow(`SELECT h.host_id, COALESCE(NULLIF(trim(h.hostname),''), ?) FROM hosts h
 		WHERE `+orphan+` AND (
 			EXISTS (SELECT 1 FROM settings s WHERE s.k='last_ip:'||h.host_id AND s.v=?)
-			OR EXISTS (SELECT 1 FROM flows f WHERE f.host_id=h.host_id AND f.local_ip=?)
 		)
-		ORDER BY COALESCE(h.last_seen_ms,0) DESC LIMIT 1`, exceptHost, ip, ip, ip).Scan(&id, &name)
+		ORDER BY COALESCE(h.last_seen_ms,0) DESC LIMIT 1`, exceptHost, ip, ip).Scan(&id, &name)
 	if err == sql.ErrNoRows {
 		return "", "", nil
 	}
@@ -258,15 +322,8 @@ func rebindAgentHost(tx *sql.Tx, agentID, from, to string) error {
 	if _, err := tx.Exec(`UPDATE agents SET host_id=? WHERE agent_id=?`, to, agentID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE flows SET agent_id=? WHERE host_id=?`, agentID, from); err != nil {
-		return err
-	}
 	for _, q := range []string{
-		`UPDATE flows SET host_id=? WHERE host_id=?`,
-		`UPDATE firewall_events SET host_id=? WHERE host_id=?`,
 		`UPDATE learn_questions SET host_id=? WHERE host_id=?`,
-		`UPDATE ssh_failures SET host_id=? WHERE host_id=?`,
-		`UPDATE collector_health SET host_id=? WHERE host_id=?`,
 		`UPDATE blocks SET host_id=? WHERE host_id=?`,
 		`UPDATE alerts SET host_id=? WHERE host_id=?`,
 	} {
@@ -274,31 +331,12 @@ func rebindAgentHost(tx *sql.Tx, agentID, from, to string) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`UPDATE flows SET agent_id=? WHERE host_id=?`, agentID, to); err != nil {
+	if _, err := tx.Exec(`INSERT INTO ssh_brute(remote_ip,host_id,attempts,first_at_ms,last_at_ms)
+ SELECT remote_ip,?,attempts,first_at_ms,last_at_ms FROM ssh_brute WHERE host_id=?
+ ON CONFLICT(remote_ip,host_id) DO UPDATE SET attempts=attempts+excluded.attempts,first_at_ms=MIN(first_at_ms,excluded.first_at_ms),last_at_ms=MAX(last_at_ms,excluded.last_at_ms)`, to, from); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE flow_samples SET agent_id=? WHERE flow_uid IN (SELECT flow_uid FROM flows WHERE host_id=?)`, agentID, to); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE collector_health SET agent_id=? WHERE host_id=?`, agentID, to); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traffic_1m(host_id,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,samples)
-		SELECT ?,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,samples FROM traffic_1m WHERE host_id=?
-		ON CONFLICT(host_id,bucket_start_ms,direction,remote_scope) DO UPDATE SET
-		  bytes_out=bytes_out+excluded.bytes_out, bytes_in=bytes_in+excluded.bytes_in, samples=samples+excluded.samples`, to, from); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM traffic_1m WHERE host_id=?`, from); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traffic_1h(host_id,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,flows,dirty)
-		SELECT ?,bucket_start_ms,direction,remote_scope,bytes_out,bytes_in,flows,dirty FROM traffic_1h WHERE host_id=?
-		ON CONFLICT(host_id,bucket_start_ms,direction,remote_scope) DO UPDATE SET
-		  bytes_out=bytes_out+excluded.bytes_out, bytes_in=bytes_in+excluded.bytes_in, flows=flows+excluded.flows`, to, from); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM traffic_1h WHERE host_id=?`, from); err != nil {
+	if _, err := tx.Exec("DELETE FROM ssh_brute WHERE host_id=?", from); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO ip_group_host_excl(group_id,host_id) SELECT group_id,? FROM ip_group_host_excl WHERE host_id=?`, to, from); err != nil {
@@ -307,17 +345,11 @@ func rebindAgentHost(tx *sql.Tx, agentID, from, to string) error {
 	if _, err := tx.Exec(`DELETE FROM ip_group_host_excl WHERE host_id=?`, from); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO remote_seen(host_id,remote_ip_bin,remote_ip,first_seen_ms,last_seen_ms,flows)
-		SELECT ?,remote_ip_bin,remote_ip,first_seen_ms,last_seen_ms,flows FROM remote_seen WHERE host_id=?
-		ON CONFLICT(host_id,remote_ip_bin) DO UPDATE SET last_seen_ms=excluded.last_seen_ms, flows=remote_seen.flows+excluded.flows`, to, from); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM remote_seen WHERE host_id=?`, from); err != nil {
-		return err
-	}
 	if _, err := tx.Exec(`INSERT INTO dns_seen(host_id,name,ip_bin,ip,first_seen_ms,last_seen_ms)
 		SELECT ?,name,ip_bin,ip,first_seen_ms,last_seen_ms FROM dns_seen WHERE host_id=?
-		ON CONFLICT(host_id,name,ip_bin) DO UPDATE SET last_seen_ms=excluded.last_seen_ms`, to, from); err != nil {
+		ON CONFLICT(host_id,name,ip_bin) DO UPDATE SET
+		  first_seen_ms=MIN(dns_seen.first_seen_ms, excluded.first_seen_ms),
+		  last_seen_ms=MAX(dns_seen.last_seen_ms, excluded.last_seen_ms)`, to, from); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM dns_seen WHERE host_id=?`, from); err != nil {

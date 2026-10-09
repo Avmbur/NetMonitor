@@ -35,9 +35,17 @@ func (s *Server) agentFromTLS(r *http.Request) (ingest.Agent, error) {
 		return ag, nil
 	}
 	var ag ingest.Agent
+	seen := map[string]int64{}
+	{
+		s.pulseMu.Lock()
+		for host, at := range s.hostSeen {
+			seen[host] = at
+		}
+		s.pulseMu.Unlock()
+	}
 	err := s.st.Update(func(tx *sql.Tx) error {
 		var e error
-		ag, e = resolveAgentTx(tx, fp, src)
+		ag, e = resolveAgentTx(tx, fp, src, seen)
 		return e
 	})
 	return ag, err
@@ -61,7 +69,7 @@ type agentFPRow struct {
 	name                string
 }
 
-func resolveAgentTx(tx *sql.Tx, fp, src string) (ingest.Agent, error) {
+func resolveAgentTx(tx *sql.Tx, fp, src string, pulse map[string]int64) (ingest.Agent, error) {
 	rows, err := tx.Query(
 		`SELECT a.agent_id, a.host_id, a.trust_state, COALESCE(a.last_src_ip,''), COALESCE(h.last_seen_ms,0), COALESCE(a.display_name,h.hostname,'')
 		 FROM agents a LEFT JOIN hosts h ON h.host_id=a.host_id
@@ -102,7 +110,8 @@ func resolveAgentTx(tx *sql.Tx, fp, src string) (ingest.Agent, error) {
 	live := false
 	var origin agentFPRow
 	for _, r := range list {
-		if r.seen > now-cloneFreshMS {
+		seenAt := pulse[r.host]
+		if seenAt > now-cloneFreshMS {
 			live = true
 			if origin.id == "" {
 				origin = r

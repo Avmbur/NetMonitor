@@ -14,6 +14,7 @@ import (
 
 func TestRemovalCompletionRetryAndAuthorization(t *testing.T) {
 	s, cert := batchFixture(t)
+	s.hostSeen = map[string]int64{"h": store.NowMS()}
 	if _, err := s.st.DB.Exec("UPDATE hosts SET last_seen_ms=?", store.NowMS()); err != nil {
 		t.Fatal(err)
 	}

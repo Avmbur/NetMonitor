@@ -66,7 +66,7 @@ func alertEventText(a uiAlert, host string) string {
 		}
 		return msg
 	case "disk-90":
-		return "диск 90% — трафик не пишется"
+		return "диск 90% — мало места"
 	case "disk-80":
 		return "диск 80% — мало места"
 	default:
@@ -96,7 +96,7 @@ func alertHint(rule string, hist bool) string {
 	case "clone":
 		return "тот же ключ агента с другого адреса"
 	case "disk-90":
-		return "диск заполнен, запись трафика остановлена"
+		return "на диске совсем мало места"
 	case "disk-80":
 		return "на диске мало места"
 	default:
@@ -116,4 +116,47 @@ func hostTitle(q policyReader, hostID string) string {
 		return name
 	}
 	return hostID
+}
+
+func hostNames(db policyReader) map[string]string {
+	out := map[string]string{}
+	rows, err := db.Query(`SELECT host_id, COALESCE(hostname,'') FROM hosts`)
+	if err != nil {
+		return out
+	}
+	for rows.Next() {
+		var id, name string
+		if rows.Scan(&id, &name) == nil && strings.TrimSpace(name) != "" {
+			out[id] = strings.TrimSpace(name)
+		}
+	}
+	rows.Close()
+	rows, err = db.Query(`SELECT host_id, COALESCE(display_name,'') FROM agents WHERE COALESCE(display_name,'')!=''`)
+	if err != nil {
+		return out
+	}
+	for rows.Next() {
+		var id, name string
+		if rows.Scan(&id, &name) == nil && strings.TrimSpace(name) != "" {
+			out[id] = strings.TrimSpace(name)
+		}
+	}
+	rows.Close()
+	return out
+}
+
+func namedHosts(db policyReader, hosts []string) []string {
+	if hosts == nil {
+		return nil
+	}
+	names := hostNames(db)
+	out := make([]string, len(hosts))
+	for i, id := range hosts {
+		if name := names[id]; name != "" {
+			out[i] = name
+		} else {
+			out[i] = id
+		}
+	}
+	return out
 }

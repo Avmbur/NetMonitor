@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
@@ -50,11 +51,19 @@ func (s *Server) recordApply(agentID string, in protocol.PollReq) error {
 		if st.DesiredRev > desired {
 			return fmt.Errorf("unissued policy revision")
 		}
-		if _, err := tx.Exec(`UPDATE agents SET fw_backend=? WHERE agent_id=?`, st.Backend, agentID); err != nil {
+		var backend, prev string
+		if err := tx.QueryRow(`SELECT COALESCE(fw_backend,''), COALESCE((SELECT v FROM settings WHERE k=?),'') FROM agents WHERE agent_id=?`, "fw_status:"+agentID, agentID).Scan(&backend, &prev); err != nil {
 			return err
 		}
-		if err := store.PutSetting(tx, "fw_status:"+agentID, string(raw)); err != nil {
-			return err
+		if backend != st.Backend {
+			if _, err := tx.Exec(`UPDATE agents SET fw_backend=? WHERE agent_id=?`, st.Backend, agentID); err != nil {
+				return err
+			}
+		}
+		if prev != string(raw) {
+			if err := store.PutSetting(tx, "fw_status:"+agentID, string(raw)); err != nil {
+				return err
+			}
 		}
 		for _, id := range st.CommandIDs {
 			var delivered, deliveredRev sql.NullInt64
@@ -92,6 +101,15 @@ func (s *Server) recordApply(agentID string, in protocol.PollReq) error {
 			}
 			if _, err := tx.Exec(`UPDATE commands SET acked_at_ms=COALESCE(acked_at_ms,?),result='applied',error=NULL WHERE command_id=? AND agent_id=?`, store.NowMS(), id, agentID); err != nil {
 				return err
+			}
+			if kind == "stop" {
+				var host string
+				if err := tx.QueryRow(`SELECT host_id FROM agents WHERE agent_id=?`, agentID).Scan(&host); err != nil {
+					return err
+				}
+				if err := store.PutSetting(tx, "agent_stopped:"+host, strconv.FormatInt(store.NowMS(), 10)); err != nil {
+					return err
+				}
 			}
 		}
 		if in.Uninstalled != "" {

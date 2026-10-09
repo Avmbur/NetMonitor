@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http/httptest"
+	"net/netip"
+	"strings"
+	"testing"
+
+	"netmonitor/internal/netipx"
 	"netmonitor/internal/policy"
 	"netmonitor/internal/protocol"
 	"netmonitor/internal/store"
-	"testing"
 )
 
 func groupReq(t *testing.T, s *Server, body string, want int) string {
@@ -72,6 +76,25 @@ func TestGroupScopeOrderAndQuestionResolution(t *testing.T) {
 	groupReq(t, s, string(raw), 400)
 }
 
+func TestGroupPatternTravelsAsName(t *testing.T) {
+	s, _ := batchFixture(t)
+	id := groupReq(t, s, `{"name":"ubuntu","policy":"watch","members":"motd.ubuntu.com","hosts":"all"}`, 200)
+	gs, err := hostGroups(s.st.DB, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, g := range gs {
+		if g.ID != id {
+			continue
+		}
+		found = len(g.Match.Names) == 1 && g.Match.Names[0] == "motd.ubuntu.com"
+	}
+	if !found {
+		t.Fatalf("group name was not sent to the agent: %+v", gs)
+	}
+}
+
 func TestAddMemberKeepsGroupAndMuteLeavesAction(t *testing.T) {
 	s, _ := batchFixture(t)
 	id := groupReq(t, s, `{"name":"net","policy":"block","members":"203.0.113.1","hosts":["h"],"mute":true}`, 200)
@@ -99,6 +122,49 @@ func TestAddMemberKeepsGroupAndMuteLeavesAction(t *testing.T) {
 	s.st.DB.QueryRow("SELECT count(*) FROM ip_groups WHERE group_id=?", id).Scan(&n)
 	if n != 0 {
 		t.Fatal("group remained")
+	}
+}
+
+func TestGroupPatternsResolveTogether(t *testing.T) {
+	s, _ := batchFixture(t)
+	id := groupReq(t, s, `{"name":"ubuntu","policy":"allow","members":"motd.ubuntu.com\n*.ubuntu.com","hosts":["h"]}`, 200)
+	add := func(host, name, ip string) {
+		t.Helper()
+		a := netip.MustParseAddr(ip)
+		if _, err := s.st.DB.Exec(`INSERT INTO dns_seen(host_id,name,ip_bin,ip,first_seen_ms,last_seen_ms) VALUES(?,?,?,?,1,1)`,
+			host, name, netipx.Bin16(a), netipx.Canonical(a)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("h", "motd.ubuntu.com", "203.0.113.1")
+	add("other", "motd.ubuntu.com", "203.0.113.1")
+	add("h", "security.ubuntu.com", "203.0.113.2")
+	add("h", "ubuntu.com", "203.0.113.3")
+	add("h", "notubuntu.com", "203.0.113.4")
+	add("h", "example.org", "203.0.113.5")
+	gs, err := hostGroups(s.st.DB, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nets []string
+	for _, g := range gs {
+		if g.ID == id {
+			nets = g.Match.Networks
+		}
+	}
+	joined := strings.Join(nets, ",")
+	for _, want := range []string{"203.0.113.1/32", "203.0.113.2/32", "203.0.113.3/32"} {
+		if !strings.Contains(joined, want) {
+			t.Fatal(nets)
+		}
+	}
+	for _, bad := range []string{"203.0.113.4/32", "203.0.113.5/32"} {
+		if strings.Contains(joined, bad) {
+			t.Fatal(nets)
+		}
+	}
+	if strings.Count(joined, "203.0.113.1/32") != 2 {
+		t.Fatal("same address from two hosts", nets)
 	}
 }
 

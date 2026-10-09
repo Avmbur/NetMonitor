@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"netmonitor/internal/fw"
 	"netmonitor/internal/netipx"
 	pol "netmonitor/internal/policy"
 	"netmonitor/internal/protocol"
@@ -19,15 +20,36 @@ var lookupHostIPs = func(ctx context.Context, name string) ([]netip.Addr, error)
 }
 
 const (
-	nameRefresh       = 5 * time.Second
-	nameLookupTimeout = 1200 * time.Millisecond
+	// Известные адреса не переспрашиваем на каждом опросе: иначе агент сам
+	// заполняет плитки запросами к локальному резолверу.
+	nameRefresh        = 5 * time.Minute
+	nameRetrySoon      = 30 * time.Second
+	nameRetryLater     = 2 * time.Minute
+	nameLookupsPerPoll = 2
+	nameLookupTimeout  = 1200 * time.Millisecond
 )
 
 type resolvedName struct {
 	at       time.Time
+	fails    int
 	prefixes []string
 	reported map[string]bool
 	pending  map[string]protocol.DNSPayload
+}
+
+// nameDueAfter — когда снова спрашивать имя. Успех держится 5 минут.
+// Ошибка не стирает адреса: повтор через 30 с, 2 мин и дальше снова 5 мин.
+func nameDueAfter(c resolvedName) time.Duration {
+	switch c.fails {
+	case 0:
+		return nameRefresh
+	case 1:
+		return nameRetrySoon
+	case 2:
+		return nameRetryLater
+	default:
+		return nameRefresh
+	}
 }
 
 func normalizeDNSName(raw string) string {
@@ -69,25 +91,52 @@ func prefixOf(ip netip.Addr) string {
 	return netip.PrefixFrom(ip, bits).String()
 }
 
+// beginNamePoll ограничивает обновление уже известных имён двумя за опрос.
+// Новое имя в этот счётчик не входит. Срок не привязан к policy_rev:
+// новый адрес сам сдвигает ревизию и иначе снова перерешил бы весь список.
+func (a *Agent) beginNamePoll() {
+	a.nameMu.Lock()
+	a.namePoll = true
+	a.nameRefreshLeft = nameLookupsPerPoll
+	a.nameMu.Unlock()
+}
+
+func (a *Agent) endNamePoll() {
+	a.nameMu.Lock()
+	a.namePoll = false
+	a.nameMu.Unlock()
+}
+
 // attachResolved adds every current address of a rule's DNS name to the
 // firewall match and reports addresses the monitor has not been told yet.
 func (a *Agent) attachResolved(rules []pol.Rule) ([]pol.Rule, []protocol.DNSPayload) {
 	names := uniqueDNSNames(rules)
 	now := time.Now()
-	var stale []string
 	a.nameMu.Lock()
+	var fresh, due []string
 	for _, name := range names {
 		c := a.resolved[name]
-		if c.at.IsZero() || now.Sub(c.at) >= nameRefresh {
-			stale = append(stale, name)
+		if c.at.IsZero() {
+			fresh = append(fresh, name)
+			continue
+		}
+		if now.Sub(c.at) >= nameDueAfter(c) {
+			due = append(due, name)
 		}
 	}
 	// Oldest attempts go first, so slow names cannot starve later names even
 	// when every entry is stale again by the next policy poll.
-	slices.SortStableFunc(stale, func(x, y string) int {
+	slices.SortStableFunc(due, func(x, y string) int {
 		return a.resolved[x].at.Compare(a.resolved[y].at)
 	})
+	if a.namePoll && len(due) > a.nameRefreshLeft {
+		due = due[:a.nameRefreshLeft]
+	}
+	if a.namePoll {
+		a.nameRefreshLeft -= len(due)
+	}
 	a.nameMu.Unlock()
+	stale := append(fresh, due...)
 	started := time.Now()
 	found := map[string][]netip.Addr{}
 	tried := map[string]time.Time{}
@@ -116,6 +165,14 @@ func (a *Agent) attachResolved(rules []pol.Rule) ([]pol.Rule, []protocol.DNSPayl
 		}
 		if at, ok := tried[name]; ok {
 			c.at = at
+			clean, have := found[name]
+			if !have || len(clean) == 0 {
+				if c.fails < 3 {
+					c.fails++
+				}
+			} else {
+				c.fails = 0
+			}
 		}
 		if clean := found[name]; len(clean) > 0 {
 			c.prefixes = nil
@@ -173,6 +230,82 @@ func (a *Agent) attachResolved(rules []pol.Rule) ([]pol.Rule, []protocol.DNSPayl
 		out[i].Match.Networks = pol.MergeNetworks(out[i].Match.Networks, extra)
 	}
 	return out, reports
+}
+
+// absorbName adds an address the agent just saw to every group and rule that
+// names it. The next packet then follows that policy instead of becoming a
+// learn question while the monitor is still learning the address.
+func (a *Agent) absorbName(name, ip string) {
+	px, ok := prefixForName(name, ip)
+	if !ok {
+		return
+	}
+	unlock, err := a.lockFirewall()
+	if err != nil {
+		return
+	}
+	changed := mergeNameEverywhere(a.groups, a.rules, name, px)
+	var p fw.Policy
+	if changed {
+		p = a.policyLocked()
+	}
+	var applyErr error
+	if changed && a.firewall != nil {
+		applyErr = a.firewall.Apply(p)
+	}
+	unlock()
+	if applyErr != nil {
+		logAgentError("имя группы", applyErr)
+	}
+}
+
+func prefixForName(name, ip string) (string, bool) {
+	name = normalizeDNSName(name)
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || name == "" || !netipx.UsableNameIP(addr) {
+		return "", false
+	}
+	return prefixOf(addr.Unmap()), true
+}
+
+func nameCovers(name, pat string) bool {
+	name = normalizeDNSName(name)
+	pat = normalizeDNSName(pat)
+	if name == "" || pat == "" {
+		return false
+	}
+	if strings.HasPrefix(pat, "*.") {
+		base := strings.TrimPrefix(pat, "*.")
+		return name == base || strings.HasSuffix(name, "."+base)
+	}
+	return name == pat
+}
+
+// mergeNameEverywhere fills both sets. With «||» a rule naming the same host
+// never got the address once a group had taken it.
+func mergeNameEverywhere(groups, rules []pol.Rule, name, prefix string) bool {
+	inGroups := mergeNamePrefix(groups, name, prefix)
+	inRules := mergeNamePrefix(rules, name, prefix)
+	return inGroups || inRules
+}
+
+func mergeNamePrefix(rules []pol.Rule, name, prefix string) bool {
+	changed := false
+	for i := range rules {
+		hit := false
+		for _, n := range rules[i].Match.Names {
+			if nameCovers(name, n) {
+				hit = true
+				break
+			}
+		}
+		if !hit || slices.Contains(rules[i].Match.Networks, prefix) {
+			continue
+		}
+		rules[i].Match.Networks = append(append([]string{}, rules[i].Match.Networks...), prefix)
+		changed = true
+	}
+	return changed
 }
 
 func (a *Agent) forgetReported(rec protocol.DNSPayload) {

@@ -179,6 +179,9 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
+		if err := s.flushQuestionRepeats(tx, store.NowMS()); err != nil {
+			return err
+		}
 		if err := answerGroupQuestions(tx, now); err != nil {
 			return err
 		}
@@ -335,15 +338,119 @@ func policyStrings(db policyReader, q string, args ...any) ([]string, error) {
 	return out, rows.Err()
 }
 func resolvePattern(db policyReader, pat string) ([]string, error) {
-	pat = strings.ToLower(strings.TrimSpace(pat))
-	if pat == "" {
-		return nil, nil
+	found, err := resolvePatterns(db, []string{pat})
+	if err != nil {
+		return nil, err
 	}
-	if strings.HasPrefix(pat, "*.") {
-		suf := strings.TrimPrefix(pat, "*")
-		return policyStrings(db, `SELECT DISTINCT ip FROM dns_seen WHERE name=? OR name LIKE ?`, strings.TrimPrefix(pat, "*."), "%"+suf)
+	return found[strings.ToLower(strings.TrimSpace(pat))], nil
+}
+
+// resolvePatterns читает адреса всех имён одним-двумя запросами.
+// Точное имя, маска *.имя и чужой сосед остаются как в patternMatches.
+func resolvePatterns(db policyReader, pats []string) (map[string][]string, error) {
+	type item struct {
+		key  string
+		like string
 	}
-	return policyStrings(db, `SELECT DISTINCT ip FROM dns_seen WHERE name=?`, pat)
+	var items []item
+	exactSeen := map[string]bool{}
+	var exacts []string
+	likeSeen := map[string]bool{}
+	var likes []string
+	for _, raw := range pats {
+		pat := strings.ToLower(strings.TrimSpace(raw))
+		if pat == "" {
+			continue
+		}
+		it := item{key: pat}
+		if strings.HasPrefix(pat, "*.") {
+			apex := strings.TrimPrefix(pat, "*.")
+			it.like = "%" + strings.TrimPrefix(pat, "*")
+			if apex != "" && !exactSeen[apex] {
+				exactSeen[apex] = true
+				exacts = append(exacts, apex)
+			}
+			if !likeSeen[it.like] {
+				likeSeen[it.like] = true
+				likes = append(likes, it.like)
+			}
+		} else if !exactSeen[pat] {
+			exactSeen[pat] = true
+			exacts = append(exacts, pat)
+		}
+		items = append(items, it)
+	}
+	out := map[string][]string{}
+	seen := map[string]map[string]bool{}
+	if len(items) == 0 {
+		return out, nil
+	}
+	add := func(name, ip string) {
+		for _, it := range items {
+			if !patternMatches(name, it.key) {
+				continue
+			}
+			if seen[it.key] == nil {
+				seen[it.key] = map[string]bool{}
+			}
+			if seen[it.key][ip] {
+				continue
+			}
+			seen[it.key][ip] = true
+			out[it.key] = append(out[it.key], ip)
+		}
+	}
+	scan := func(q string, args ...any) error {
+		rows, err := db.Query(q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name, ip string
+			if err := rows.Scan(&name, &ip); err != nil {
+				return err
+			}
+			add(name, ip)
+		}
+		return rows.Err()
+	}
+	const chunk = 200
+	for i := 0; i < len(exacts); i += chunk {
+		j := i + chunk
+		if j > len(exacts) {
+			j = len(exacts)
+		}
+		part := exacts[i:j]
+		args := make([]any, len(part))
+		for k, v := range part {
+			args[k] = v
+		}
+		if err := scan("SELECT name, ip FROM dns_seen WHERE name IN ("+placeholders(len(part))+")", args...); err != nil {
+			return nil, err
+		}
+	}
+	for i := 0; i < len(likes); i += chunk {
+		j := i + chunk
+		if j > len(likes) {
+			j = len(likes)
+		}
+		part := likes[i:j]
+		args := make([]any, len(part))
+		var b strings.Builder
+		b.WriteString("SELECT name, ip FROM dns_seen WHERE ")
+		for k, v := range part {
+			if k > 0 {
+				b.WriteString(" OR ")
+			}
+			b.WriteString("name LIKE ?")
+			args[k] = v
+		}
+		if err := scan(b.String(), args...); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func patternMatches(name, pat string) bool {
@@ -438,6 +545,9 @@ func (s *Server) groupOperation(w http.ResponseWriter, in uiGroup) {
 					return err
 				}
 			}
+		}
+		if err := s.flushQuestionRepeats(tx, store.NowMS()); err != nil {
+			return err
 		}
 		if err := answerGroupQuestions(tx, store.NowMS()); err != nil {
 			return err

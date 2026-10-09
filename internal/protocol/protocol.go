@@ -6,9 +6,18 @@ import (
 )
 
 type Batch struct {
-	PendingFrom *int64  `json:"pending_from,omitempty"`
-	Lane        string  `json:"lane,omitempty"`
-	Events      []Event `json:"events"`
+	QuestionPendingFrom *int64 `json:"question_pending_from,omitempty"`
+	// Session — сеанс монитора. Пустое поле шлёт старый агент.
+	// Чужой сеанс монитор не принимает: это пачка до перезапуска.
+	Instance    string `json:"instance,omitempty"`
+	Session     string `json:"session,omitempty"`
+	PendingFrom *int64 `json:"pending_from,omitempty"`
+	// AssignedThrough — последний seq, который агент уже занял (next_seq).
+	// Вместе с pending_from это граница очереди: номер выше неё ещё не существует,
+	// номер от pending_from до неё агент ещё может прислать. Старый агент поле не шлёт.
+	AssignedThrough *int64  `json:"assigned_through,omitempty"`
+	Lane            string  `json:"lane,omitempty"`
+	Events          []Event `json:"events"`
 }
 
 type Event struct {
@@ -20,8 +29,15 @@ type Event struct {
 }
 
 type Ack struct {
-	Ack   []string `json:"ack"`
-	Error string   `json:"error,omitempty"`
+	Session string   `json:"session,omitempty"`
+	Ack     []string `json:"ack"`
+	// Held — принято в память и ещё не записано. Старый агент поля не знает
+	// и по нему очередь не чистит. Это не квитанция диска.
+	Held []string `json:"held,omitempty"`
+	// Stored — отдельные event_id, уже записанные на диск. Пропуск seq между
+	// ними не подтверждается. Список принадлежит этому агенту, не чужому.
+	Stored []string `json:"stored,omitempty"`
+	Error  string   `json:"error,omitempty"`
 }
 
 type EnrollReq struct {
@@ -173,6 +189,7 @@ type ApplyStatus struct {
 }
 
 type PollReq struct {
+	Instance     string       `json:"instance,omitempty"`
 	Status       *ApplyStatus `json:"status,omitempty"`
 	Rev          int64        `json:"rev"`
 	Ack          []string     `json:"ack"`
@@ -200,6 +217,12 @@ type PollRes struct {
 	ObserveDocker bool          `json:"observe_docker,omitempty"`
 	ScanPorts     int           `json:"scan_ports,omitempty"`
 	ScanWindowMS  int64         `json:"scan_window_ms,omitempty"`
+	// Stored — event_id, записанные на диск после прошлой доставки.
+	// Пустое поле старый агент не видит и ничего по нему не удаляет.
+	Stored []string `json:"stored,omitempty"`
+	// Session — текущий сеанс монитора. Смена значит: очередь телеметрии
+	// выбросить и прислать свежий снимок. Пустое поле — прежний монитор.
+	Session string `json:"session,omitempty"`
 }
 
 type QuestionPayload struct {

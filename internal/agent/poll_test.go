@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 
@@ -281,8 +282,13 @@ func TestPollRepairProducesOneHealthEvent(t *testing.T) {
 	if err := a.applyPoll(pr); err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if err := a.st.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='health' AND payload LIKE '%firewall_restored%'").Scan(&n); err != nil || n != 1 {
-		t.Fatal("repair event count", n, err)
+	n := 0
+	for _, it := range a.plan.copy() {
+		if it.kind == "health" && strings.Contains(it.payload, "firewall_restored") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatal("repair event count", n)
 	}
 }

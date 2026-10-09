@@ -14,8 +14,9 @@ func TestMonitorSchema(t *testing.T) {
 	}
 	defer st.Close()
 	want := []string{
-		"hosts", "agents", "ingest_events", "flows", "flow_samples",
+		"hosts", "agents", "ingest_events", "flows", "open_flows", "flow_owner", "flow_samples",
 		"traffic_1m", "never_block", "blocks", "settings", "enroll_tokens",
+		"flows_open", "flows_open_host",
 	}
 	want = append(want, "block_pause")
 	for _, name := range want {

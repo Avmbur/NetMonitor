@@ -8,6 +8,32 @@ import (
 	"testing"
 )
 
+func TestWALAutocheckpoint(t *testing.T) {
+	mon, err := OpenMonitor(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mon.Close()
+	var pages int
+	if err := mon.DB.QueryRow("PRAGMA wal_autocheckpoint").Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != monitorWALPages {
+		t.Fatalf("monitor wal_autocheckpoint=%d", pages)
+	}
+	ag, err := OpenAgent(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Close()
+	if err := ag.DB.QueryRow("PRAGMA wal_autocheckpoint").Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != agentWALPages {
+		t.Fatalf("agent wal_autocheckpoint=%d", pages)
+	}
+}
+
 func TestMonitorFileLimitAndRecovery(t *testing.T) {
 	st, err := OpenMonitor(t.TempDir())
 	if err != nil {

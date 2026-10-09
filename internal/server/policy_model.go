@@ -305,12 +305,12 @@ func groupNetworks(db policyReader, id string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	found, err := resolvePatterns(db, ps)
+	if err != nil {
+		return nil, err
+	}
 	for _, p := range ps {
-		ips, err := resolvePattern(db, p)
-		if err != nil {
-			return nil, err
-		}
-		for _, ip := range ips {
+		for _, ip := range found[strings.ToLower(strings.TrimSpace(p))] {
 			px, e := parseMember(ip)
 			if e != nil {
 				return nil, e
@@ -359,6 +359,15 @@ func hostGroups(db policyReader, host string) ([]policy.Rule, error) {
 		out[i].Match.Networks, err = groupNetworks(db, out[i].ID)
 		if err != nil {
 			return nil, err
+		}
+		names, err := policyStrings(db, "SELECT pattern FROM ip_group_patterns WHERE group_id=?", out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(names) > 0 {
+			// The agent resolves these names itself, so a new address is covered
+			// before the next round trip would otherwise raise a learn question.
+			out[i].Match.Names = names
 		}
 	}
 	return policy.Ordered(out), nil
@@ -455,6 +464,9 @@ func (s *Server) handlePolicyRule(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			if err = rememberResolved(tx, rule.Hosts, seed, now); err != nil {
+				return err
+			}
+			if err := s.flushQuestionRepeats(tx, now); err != nil {
 				return err
 			}
 			if err = answerPolicyQuestions(tx, rule, qid, in.Together, now); err != nil {

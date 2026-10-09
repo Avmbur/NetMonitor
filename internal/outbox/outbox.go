@@ -16,6 +16,13 @@ func Insert(tx *sql.Tx, kind string, priority int, payload any, now int64) error
 	}
 	return trim(tx, now)
 }
+
+// InsertUntrimmed is for callers that also own an in-memory queue.
+// They must apply Trim to the combined queue in the same transaction.
+func InsertUntrimmed(tx *sql.Tx, kind string, priority int, payload any, now int64) error {
+	return insert(tx, kind, priority, payload, now)
+}
+
 func insert(tx *sql.Tx, kind string, priority int, payload any, now int64) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -108,7 +115,8 @@ func MarkQuestionsSent(tx *sql.Tx, ids []string) error {
 		if id == "" {
 			continue
 		}
-		if _, err := tx.Exec("UPDATE local_questions SET sent=1 WHERE question_id=?", id); err != nil {
+		// Повторная отправка уже отмеченного вопроса страницу базы не переписывает.
+		if _, err := tx.Exec("UPDATE local_questions SET sent=1 WHERE question_id=? AND COALESCE(sent,0)!=1", id); err != nil {
 			return err
 		}
 	}
@@ -145,6 +153,11 @@ type Loss struct {
 }
 
 const MaxBytes int64 = 32 << 20
+
+// Trim применяет уже записанный предел очереди и не меняет queue_limit.
+func Trim(tx *sql.Tx, now int64) error {
+	return trim(tx, now)
+}
 
 func trim(tx *sql.Tx, now int64) error {
 	var total int64
@@ -222,12 +235,21 @@ func trim(tx *sql.Tx, now int64) error {
 // Reserve space for SQLite pages, WAL and a loss report. The limit can only fall
 // below the fixed spool cap; low space never expands the queue.
 func Capacity(tx *sql.Tx, free uint64, now int64) error {
+	if err := SetCapacity(tx, free); err != nil {
+		return err
+	}
+	return trim(tx, now)
+}
+
+// SetCapacity changes the limit; callers with a RAM queue trim both sources.
+func SetCapacity(tx *sql.Tx, free uint64) error {
 	limit := MaxBytes
 	if free < 128<<20 {
 		limit = max(4096, int64(free/4))
 	}
-	if _, err := tx.Exec("INSERT INTO meta(k,v) VALUES('queue_limit',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", strconv.FormatInt(limit, 10)); err != nil {
+	// Пульс зовёт это каждые 10 секунд: то же значение страницу не переписывает.
+	if _, err := tx.Exec("INSERT INTO meta(k,v) VALUES('queue_limit',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v WHERE meta.v IS NOT excluded.v", strconv.FormatInt(limit, 10)); err != nil {
 		return err
 	}
-	return trim(tx, now)
+	return nil
 }
