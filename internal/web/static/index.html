@@ -3561,13 +3561,20 @@ function policyBlocks() {
     ]
   })));
   const rules = RULES.filter(r => hostTouchesShown(r) && !r.once && !ruleExpired(r));
-  const ruleItems = rules.map((r, i) => ({
-    r,
-    cells: [
-      String(i + 1), esc(r.name), esc(ruleKindText(r)),
-      esc(hostsLabel(r.hosts, r.except)), ruleStatusHtml(r)
-    ]
-  }));
+  const ruleItems = rules.map((r, i) => {
+    // Название сохранено как было набрано, а условие могло быть уже: показываем
+    // фактическую службу и серверы привязки, если название о них молчит.
+    const proc = serviceRule(r) || (r.bindings || []).length > 1 ? "" : ruleProcessText(r);
+    const only = boundHostsText(r, true);
+    const fact = [proc && String(r.name || "").indexOf(proc) < 0 ? proc : "", only].filter(Boolean).join(" · ");
+    return {
+      r,
+      cells: [
+        String(i + 1), esc(r.name) + (fact ? ` <span class="muted">· ${esc(fact)}</span>` : ""), esc(ruleKindText(r)),
+        esc(hostsLabel(r.hosts, r.except)), ruleStatusHtml(r)
+      ]
+    };
+  });
   const ruleSorted = sortPolicyItems("rules", ruleItems);
   const ruleRows = ruleItems.map(x => x.cells);
   const alerts = alertTileRows();
@@ -5317,7 +5324,51 @@ function assembledRuleName(d) {
   const proto = d.proto && d.proto !== "any" ? d.proto : "";
   const port = d.port ? ":" + String(d.port).replace(/^:/, "") : "";
   const group = ((GROUPS || []).find(g => g.id === d.group) || {}).name || "";
-  return [selectedServerNames(d), processDisplay(d), dir, proto, port, d.addr, group].filter(Boolean).join(" · ");
+  return [selectedServerNames(d), ruleProcessText(d), dir, proto, port, d.addr, group].filter(Boolean).join(" · ");
+}
+// Служба systemd вида system.slice/<имя>.service одна на любом сервере: при
+// нескольких серверах монитор сохраняет её без сервера вопроса.
+function systemService(cgroup) {
+  const m = String(cgroup || "").replace(/^\d*::/, "").replace(/^\/+|\/+$/g, "").match(/^(?:system\.slice\/)?([^/]+\.service)$/);
+  return m && m[1] !== ".service" ? m[1] : "";
+}
+function multiHostScope(d) {
+  return d.hosts === "all" || d.hosts == null || (Array.isArray(d.hosts) && d.hosts.length > 1);
+}
+// Имя процесса из строки соединения у службы может быть чужим: у правила
+// «curl» условие — служба nm-update. Показываем фактическую службу.
+function ruleProcessText(d) {
+  const name = processDisplay(d);
+  const b = (d.bindings || [])[0] || identityToBinding(processIdentity(d.process));
+  const svc = systemService(b.cgroup);
+  if (!svc || svc === name + ".service") return name;
+  return name && name !== svc && name.indexOf("=") < 0 ? name + " в " + svc : svc;
+}
+function bindingScopeSig(x) {
+  const hosts = x.hosts === "all" || x.hosts == null ? "all" : [...x.hosts].sort();
+  const binds = (x.bindings || []).map(b => [b.host || "", b.cgroup || "", b.path || "", b.name || "", b.uid == null ? "" : String(b.uid)].join("|")).sort();
+  return JSON.stringify([hosts, [...(x.except || [])].sort(), binds]);
+}
+// Монитор пересчитывает привязки, только если правка меняет серверы или
+// привязки; иначе (переключатель, срок, имя) правило сохраняется как было.
+function bindingsRescoped(d) {
+  const r = d.id && RULES.find(x => x.id === d.id);
+  return !r || bindingScopeSig(r) !== bindingScopeSig(d);
+}
+// Привязки, которые действуют не на всех серверах правила, — каждая отдельно:
+// общая служба рядом с контейнером одного сервера действует везде. saved — как
+// сохранено сейчас; иначе как сохранит монитор.
+function boundHostsText(d, saved) {
+  const single = !multiHostScope(d) && Array.isArray(d.hosts) ? d.hosts[0] : "";
+  const rescope = !saved && bindingsRescoped(d);
+  const parts = [];
+  (d.bindings || []).forEach(b => {
+    const host = rescope && systemService(b.cgroup) ? single : (b.host || "");
+    if (!host || host === single) return;
+    const t = (systemService(b.cgroup) || b.name || b.path || b.cgroup || "процесс") + " только на " + hostName(host);
+    if (!parts.includes(t)) parts.push(t);
+  });
+  return parts.join(", ");
 }
 function ruleModalMeta(m) {
   const d = m && m.draft;
@@ -5504,6 +5555,7 @@ function renderRuleModal() {
       <input type="text" data-process-query data-suggest="proc" placeholder="начни писать имя" value="${esc(processDisplay(d))}" autocomplete="off">
       <div class="sug" id="proc-sug"></div>
     </div>` : ""}
+    ${!grouping && boundHostsText(d) ? `<div class="hint" style="padding:0">${esc(boundHostsText(d))}: на остальных выбранных серверах эта привязка не действует</div>` : ""}
   </div>`;
   const effect = grouping ? `<div class="rcol">
       <div class="rule-section">Где действует группа</div>
@@ -6388,7 +6440,7 @@ function openBrandModal() {
       <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
     </div>`;
-  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.8 · 10.10.2026", body, ""), "brand");
+  showModal(modalShell("AVMBUR", "NetMonitor · 1.0.9 · 10.10.2026", body, ""), "brand");
 }
 
 document.getElementById("profile").addEventListener("click", openProfileModal);

@@ -203,26 +203,158 @@ func TestAllowOnNonStandardSSHPortProtects(t *testing.T) {
 	}
 }
 
+func bindingHits(t *testing.T, s *Server, host string, c policy.Contact) bool {
+	t.Helper()
+	rs, err := hostRules(s.st.DB, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Host = host
+	d, ok := policy.Evaluate(rs, host, c, store.NowMS())
+	return ok && d.Action == "allow"
+}
+
+// Container and path bindings are not portable: on several servers they stay
+// on the server where the process was seen.
 func TestProcessBindingStaysOnObservedHost(t *testing.T) {
 	s, _ := batchFixture(t)
 	s.st.DB.Exec("INSERT INTO hosts(host_id) VALUES('h2')")
-	r := ruleRequest(t, s, `{"kind":"allow","process":"nginx","proto":"tcp","direction":"out","port":80,"hosts":["h","h2"],"bindings":[{"host":"h","name":"nginx","cgroup":"system.slice/nginx.service"}]}`, 200)
-	if len(r.Match.Bindings) != 1 || r.Match.Bindings[0].Cgroup != "system.slice/nginx.service" {
+	ct := "system.slice/docker-0123456789ab.scope"
+	r := ruleRequest(t, s, `{"kind":"allow","process":"app","proto":"tcp","direction":"out","port":80,"hosts":["h","h2"],"bindings":[{"host":"h","name":"app","cgroup":"`+ct+`"}]}`, 200)
+	if len(r.Match.Bindings) != 1 || r.Match.Bindings[0].Host != "h" {
 		t.Fatal(r.Match.Bindings)
 	}
-	rs, _ := hostRules(s.st.DB, "h")
-	if _, ok := policy.Evaluate(rs, "h", policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "1.2.3.4", RemotePort: 80, Cgroup: "system.slice/nginx.service"}, store.NowMS()); !ok {
+	c := policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "1.2.3.4", RemotePort: 80, Cgroup: ct}
+	if !bindingHits(t, s, "h", c) {
 		t.Fatal("observed host missed")
 	}
-	rs, _ = hostRules(s.st.DB, "h2")
-	if _, ok := policy.Evaluate(rs, "h2", policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "1.2.3.4", RemotePort: 80, Cgroup: "system.slice/nginx.service"}, store.NowMS()); ok {
-		t.Fatal("cgroup expanded to a host without a saved binding")
+	if bindingHits(t, s, "h2", c) {
+		t.Fatal("container cgroup expanded to a host without a saved binding")
 	}
-	body, _ := json.Marshal(map[string]any{"id": r.ID, "version": r.Version, "kind": "allow", "process": "nginx", "proto": "tcp", "direction": "out", "port": 80, "hosts": []string{"h", "h2"}, "bindings": r.Match.Bindings})
+	body, _ := json.Marshal(map[string]any{"id": r.ID, "version": r.Version, "kind": "allow", "process": "app", "proto": "tcp", "direction": "out", "port": 80, "hosts": []string{"h", "h2"}, "bindings": r.Match.Bindings})
 	ruleRequest(t, s, string(body), 200)
-	rs, _ = hostRules(s.st.DB, "h2")
-	if _, ok := policy.Evaluate(rs, "h2", policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "1.2.3.4", RemotePort: 80, Cgroup: "system.slice/nginx.service"}, store.NowMS()); ok {
+	if bindingHits(t, s, "h2", c) {
 		t.Fatal("server change invented a binding")
+	}
+	nested := policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "1.2.3.4", RemotePort: 81, Cgroup: "system.slice/system-getty.slice/getty@tty1.service"}
+	ruleRequest(t, s, `{"kind":"allow","process":"getty","proto":"tcp","direction":"out","port":81,"ip":"1.2.3.4","hosts":"all","bindings":[{"host":"h","name":"getty","cgroup":"`+nested.Cgroup+`"}]}`, 200)
+	if !bindingHits(t, s, "h", nested) || bindingHits(t, s, "h2", nested) {
+		t.Fatal("nested service binding left its host")
+	}
+}
+
+// Антон, 10.10.2026: «все серверы · nmagent» из вопроса сохранялось с сервером
+// вопроса и действовало только там; каждый следующий сервер спрашивал снова, а
+// новое правило не считалось дублем. Служба systemd на нескольких серверах
+// теперь действует на всех выбранных, а одинаковое правило отклоняется.
+func TestSystemServiceBindingCoversChosenHosts(t *testing.T) {
+	s, _ := batchFixture(t)
+	for _, h := range []string{"h2", "h3"} {
+		s.st.DB.Exec("INSERT INTO hosts(host_id) VALUES(?)", h)
+	}
+	ask := func(host, scope, except string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		body := `{"kind":"allow","process":"cgroup=system.slice/nmagent.service","proto":"tcp","direction":"out","port":443,"ip":"185.199.111.133","hosts":` + scope + `,"except":` + except + `,"bindings":[{"host":"` + host + `","name":"nmagent","cgroup":"system.slice/nmagent.service"}]}`
+		s.handlePolicyRule(w, httptest.NewRequest("POST", "/ui/api/rule", bytes.NewBufferString(body)))
+		return w
+	}
+	c := policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "185.199.111.133", RemotePort: 443, Cgroup: "system.slice/nmagent.service"}
+	if w := ask("h", `"all"`, `["h3"]`); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if !bindingHits(t, s, "h", c) || !bindingHits(t, s, "h2", c) {
+		t.Fatal("service rule missing on a chosen host")
+	}
+	if bindingHits(t, s, "h3", c) {
+		t.Fatal("exception ignored")
+	}
+	other := c
+	other.Cgroup = "system.slice/nmserver.service"
+	if bindingHits(t, s, "h2", other) {
+		t.Fatal("service binding widened to another service")
+	}
+	if w := ask("h2", `"all"`, `["h3"]`); w.Code != 400 || !strings.Contains(w.Body.String(), "уже есть") {
+		t.Fatal("same rule from another host's question", w.Code, w.Body.String())
+	}
+	var n int
+	s.st.DB.QueryRow("SELECT count(*) FROM policy_rules WHERE payload LIKE '%nmagent.service%' AND rule_id NOT LIKE '%svc-%'").Scan(&n)
+	if n != 1 {
+		t.Fatal("rules", n)
+	}
+	// Один сервер: привязка остаётся на нём.
+	w := ask("h3", `["h3"]`, `[]`)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var one policy.Rule
+	json.Unmarshal(w.Body.Bytes(), &one)
+	if len(one.Match.Bindings) != 1 || one.Match.Bindings[0].Host != "h3" {
+		t.Fatal(one.Match.Bindings)
+	}
+	// Повторное сохранение на нескольких серверах не возвращает сервер вопроса.
+	body, _ := json.Marshal(map[string]any{"id": one.ID, "version": one.Version, "kind": "allow", "process": "cgroup=system.slice/nmagent.service", "proto": "tcp", "direction": "out", "port": 443, "ip": "185.199.111.133", "hosts": []string{"h2", "h3"}, "bindings": one.Match.Bindings})
+	two := ruleRequest(t, s, string(body), 200)
+	if len(two.Match.Bindings) != 1 || two.Match.Bindings[0].Host != "" {
+		t.Fatal(two.Match.Bindings)
+	}
+	if !bindingHits(t, s, "h3", c) {
+		t.Fatal("edited rule lost its host")
+	}
+}
+
+// Жека, #Ж61: переключатель «вкл» шлёт правило целиком и расширял старое
+// «все серверы · nmagent», привязанное к одному серверу, на все.
+func TestToggleKeepsOldHostBoundRule(t *testing.T) {
+	s, _ := batchFixture(t)
+	s.st.DB.Exec("INSERT INTO hosts(host_id) VALUES('h2')")
+	old := policy.Rule{ID: "old19", Name: "все серверы · nmagent", Version: 1, Enabled: true, Action: "allow", Match: policy.Match{
+		Direction: "out", Protocol: "tcp", RemotePort: 443, Networks: []string{"185.199.111.133/32"}, Process: "cgroup=system.slice/nmagent.service",
+		Bindings: []policy.Binding{{Host: "h", Name: "nmagent", Cgroup: "system.slice/nmagent.service"}}}}
+	raw, _ := json.Marshal(old)
+	if _, err := s.st.DB.Exec("INSERT INTO policy_rules(rule_id,version,sort_order,payload) VALUES(?,?,?,?)", old.ID, 1, 0, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	c := policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "185.199.111.133", RemotePort: 443, Cgroup: "system.slice/nmagent.service"}
+	toggle := func(version int64, on bool) policy.Rule {
+		body, _ := json.Marshal(map[string]any{"id": old.ID, "version": version, "name": old.Name, "kind": "allow", "enabled": on,
+			"process": old.Match.Process, "proto": "tcp", "direction": "out", "portSide": "remote", "port": "443", "addr": "185.199.111.133/32",
+			"networks": old.Match.Networks, "hosts": "all", "except": []string{}, "bindings": old.Match.Bindings})
+		return ruleRequest(t, s, string(body), 200)
+	}
+	r := toggle(1, false)
+	r = toggle(r.Version, true)
+	if len(r.Match.Bindings) != 1 || r.Match.Bindings[0].Host != "h" {
+		t.Fatal("toggle rewrote bindings", r.Match.Bindings)
+	}
+	if !bindingHits(t, s, "h", c) || bindingHits(t, s, "h2", c) {
+		t.Fatal("toggle changed where the rule acts")
+	}
+}
+
+// Жека, #Ж61: служба переносилась на несколько серверов, но не на другой один.
+func TestServiceBindingMovesToSingleHost(t *testing.T) {
+	s, _ := batchFixture(t)
+	s.st.DB.Exec("INSERT INTO hosts(host_id) VALUES('h2')")
+	r := ruleRequest(t, s, `{"kind":"allow","process":"cgroup=system.slice/nginx.service","proto":"tcp","direction":"out","port":80,"ip":"1.2.3.4","hosts":["h"],"bindings":[{"host":"h","name":"nginx","cgroup":"system.slice/nginx.service"}]}`, 200)
+	body, _ := json.Marshal(map[string]any{"id": r.ID, "version": r.Version, "kind": "allow", "process": r.Match.Process, "proto": "tcp", "direction": "out", "port": 80, "ip": "1.2.3.4", "hosts": []string{"h2"}, "bindings": r.Match.Bindings})
+	moved := ruleRequest(t, s, string(body), 200)
+	if len(moved.Match.Bindings) != 1 || moved.Match.Bindings[0].Host != "h2" {
+		t.Fatal(moved.Match.Bindings)
+	}
+	c := policy.Contact{Direction: "out", Protocol: "tcp", RemoteIP: "1.2.3.4", RemotePort: 80, Cgroup: "system.slice/nginx.service"}
+	if !bindingHits(t, s, "h2", c) || bindingHits(t, s, "h", c) {
+		t.Fatal("service did not move")
+	}
+}
+
+func TestBindingOutsideScopeRejected(t *testing.T) {
+	s, _ := batchFixture(t)
+	s.st.DB.Exec("INSERT INTO hosts(host_id) VALUES('h2')")
+	w := httptest.NewRecorder()
+	body := `{"kind":"allow","process":"app","proto":"tcp","direction":"out","port":80,"ip":"1.2.3.4","hosts":["h2"],"bindings":[{"host":"h","name":"app","cgroup":"system.slice/docker-0123456789ab.scope"}]}`
+	s.handlePolicyRule(w, httptest.NewRequest("POST", "/ui/api/rule", bytes.NewBufferString(body)))
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "вне выбранных") {
+		t.Fatal(w.Code, w.Body.String())
 	}
 }
 

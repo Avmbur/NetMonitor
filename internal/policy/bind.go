@@ -103,6 +103,14 @@ func DedicatedCgroup(s string) bool {
 	return strings.HasSuffix(base, ".scope")
 }
 
+// SystemService: обычная служба systemd (system.slice/<имя>.service). Имя такой
+// службы одно на любом сервере, поэтому привязка к ней переносится на все
+// выбранные серверы. Контейнеры, вложенные срезы и сеансы сюда не входят.
+func SystemService(cgroup string) bool {
+	slice, svc, ok := strings.Cut(NormalizeCgroup(cgroup), "/")
+	return ok && slice == "system.slice" && !strings.Contains(svc, "/") && len(svc) > len(".service") && strings.HasSuffix(svc, ".service")
+}
+
 func CgroupMatch(path string) (string, error) {
 	p := NormalizeCgroup(path)
 	if p == "" || !DedicatedCgroup(p) {

@@ -131,3 +131,17 @@ func TestOnDemandNeverMeansAnyAddress(t *testing.T) {
 		t.Fatal("explicit address lost")
 	}
 }
+
+func TestSystemService(t *testing.T) {
+	for _, c := range []string{"system.slice/nmagent.service", "/system.slice/nginx.service/", "nm-update.service", "0::/system.slice/sshd.service"} {
+		if !SystemService(c) {
+			t.Fatal("service rejected", c)
+		}
+	}
+	for _, c := range []string{"", ".service", "system.slice/.service", "system.slice/docker-abc.scope", "system.slice/system-getty.slice/getty@tty1.service",
+		"user.slice/user-1000.slice/user@1000.service/app.service", "machine.slice/libpod-1.scope", "system.slice"} {
+		if SystemService(c) {
+			t.Fatal("not a portable service", c)
+		}
+	}
+}

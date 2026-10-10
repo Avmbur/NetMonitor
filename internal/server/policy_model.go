@@ -3,12 +3,14 @@ package server
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
 	"netmonitor/internal/idgen"
 	"netmonitor/internal/policy"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -243,6 +245,88 @@ func attachProcessBindings(r *policy.Rule, in ruleInput) error {
 	r.Match.Bindings = out
 	return nil
 }
+
+// scopeBindings приводит привязки к области правила. Служба systemd идёт за
+// выбором серверов: при нескольких теряет сервер вопроса (иначе «все серверы»
+// молча значило бы один сервер), при одном переезжает на него. Прочая привязка
+// к серверу вне области отбрасывается; если не осталось ни одной, правило не
+// сохраняется, а не расширяется до любого процесса.
+func scopeBindings(r policy.Rule, bs []policy.Binding) ([]policy.Binding, error) {
+	if len(bs) == 0 {
+		return bs, nil
+	}
+	seen := map[string]bool{}
+	var out []policy.Binding
+	for _, b := range bs {
+		if policy.SystemService(b.Cgroup) {
+			b.Host = ""
+			if len(r.Hosts) == 1 {
+				b.Host = r.Hosts[0]
+			}
+		}
+		if b.Host != "" && !r.OnHost(b.Host) {
+			continue
+		}
+		if k := bindingKey(b); !seen[k] {
+			seen[k] = true
+			out = append(out, b)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("процесс привязан к серверу вне выбранных")
+	}
+	return out, nil
+}
+
+func scopeRuleBindings(tx *sql.Tx, rule *policy.Rule) error {
+	if rule.ID != "" {
+		var raw string
+		err := tx.QueryRow("SELECT payload FROM policy_rules WHERE rule_id=?", rule.ID).Scan(&raw)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var prev policy.Rule
+		if err == nil && json.Unmarshal([]byte(raw), &prev) == nil && sameBindingScope(prev, *rule) {
+			return nil
+		}
+	}
+	bs, err := scopeBindings(*rule, rule.Match.Bindings)
+	if err != nil {
+		return err
+	}
+	rule.Match.Bindings = bs
+	return nil
+}
+
+// sameBindingScope: правка не трогала ни серверы, ни привязки (переключатель
+// «вкл», смена срока или имени). Тогда привязки остаются как сохранены: старое
+// правило не расширяется молча.
+func sameBindingScope(a, b policy.Rule) bool {
+	keys := func(r policy.Rule) []string {
+		var out []string
+		for _, x := range r.Match.Bindings {
+			out = append(out, bindingKey(x))
+		}
+		sort.Strings(out)
+		return out
+	}
+	sorted := func(s []string) []string {
+		s = slices.Clone(s)
+		sort.Strings(s)
+		return s
+	}
+	return (a.Hosts == nil) == (b.Hosts == nil) && slices.Equal(sorted(a.Hosts), sorted(b.Hosts)) &&
+		slices.Equal(sorted(a.Except), sorted(b.Except)) && slices.Equal(keys(a), keys(b))
+}
+
+func bindingKey(b policy.Binding) string {
+	uid := ""
+	if b.UID != nil {
+		uid = strconv.Itoa(*b.UID)
+	}
+	return strings.Join([]string{b.Host, b.Cgroup, b.Path, b.Name, uid}, "\x1f")
+}
+
 func readPolicyRules(db policyReader) ([]policy.Rule, error) {
 	rows, err := db.Query("SELECT payload FROM policy_rules ORDER BY sort_order,rule_id")
 	if err != nil {
@@ -425,6 +509,9 @@ func (s *Server) handlePolicyRule(w http.ResponseWriter, r *http.Request) {
 			}
 			if isServiceRuleID(in.ID) {
 				return fmt.Errorf("служебное правило, руками не трогать")
+			}
+			if err := scopeRuleBindings(tx, &rule); err != nil {
+				return err
 			}
 			if dup, err := findDuplicateRule(tx, rule); err != nil {
 				return err
@@ -697,11 +784,7 @@ func ruleFingerprint(r policy.Rule) string {
 	sort.Strings(names)
 	var binds []string
 	for _, b := range r.Match.Bindings {
-		uid := ""
-		if b.UID != nil {
-			uid = strconv.Itoa(*b.UID)
-		}
-		binds = append(binds, strings.Join([]string{b.Host, b.Cgroup, b.Path, b.Name, uid}, "\x1f"))
+		binds = append(binds, bindingKey(b))
 	}
 	sort.Strings(binds)
 	return strings.Join([]string{
